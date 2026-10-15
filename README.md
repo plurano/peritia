@@ -92,6 +92,22 @@ sources are refused with the rule recorded. `python3 tools/candidates.py summary
 --candidates candidates.tsv` reports counts per verdict, per clause, per
 licence class, and per domain among candidates.
 
+`python3 tools/overlap.py run --candidates candidates.tsv --checkouts <folder>
+--out overlap.tsv --groups groups.tsv --judge-model <name>` finds, for every
+adoption candidate, skills it may overlap among other candidates and skills
+already in `skills/`. It ranks the k nearest neighbours by cosine similarity
+using embeddings from a local model (defaulting to
+`hf.co/unsloth/embeddinggemma-2-GGUF:Q8_0`) plus any item with the same
+normalised name, and lets a local chat model judge per pair whether they serve
+the same use. Embeddings are cached per blob id, and an interrupted run resumes
+without asking previously judged pairs again; failed judgements are recorded as
+unjudged, never guessed. Connected components over matching pairs are grouped in
+`groups.tsv`, identifying overlap-free candidates and groups containing an
+existing skill. `python3 tools/overlap.py summary --overlap overlap.tsv --groups
+groups.tsv --candidates candidates.tsv` reports counts of candidates,
+overlap-free candidates, groups, groups with an existing skill, and unjudged
+pairs.
+
 ## Credits
 
 Every skill credits its upstream author and repository in its own `ORIGIN.md`.
