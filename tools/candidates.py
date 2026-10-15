@@ -538,7 +538,7 @@ def decide_row(
     elif lic_cls in ("permissive", "weak"):
         verdict, reason = "candidate", ""
     elif lic_cls == "strong":
-        verdict, reason = "report", ""
+        verdict, reason = "report", f"licence:{licence} strong copyleft: a person decides"
     else:
         verdict, reason = "refused", f"licence:{licence} evidence:{evidence}"
 

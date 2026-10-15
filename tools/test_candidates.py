@@ -204,7 +204,7 @@ class CandidatesTests(unittest.TestCase):
             res = candidates.run(census_p, class_p, checkouts, out, [], FakeGitHubReader())
             row = res[0]
             self.assertEqual((row.licence, row.licence_class, row.verdict, row.reason),
-                             ("GPL-3.0", "strong", "report", ""))
+                             ("GPL-3.0", "strong", "report", "licence:GPL-3.0 strong copyleft: a person decides"))
 
     def test_path_leaving_checkout_refused(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -502,8 +502,8 @@ class CandidatesTests(unittest.TestCase):
             out = folder / "out.tsv"
             res = candidates.run(census_p, class_p, checkouts, out, [], FakeGitHubReader())
             row = res[0]
-            self.assertEqual((row.licence, row.licence_class, row.verdict),
-                             ("AGPL-3.0-only", "strong", "report"))
+            self.assertEqual((row.licence, row.licence_class, row.verdict, row.reason),
+                             ("AGPL-3.0-only", "strong", "report", "licence:AGPL-3.0-only strong copyleft: a person decides"))
             self.assertEqual(candidates.licence_class("AGPL-3.0-only"), "strong")
 
     def test_core_functions_is_subset_of_classify_functions(self) -> None:

@@ -28,6 +28,7 @@ test: build
 	@python3 -B tools/test_census.py
 	@python3 -B tools/test_classify.py
 	@python3 -B tools/test_candidates.py
+	@python3 -B tools/test_overlap.py
 	@reuse lint
 
 build:
