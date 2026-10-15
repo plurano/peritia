@@ -65,6 +65,16 @@ inventory of public `SKILL.md` files from the repositories in
 metadata (never skill contents), and fails closed after writing any rows it
 could read. This is census data only; it does not classify or adopt skills.
 
+`python3 tools/classify.py run --census census.tsv --checkouts <folder> --out
+classified.tsv --model <name>` labels each unique skill of a census on two axes,
+what it does and which domain it serves, with a model served by a local Ollama.
+`<folder>` holds one checkout per source, named `<owner>__<name>`, at the census
+pin. The answer is constrained to the label lists by a JSON schema and checked
+again; a skill whose answer fails twice is written with status `error`, never
+guessed. Every row names its model, and an interrupted run resumes.
+`python3 tools/classify.py summary --out classified.tsv` counts the labels and
+names the domains no skill serves.
+
 ## Credits
 
 Every skill credits its upstream author and repository in its own `ORIGIN.md`.
