@@ -27,6 +27,7 @@ test: build
 	@python3 -B tools/install_user_skills.py selftest
 	@python3 -B tools/test_census.py
 	@python3 -B tools/test_classify.py
+	@python3 -B tools/test_candidates.py
 	@reuse lint
 
 build:
