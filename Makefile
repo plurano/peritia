@@ -29,6 +29,7 @@ test: build
 	@python3 -B tools/test_classify.py
 	@python3 -B tools/test_candidates.py
 	@python3 -B tools/test_overlap.py
+	@python3 -B tools/test_judge_groups.py
 	@reuse lint
 
 build:

@@ -1,0 +1,510 @@
+{
+  "version": 1,
+  "classes": {
+    "coding": [
+      {
+        "id": "coding-thread-safe-cache",
+        "prompt": "Implement an in-memory key-value cache class in Python supporting get and set operations across concurrent worker threads.",
+        "must_match": [
+          "(?:Lock\\(|RLock\\(|threading\\.Lock|threading\\.RLock)",
+          "with\\s+self\\._?\\w*lock",
+          "def\\s+(?:get|set)\\s*\\([^)]*:\\s*"
+        ],
+        "must_not_match": [
+          "TODO",
+          "pass\\s*#\\s*implement"
+        ],
+        "rubric": "Thread-safe cache implementation utilizing locks with context managers, proper exception safety, and clear type annotations."
+      },
+      {
+        "id": "coding-rust-hex-parser",
+        "prompt": "Write a Rust function that converts a 2-character hexadecimal string slice into an 8-bit unsigned integer value.",
+        "must_match": [
+          "Result<u8,",
+          "from_str_radix",
+          "(?:len\\(\\)\\s*!=\\s*2|\\.len\\(\\)\\s*==\\s*2|2\\s*==\\s*.*\\.len\\(\\))"
+        ],
+        "must_not_match": [
+          "\\.unwrap\\(\\)",
+          "\\.expect\\("
+        ],
+        "rubric": "Idiomatic Rust error handling returning Result without panicking or unwrapping, verifying 2-character slice length and parsing hex."
+      },
+      {
+        "id": "coding-ts-generic-pagination",
+        "prompt": "Write a TypeScript function that fetches a single page of results for a generic resource type from a paginated REST endpoint.",
+        "must_match": [
+          "<[A-Z]\\w*>",
+          "Promise<",
+          "(?:URLSearchParams|\\?page=|\\?offset=|\\?limit=)"
+        ],
+        "must_not_match": [
+          ":\\s*any\\b"
+        ],
+        "rubric": "Strict generic TypeScript types without any, proper async/await with Promise return, and clean URL query parameter handling."
+      }
+    ],
+    "review-audit": [
+      {
+        "id": "review-audit-python-mutable-default",
+        "prompt": "Review a Python function signature def collect(item, values=[]): values.append(item); return values. Identify why subsequent invocations produce unexpected output and provide the fix.",
+        "must_match": [
+          "mutable\\s+(?:default|argument|object)",
+          "values\\s*=\\s*None",
+          "values\\s+is\\s+None"
+        ],
+        "must_not_match": [
+          "looks\\s+good\\s+to\\s+me",
+          "no\\s+bug"
+        ],
+        "rubric": "Explains shared state across calls caused by mutable default arguments, replaces with None sentinel and values is None initialization."
+      },
+      {
+        "id": "review-audit-go-map-race",
+        "prompt": "Review a Go routine where multiple background workers update a shared key-counter map concurrently. Explain the runtime failure mode and show how to fix it.",
+        "must_match": [
+          "(?:data\\s+race|race\\s+condition|concurrent\\s+map\\s+(?:read|write))",
+          "(?:sync\\.RWMutex|sync\\.Mutex|sync\\.Map)",
+          "(?:Lock\\(\\)|Unlock\\(\\)|Store\\(\\))"
+        ],
+        "must_not_match": [
+          "thread-safe\\s+by\\s+default",
+          "maps\\s+are\\s+safe"
+        ],
+        "rubric": "Diagnoses fatal concurrent map read/write race condition, corrects it using sync.Mutex, sync.RWMutex, or sync.Map."
+      },
+      {
+        "id": "review-audit-adr-tradeoffs",
+        "prompt": "Audit an architectural change replacing an existing ACID database with an eventual-consistency NoSQL store for processing money transfers between accounts.",
+        "must_match": [
+          "(?:double[- ]spend|lost\\s+update|dirty\\s+read|isolation)",
+          "(?:idempotency|reconciliation|two-phase|saga|compensat)",
+          "(?:atomic|all-or-nothing|rollback)"
+        ],
+        "must_not_match": [
+          "zero\\s+risk",
+          "no\\s+concerns"
+        ],
+        "rubric": "Highlights serious financial risks of eventual consistency (double spending, lost updates, race conditions) and required mitigations (sagas, idempotency keys, compensating transactions)."
+      }
+    ],
+    "testing": [
+      {
+        "id": "testing-go-table-test",
+        "prompt": "Write unit tests in Go for a function that parses host and port pairs from network address strings.",
+        "must_match": [
+          "(?:struct\\s*\\{|\\[\\]struct)",
+          "t\\.Run\\(",
+          "(?:empty|missing|invalid|out\\s+of\\s+range|-1|65536)"
+        ],
+        "must_not_match": [
+          "panic\\("
+        ],
+        "rubric": "Table-driven Go tests with t.Run subtests testing both valid hosts/ports and edge/error paths (empty string, out-of-bounds port, missing colon)."
+      },
+      {
+        "id": "testing-pytest-async-mock",
+        "prompt": "Write tests in Python using pytest for an asynchronous coroutine that queries a remote profile endpoint.",
+        "must_match": [
+          "@pytest\\.mark\\.(?:asyncio|anyio)",
+          "(?:AsyncMock|patch\\b|httpx_mock)",
+          "(?:pytest\\.raises|status_code\\s*==\\s*|timeout)"
+        ],
+        "must_not_match": [
+          "time\\.sleep\\("
+        ],
+        "rubric": "Proper async pytest testing with mocked network responses, validating both successful parsing and network error handling."
+      },
+      {
+        "id": "testing-hypothesis-property",
+        "prompt": "Write property-based tests in Python verifying that a custom integer sorting function satisfies fundamental ordering invariants.",
+        "must_match": [
+          "(?:@given|from\\s+hypothesis|hypothesis\\.given)",
+          "strategies\\.(?:lists|integers)",
+          "(?:len\\(.*==\\s*len|sort.*sort|\\.count\\()"
+        ],
+        "must_not_match": [
+          "assert\\s+sort.*\\b[1,\\s*2\\b]"
+        ],
+        "rubric": "Uses hypothesis with strategies.lists to verify property invariants like preservation of length, idempotence, and monotonic order."
+      }
+    ],
+    "ci-release": [
+      {
+        "id": "ci-release-github-actions",
+        "prompt": "Create a GitHub Actions CI pipeline in YAML that validates pull requests for a web application project.",
+        "must_match": [
+          "actions/checkout@",
+          "(?:npm\\s+ci|pnpm\\s+install\\s+--frozen|yarn\\s+install\\s+--frozen|bundle\\s+exec)",
+          "(?:npm\\s+test|npm\\s+run\\s+lint|pytest|cargo\\s+test)"
+        ],
+        "must_not_match": [
+          "npm\\s+install\\s+-[gG]\\b"
+        ],
+        "rubric": "Clean GitHub Actions workflow checking out code, using reproducible clean installs (npm ci), running automated tests."
+      },
+      {
+        "id": "ci-release-docker-multistage",
+        "prompt": "Write a Dockerfile for building and packaging a compiled Go backend service binary into a production container image.",
+        "must_match": [
+          "(?:AS\\s+builder|as\\s+build)",
+          "COPY\\s+--from=",
+          "(?:USER\\s+\\d+|USER\\s+\\w+|adduser)"
+        ],
+        "must_not_match": [
+          "USER\\s+root"
+        ],
+        "rubric": "Multi-stage Dockerfile that keeps build toolchain out of final image, runs as an unprivileged user, and creates a minimal footprint."
+      },
+      {
+        "id": "ci-release-semver-tag-script",
+        "prompt": "Write a shell script that inspects repository release history, increments the semantic version by one patch increment, and publishes the new release marker.",
+        "must_match": [
+          "(?:git\\s+describe|git\\s+tag)",
+          "(?:expr\\b|\\(\\(|\\+\\s*1)",
+          "git\\s+tag\\s+-(?:a|s|m)\\b"
+        ],
+        "must_not_match": [
+          "git\\s+push\\s+--force"
+        ],
+        "rubric": "Parses latest tag, safely calculates next patch version, creates annotated git tag with message, avoids force pushes."
+      }
+    ],
+    "docs-writing": [
+      {
+        "id": "docs-writing-adr-grpc",
+        "prompt": "Document an architectural choice between remote procedure calls and message queues for asynchronous order fulfillment.",
+        "must_match": [
+          "#+\\s*(?:Context|Status)",
+          "#+\\s*Decision",
+          "#+\\s*(?:Consequences|Trade-offs|Outcomes)"
+        ],
+        "must_not_match": [
+          "TODO",
+          "Lorem\\s+ipsum"
+        ],
+        "rubric": "Structured architectural decision record with clear context, concrete decision rationale, and explicit positive/negative trade-offs."
+      },
+      {
+        "id": "docs-writing-rest-endpoint-spec",
+        "prompt": "Write technical documentation for an HTTP endpoint that receives incoming event notifications from payment providers.",
+        "must_match": [
+          "(?:POST|PUT)\\s+/\\w+",
+          "(?:X-Signature|X-Hub-Signature|Authorization|header)",
+          "(?:200|201|202|204)\\b.*(?:400|401|403|500)\\b",
+          "(?:curl\\s+-X|```json)"
+        ],
+        "must_not_match": [
+          "<insert\\s+curl>"
+        ],
+        "rubric": "Clear API documentation specifying endpoint path, HTTP method, signature verification headers, status codes, and payload example."
+      },
+      {
+        "id": "docs-writing-504-runbook",
+        "prompt": "Create an on-call operational runbook for diagnosing and remediating elevated rates of downstream request timeouts in production.",
+        "must_match": [
+          "#+\\s*(?:Triage|Diagnosis|Investigation|Troubleshooting)",
+          "(?:kubectl\\s+|curl\\s+|journalctl|grep\\b|systemctl)",
+          "#+\\s*(?:Remediation|Mitigation|Resolution|Recovery)"
+        ],
+        "must_not_match": [
+          "reboot\\s+the\\s+entire\\s+datacenter"
+        ],
+        "rubric": "Actionable on-call runbook with structured triage section, concrete diagnostic CLI commands, and systematic mitigation procedures."
+      }
+    ],
+    "research": [
+      {
+        "id": "research-btree-vs-lsm",
+        "prompt": "Analyze the engineering tradeoffs between append-only log-structured engines and mutable page-oriented storage for transactional workloads.",
+        "must_match": [
+          "B[- ]?Tree",
+          "(?:LSM|log-structured\\s+merge)",
+          "write\\s+amplification",
+          "compaction"
+        ],
+        "must_not_match": [
+          "zero\\s+write\\s+amplification"
+        ],
+        "rubric": "Deep technical comparison contrasting LSM-Tree append-only writes and background compaction with B-Tree page writes and write amplification."
+      },
+      {
+        "id": "research-raft-vs-paxos",
+        "prompt": "Provide a comparative analysis of state machine replication approaches used in modern fault-tolerant distributed stores.",
+        "must_match": [
+          "(?:Raft|Paxos)",
+          "(?:quorum|majority|split[- ]brain)",
+          "leader\\s+election",
+          "(?:log\\s+replication|term\\s+number|ballot)"
+        ],
+        "must_not_match": [
+          "paxos\\s+has\\s+no\\s+consensus"
+        ],
+        "rubric": "Contrasts Raft and Multi-Paxos leadership lifecycle, quorum requirements, split-brain prevention, and log entry commitment."
+      },
+      {
+        "id": "research-gc-mechanisms",
+        "prompt": "Evaluate memory reclamation techniques that minimize application pause times in high-throughput backend runtimes.",
+        "must_match": [
+          "(?:ZGC|Shenandoah|Go\\s+GC)",
+          "concurrent\\s+(?:mark|sweep|evacuation)",
+          "(?:read\\s+barrier|load\\s+barrier|safepoint|colored\\s+pointer)"
+        ],
+        "must_not_match": [
+          "has\\s+no\\s+garbage\\s+collector"
+        ],
+        "rubric": "Compares low-latency GC approaches (ZGC/Shenandoah load barriers and concurrent evacuation) against Go non-generational concurrent mark-sweep."
+      }
+    ],
+    "planning-fleet-mgmt": [
+      {
+        "id": "planning-db-expand-contract",
+        "prompt": "Formulate a migration plan to alter a primary customer identification column across active production databases without service interruption.",
+        "must_match": [
+          "expand[- /]contract",
+          "dual[- ]writ",
+          "backfill"
+        ],
+        "must_not_match": [
+          "shut\\s+down\\s+production"
+        ],
+        "rubric": "Comprehensive zero-downtime migration plan utilizing expand-contract phases: column expansion, dual writes, asynchronous backfill, validation, and contract cleanup."
+      },
+      {
+        "id": "planning-multiagent-audit",
+        "prompt": "Design an operational framework for orchestrating multiple autonomous AI coding agents working on different portions of the same repository.",
+        "must_match": [
+          "(?:worktree|branch|sandbox)",
+          "(?:reviewer|auditor|gatekeeper|worker|lead)",
+          "(?:merge\\s+conflict|lock|race|coordination)"
+        ],
+        "must_not_match": [
+          "commit.*directly\\s+to\\s+main"
+        ],
+        "rubric": "Designs robust multi-agent orchestration with workspace isolation (worktrees/branches), clear role specialization, conflict prevention, and verification gates."
+      },
+      {
+        "id": "planning-postmortem-tls-outage",
+        "prompt": "Draft an investigation report following an extended outage where web endpoints rejected traffic due to cryptographic certificate expiration.",
+        "must_match": [
+          "#+\\s*(?:Root\\s+Cause|Timeline)",
+          "#+\\s*(?:Action\\s+Items|Remediation|Preventative\\s+Actions)",
+          "(?:cert[- ]manager|Let's\\s+Encrypt|automated\\s+renew|alert.*(?:day|week))"
+        ],
+        "must_not_match": [
+          "blame\\s+\\w+"
+        ],
+        "rubric": "Blameless postmortem structure with clear timeline, root cause analysis, automated certificate renewal mechanisms (cert-manager/Let's Encrypt), and alerting."
+      }
+    ],
+    "infra-ops": [
+      {
+        "id": "infra-k8s-deployment",
+        "prompt": "Write a Kubernetes configuration in YAML to run a stateless microservice with high availability and health monitoring.",
+        "must_match": [
+          "kind:\\s*Deployment",
+          "livenessProbe:",
+          "readinessProbe:",
+          "resources:\\s*(?:.*\\n)*\\s*limits:"
+        ],
+        "must_not_match": [
+          "privileged:\\s*true"
+        ],
+        "rubric": "Valid Kubernetes Deployment YAML with readiness and liveness probes, resource requests and limits, and multiple replicas."
+      },
+      {
+        "id": "infra-terraform-s3-secure",
+        "prompt": "Write Terraform code that provisions a cloud object storage bucket for archival data while enforcing strict privacy.",
+        "must_match": [
+          "(?:aws_s3_bucket|google_storage_bucket)",
+          "(?:server_side_encryption|encryption\\b|kms_key)",
+          "(?:public_access_block|block_public|uniform_bucket_level_access)"
+        ],
+        "must_not_match": [
+          "acl\\s*=\\s*\\\"public-read\\\""
+        ],
+        "rubric": "Secure Terraform configuration declaring storage bucket with server-side encryption enabled and public access blocks enforced."
+      },
+      {
+        "id": "infra-prometheus-alert",
+        "prompt": "Write an alerting rule in YAML for Prometheus that fires when an HTTP service exhibits an unacceptable proportion of server errors.",
+        "must_match": [
+          "alert:\\s*\\w+",
+          "expr:.*(?:rate|increase)\\(",
+          "for:\\s*\\d+[smhd]",
+          "severity:\\s*(?:critical|warning|page)"
+        ],
+        "must_not_match": [
+          "expr:\\s*1\\s*==\\s*1"
+        ],
+        "rubric": "Prometheus alert rule computing error ratio over rate of requests, setting evaluation duration and appropriate severity labels."
+      }
+    ],
+    "data-science": [
+      {
+        "id": "ds-scikit-pipeline",
+        "prompt": "Write Python code that prepares tabular training data by standardizing numeric features and trains a regularized binary classification model without data leakage.",
+        "must_match": [
+          "(?:StandardScaler|RobustScaler|MinMaxScaler)",
+          "(?:Pipeline\\(|train_test_split)",
+          "(?:fit_transform|\\.fit\\b)"
+        ],
+        "must_not_match": [
+          "fit_transform\\(X\\)"
+        ],
+        "rubric": "Creates scikit-learn Pipeline or separates train/test splits before fitting scaler, preventing data leakage."
+      },
+      {
+        "id": "ds-sql-moving-average",
+        "prompt": "Write a SQL query that calculates the 7-day rolling average of daily user payments for each geographical region.",
+        "must_match": [
+          "AVG\\(.*\\)\\s+OVER\\s*\\(",
+          "PARTITION\\s+BY",
+          "(?:ROWS\\s+BETWEEN|RANGE\\s+BETWEEN|ORDER\\s+BY)"
+        ],
+        "must_not_match": [
+          "CROSS\\s+JOIN"
+        ],
+        "rubric": "Uses window function with PARTITION BY and explicit frame specification for rolling average without expensive self-joins."
+      },
+      {
+        "id": "ds-pytorch-train-loop",
+        "prompt": "Implement a Python training loop step in PyTorch that updates neural network weights based on computed mini-batch cross-entropy loss.",
+        "must_match": [
+          "(?:zero_grad\\(\\)|\\.grad\\s*=\\s*None)",
+          "\\.backward\\(",
+          "optimizer\\.step\\(\\)"
+        ],
+        "must_not_match": [
+          "with\\s+torch\\.no_grad\\(\\):.*\\.backward"
+        ],
+        "rubric": "Idiomatic PyTorch training step executing zero_grad(), loss.backward(), and optimizer.step() in correct sequence."
+      }
+    ],
+    "design-frontend": [
+      {
+        "id": "frontend-accessible-modal",
+        "prompt": "Build a frontend modal dialog component in React with TypeScript that adheres strictly to digital accessibility guidelines.",
+        "must_match": [
+          "role=[\\\"']dialog[\\\"']",
+          "aria-modal=[\\\"']true[\\\"']",
+          "(?:keydown|Escape|keyCode\\s*===\\s*27)"
+        ],
+        "must_not_match": [
+          "<div\\s+onClick="
+        ],
+        "rubric": "Accessible React modal implementing WAI-ARIA authoring practices with role='dialog', aria-modal='true', and Escape key listener."
+      },
+      {
+        "id": "frontend-responsive-grid",
+        "prompt": "Write clean modern CSS that displays a product catalog in multiple columns on wide viewports and condenses to a single column on compact screens.",
+        "must_match": [
+          "display:\\s*(?:grid|flex)",
+          "(?:@media|repeat\\s*\\(\\s*auto-(?:fit|fill))",
+          "(?:grid-template-columns|flex-wrap|flex-direction)"
+        ],
+        "must_not_match": [
+          "table-layout:\\s*fixed"
+        ],
+        "rubric": "Responsive layout utilizing CSS Grid or Flexbox with media queries or repeat(auto-fit, minmax()) without hardcoded element widths."
+      },
+      {
+        "id": "frontend-accessible-button",
+        "prompt": "Write HTML and CSS for a primary interactive submission button that provides clear visual states for keyboard navigation and screen readers.",
+        "must_match": [
+          ":focus-visible",
+          "(?:outline|box-shadow)",
+          "(?:aria-disabled|:disabled|:hover)"
+        ],
+        "must_not_match": [
+          "outline:\\s*(?:none|0)\\s*;"
+        ],
+        "rubric": "Complies with WCAG guidelines by preserving explicit :focus-visible outlines and providing semantic button states."
+      }
+    ],
+    "security": [
+      {
+        "id": "security-constant-time-compare",
+        "prompt": "Write a Python verification function that compares a user-supplied authentication token against a stored secret hash without exposing the system to side-channel leakage.",
+        "must_match": [
+          "(?:hmac\\.compare_digest|secrets\\.compare_digest)",
+          "timing",
+          "constant[- ]time"
+        ],
+        "must_not_match": [
+          "return\\s+\\w+\\s*==\\s*\\w+"
+        ],
+        "rubric": "Avoids vulnerable == comparisons in favor of hmac.compare_digest or secrets.compare_digest to prevent timing side-channel attacks."
+      },
+      {
+        "id": "security-parameterized-query",
+        "prompt": "Review a function that searches accounts by user input. Explain how unvalidated strings cause arbitrary database execution and provide the remediated implementation.",
+        "must_match": [
+          "SQL\\s+injection",
+          "(?:execute\\s*\\(.*?,|\\?|%s|:\\w+)",
+          "parameter"
+        ],
+        "must_not_match": [
+          "execute\\s*\\(f[\\\"']"
+        ],
+        "rubric": "Correctly identifies SQL injection vulnerability, explaining threat of arbitrary SQL execution and fixing with parameterized query placeholders."
+      },
+      {
+        "id": "security-csp-helmet",
+        "prompt": "Configure HTTP security headers in an Express application to prevent malicious external script execution and inline script abuse in the browser.",
+        "must_match": [
+          "(?:helmet|Content-Security-Policy)",
+          "script-src",
+          "['\\\"](?:'self'|self)['\\\"]"
+        ],
+        "must_not_match": [
+          "['\\\"]'unsafe-inline'['\\\"]",
+          "['\\\"]'unsafe-eval'['\\\"]"
+        ],
+        "rubric": "Configures Content Security Policy via Helmet or header directives restricting script-src to 'self' and disallowing unsafe-inline/unsafe-eval."
+      }
+    ],
+    "media": [
+      {
+        "id": "media-ffmpeg-h264",
+        "prompt": "Write a command-line invocation that converts a raw video file into a web-optimized 1080p format suitable for progressive browser streaming.",
+        "must_match": [
+          "ffmpeg\\s+",
+          "(?:-c:v\\s+libx264|-vcodec\\s+libx264|libx264)",
+          "faststart",
+          "(?:scale=-?[0-9]*:1080|scale=1080:-?[0-9]*)"
+        ],
+        "must_not_match": [
+          "-c:v\\s+copy"
+        ],
+        "rubric": "Valid ffmpeg command using libx264, scaling to 1080p while preserving aspect ratio, and setting +faststart for progressive streaming."
+      },
+      {
+        "id": "media-pil-thumbnail-webp",
+        "prompt": "Write a Python function that resizes uploaded user photos to fit within a 300-pixel bounding box without distorting the original proportions and exports them in a modern compressed format.",
+        "must_match": [
+          "(?:from\\s+PIL|import\\s+PIL|Image\\b)",
+          "(?:\\.thumbnail\\(|aspect)",
+          "(?:format=['\\\"]WEBP['\\\"]|\\.save\\(.*['\\\"]webp['\\\"]|WEBP)"
+        ],
+        "must_not_match": [
+          "\\.resize\\(\\s*\\(\\s*300\\s*,\\s*300\\s*\\)\\s*\\)"
+        ],
+        "rubric": "Uses PIL thumbnail method or calculates aspect ratio correctly, exporting as WebP without geometric distortion."
+      },
+      {
+        "id": "media-audio-loudnorm",
+        "prompt": "Write a script command to adjust a podcast episode audio volume to standard internet streaming loudness.",
+        "must_match": [
+          "(?:ffmpeg|pydub|sox)",
+          "loudnorm",
+          "(?:LUFS|-14|-16|integrated)"
+        ],
+        "must_not_match": [
+          "volume=100%"
+        ],
+        "rubric": "Applies EBU R128 loudness normalization via ffmpeg loudnorm targeting standard podcast loudness (-14 to -16 LUFS)."
+      }
+    ]
+  }
+}
