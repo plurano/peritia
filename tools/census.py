@@ -236,7 +236,17 @@ def tree_entries(tree: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def is_folder_license(path: str) -> bool:
-    return Path(path).name.upper() == "LICENSE"
+    parts = Path(path).name.split(".")
+    if len(parts) > 2:
+        return False
+    stem = parts[0].upper()
+    if stem not in {"LICENSE", "LICENCE", "COPYING"}:
+        return False
+    if len(parts) == 2:
+        ext = parts[1]
+        if not ext or ext.upper() == "LESSER":
+            return False
+    return True
 
 
 def is_script(path: str) -> str | None:
@@ -258,7 +268,11 @@ def rows_for_source(source: Source, pin: str, repository_license: str, entries: 
         prefix = "" if folder == "." else folder + "/"
         folder_entries = [entry for entry in entries if entry["path"].startswith(prefix)]
         extensions = sorted({extension for entry in folder_entries if (extension := is_script(entry["path"]))})
-        has_license = any(is_folder_license(entry["path"]) for entry in folder_entries)
+        has_license = any(
+            is_folder_license(entry["path"])
+            for entry in folder_entries
+            if str(Path(entry["path"]).parent) == folder
+        )
         ineligible = "" if repository_is_osi or has_license else "licence:none"
         rows.append(Row(
             source=source.repository, pin=pin, path=path, skill_name=Path(folder).name if folder != "." else "SKILL",
