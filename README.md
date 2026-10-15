@@ -42,7 +42,9 @@ skill folder of every client it finds: Claude Code (`~/.claude/skills`), Codex
 (`$CODEX_HOME/skills`), Antigravity (`~/.gemini/config/skills`), Gemini CLI
 (`~/.gemini/skills`) and opencode (`~/.agents/skills`, which opencode reads
 beside `~/.claude/skills`). It never replaces an existing entry of the same
-name, and it prints a plan unless you pass `--apply`:
+name, and it prints a plan unless you pass `--apply`. On Windows, where a
+symbolic link needs developer mode or administrator rights, a refused link
+becomes a directory junction, and the output names the mode it used:
 
 ```sh
 python3 tools/install_user_skills.py plan --tag v0.1.0

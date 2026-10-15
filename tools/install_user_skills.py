@@ -33,6 +33,9 @@ STORE_PARENT = ".local/share/praetor-tools/skills"
 MANIFEST = "peritia-user-skills.json"
 GIT_TIMEOUT = 300  # seconds for one clone or ls-remote (HISS-02)
 MAX_FILES = 20000  # bounds every tree walk (HISS-02)
+# Windows refuses a symbolic link without developer mode or admin rights; a directory junction needs neither.
+# PERITIA_LINK_MODE=junction forces junctions (to test that path where symlinks work); the output names the mode.
+LINK_MODE_ENV = "PERITIA_LINK_MODE"
 # User skill folders, read from each installed client (binary strings and its own docs, 2026-10-15):
 # Claude Code ~/.claude/skills; Codex $CODEX_HOME/skills (default ~/.codex/skills); Antigravity CLI
 # ~/.gemini/config/skills; Gemini CLI ~/.gemini/skills; opencode auto-loads ~/.claude/skills and ~/.agents/skills
@@ -100,15 +103,56 @@ def skill_names(tree):
     return sorted(p.name for p in (tree / "skills").iterdir() if (p / "SKILL.md").is_file())
 
 
+def is_junction(path):
+    return bool(getattr(os.path, "isjunction", lambda _p: False)(path))
+
+
+def link_target(link):
+    """The folder a symlink or junction at link points to, or None when link is neither."""
+    if not (link.is_symlink() or is_junction(link)):
+        return None
+    raw = os.readlink(link)
+    return Path(raw[4:] if raw.startswith("\\\\?\\") else raw)
+
+
+def make_link(link, target):
+    """Link link to target; returns the mode used. A refused symlink on Windows becomes a junction, named."""
+    forced = os.environ.get(LINK_MODE_ENV, "")
+    if forced == "junction" and os.name != "nt":
+        raise SystemExit("refused: junctions exist only on Windows; unset " + LINK_MODE_ENV)
+    if forced != "junction":
+        try:
+            link.symlink_to(target, target_is_directory=True)
+            return "symlink"
+        except OSError as exc:
+            if os.name != "nt":
+                raise
+            why = f"symlink refused: {exc.strerror or exc}"
+    else:
+        why = f"forced by {LINK_MODE_ENV}"
+    run = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], capture_output=True, text=True,
+                         timeout=GIT_TIMEOUT)
+    if run.returncode != 0:
+        raise SystemExit(f"refused: junction {link} failed: {run.stdout.strip()} {run.stderr.strip()}"[:400])
+    return f"junction ({why})"
+
+
+def remove_link(link):
+    if is_junction(link):
+        os.rmdir(link)
+    else:
+        link.unlink()
+
+
 def plan_links(names, dirs, store):
     """[(client, link path, target)] for every skill and client, plus collisions that are never replaced."""
     links, collisions = [], []
     for client, folder in sorted(dirs.items()):
         for name in names:
             link, target = folder / name, store / "skills" / name
-            if link.is_symlink() and Path(os.readlink(link)) == target:
+            if link_target(link) == target:
                 links.append((client, link, target))
-            elif link.exists() or link.is_symlink():
+            elif link.exists() or link.is_symlink() or is_junction(link):
                 collisions.append(f"{client}: {link} exists and is not this release's link")
             else:
                 links.append((client, link, target))
@@ -142,10 +186,12 @@ def install(args, home, apply):
         if (home / STORE_PARENT / MANIFEST).exists():
             raise SystemExit("refused: a Peritia user install exists; run uninstall --apply first")
         sums = write_store(tree, store, files)
+    modes = set()
     for _client, link, target in links:
         link.parent.mkdir(parents=True, exist_ok=True)
-        if not link.is_symlink():
-            link.symlink_to(target, target_is_directory=True)
+        if link_target(link) is None:
+            modes.add(make_link(link, target))
+    print("link mode: " + (", ".join(sorted(modes)) or "links already present"))
     manifest = {"repo": repo, "tag": tag, "commit": commit, "store": str(store), "files": sums,
                 "links": [{"client": c, "link": str(l), "target": str(t)} for c, l, t in links],
                 "skipped_clients": skipped, "collisions": collisions}
@@ -185,10 +231,11 @@ def link_problems(manifest):
     bad = []
     for row in manifest["links"]:
         link = Path(row["link"])
-        if not link.is_symlink():
+        target = link_target(link)
+        if target is None:
             bad.append(f"link missing or replaced: {link}")
-        elif Path(os.readlink(link)) != Path(row["target"]):
-            bad.append(f"link points elsewhere: {link} -> {os.readlink(link)}")
+        elif target != Path(row["target"]):
+            bad.append(f"link points elsewhere: {link} -> {target}")
     return bad
 
 
@@ -206,13 +253,12 @@ def verify(home):
 def uninstall(home, apply):
     manifest = load_manifest(home)
     store = Path(manifest["store"])
-    ours = [Path(r["link"]) for r in manifest["links"] if Path(r["link"]).is_symlink()
-            and Path(os.readlink(r["link"])) == Path(r["target"])]
+    ours = [Path(r["link"]) for r in manifest["links"] if link_target(Path(r["link"])) == Path(r["target"])]
     print(f"{'uninstall' if apply else 'uninstall plan (dry run)'}: {len(ours)} links, store {store}")
     if not apply:
         return 0
     for link in ours:
-        link.unlink()
+        remove_link(link)
     for path in sorted(store.rglob("*"), reverse=True)[:MAX_FILES]:
         path.chmod(stat.S_IRWXU) if path.is_dir() else path.chmod(stat.S_IRUSR | stat.S_IWUSR)
     shutil.rmtree(store, ignore_errors=False)
@@ -227,9 +273,9 @@ def leftovers(home, manifest):
     store = Path(manifest["store"])
     left = [str(p) for p in (store, home / STORE_PARENT / MANIFEST) if p.exists() or p.is_symlink()]
     for row in manifest["links"]:
-        link = Path(row["link"])
-        if link.is_symlink() and str(os.readlink(link)).startswith(str(store)):
-            left.append(str(link))
+        target = link_target(Path(row["link"]))
+        if target is not None and str(target).startswith(str(store)):
+            left.append(row["link"])
     return left
 
 
@@ -276,9 +322,9 @@ def selftest_cases(root):
     extra.write_text("x\n", encoding="utf-8")
     cases.append(("added file refused", quiet(verify, home) == 1))
     extra.unlink()
-    Path(manifest["links"][0]["link"]).unlink()
+    remove_link(Path(manifest["links"][0]["link"]))
     cases.append(("missing link refused", quiet(verify, home) == 1))
-    Path(manifest["links"][0]["link"]).symlink_to(manifest["links"][0]["target"])
+    make_link(Path(manifest["links"][0]["link"]), Path(manifest["links"][0]["target"]))
     cases.append(("second install refused", refused(lambda: quiet(install, args, home, True))))
     cases.append(("uninstall leaves zero Peritia files", quiet(uninstall, home, True) == 0
                   and not leftovers(home, manifest) and (home / ".claude/skills/beta").is_dir()))
@@ -294,16 +340,25 @@ def refused(call):
 
 
 def selftest():
-    keep = os.environ.get("CODEX_HOME")
+    keep = {name: os.environ.get(name) for name in ("CODEX_HOME", LINK_MODE_ENV)}
+    modes = ["symlink", "junction"] if os.name == "nt" else ["symlink"]
+    cases = []
     try:
-        with tempfile.TemporaryDirectory() as tmp:
-            cases = selftest_cases(Path(tmp))
+        for mode in modes:
+            os.environ[LINK_MODE_ENV] = mode
+            with tempfile.TemporaryDirectory() as tmp:
+                cases += [(f"{mode}: {name}", ok) for name, ok in selftest_cases(Path(tmp))]
+        if os.name != "nt":
+            os.environ[LINK_MODE_ENV] = "junction"
+            cases.append(("junction mode refused off Windows", refused(lambda: make_link(Path("x"), Path("y")))))
     finally:
-        os.environ.pop("CODEX_HOME", None) if keep is None else os.environ.__setitem__("CODEX_HOME", keep)
+        for name, value in keep.items():
+            os.environ.pop(name, None) if value is None else os.environ.__setitem__(name, value)
     bad = [name for name, ok in cases if not ok]
     if bad:
         raise SystemExit(f"selftest failed: {bad}")
-    print(f"selftest ok: {len(cases)} cases (plan, install, collision, tamper, add, link, reinstall, uninstall)")
+    print(f"selftest ok: {len(cases)} cases, link modes {', '.join(modes)} "
+          "(plan, install, collision, tamper, add, link, reinstall, uninstall)")
     return 0
 
 
