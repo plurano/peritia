@@ -24,6 +24,7 @@ audit:
 # carries a licence (REUSE). The selftest plants one defect per rule and must see each refused.
 test: build
 	@python3 -B tools/check_skills.py selftest
+	@python3 -B tools/install_user_skills.py selftest
 	@reuse lint
 
 build:
