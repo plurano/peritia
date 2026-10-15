@@ -35,6 +35,26 @@ Pin a release tag of this repository, the way you pin any upstream dependency,
 and point your agent client's skill directory at the skills you want. A release
 never changes after it is tagged; updates arrive as new tags.
 
+To install one release for every coding client on a machine at once,
+`tools/install_user_skills.py` clones the release at its tag, keeps its skills
+in a store named after the tagged commit, and links each skill into the user
+skill folder of every client it finds: Claude Code (`~/.claude/skills`), Codex
+(`$CODEX_HOME/skills`), Antigravity (`~/.gemini/config/skills`), Gemini CLI
+(`~/.gemini/skills`) and opencode (`~/.agents/skills`, which opencode reads
+beside `~/.claude/skills`). It never replaces an existing entry of the same
+name, and it prints a plan unless you pass `--apply`:
+
+```sh
+python3 tools/install_user_skills.py plan --tag v0.1.0
+python3 tools/install_user_skills.py install --tag v0.1.0 --apply
+python3 tools/install_user_skills.py verify
+python3 tools/install_user_skills.py uninstall --apply
+```
+
+`verify` compares every stored file with the sha256 recorded at install and
+every link with its target, and fails on any change. `uninstall` removes the
+links and the store and reports how many Peritia paths remain (zero).
+
 ## Credits
 
 Every skill credits its upstream author and repository in its own `ORIGIN.md`.
