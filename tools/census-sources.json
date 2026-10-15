@@ -1,0 +1,54 @@
+{
+  "sources": [
+    {
+      "repository": "ComposioHQ/awesome-claude-skills",
+      "note": "Seed awesome list named in the census brief.",
+      "found_at": "https://github.com/ComposioHQ/awesome-claude-skills"
+    },
+    {
+      "repository": "K-Dense-AI/scientific-agent-skills",
+      "note": "Seed scientific skills repository named in the census brief.",
+      "found_at": "https://github.com/K-Dense-AI/scientific-agent-skills"
+    },
+    {
+      "repository": "affaan-m/ecc",
+      "note": "Seed repository named in the census brief.",
+      "found_at": "https://github.com/affaan-m/ecc"
+    },
+    {
+      "repository": "anthropics/skills",
+      "note": "Seed repository named in the census brief.",
+      "found_at": "https://github.com/anthropics/skills"
+    },
+    {
+      "repository": "bergside/awesome-design-skills",
+      "note": "Public awesome list found by fresh GitHub repository search for SKILL.md.",
+      "found_at": "https://github.com/search?q=SKILL.md&type=repositories"
+    },
+    {
+      "repository": "composio-community/awesome-codex-skills",
+      "note": "Seed awesome list named in the census brief.",
+      "found_at": "https://github.com/composio-community/awesome-codex-skills"
+    },
+    {
+      "repository": "microsoft/skills",
+      "note": "Public skills repository found by fresh GitHub repository search for SKILL.md.",
+      "found_at": "https://github.com/search?q=SKILL.md&type=repositories"
+    },
+    {
+      "repository": "obra/superpowers",
+      "note": "Seed repository named in the census brief.",
+      "found_at": "https://github.com/obra/superpowers"
+    },
+    {
+      "repository": "sickn33/agentic-awesome-skills",
+      "note": "Seed awesome list named in the census brief.",
+      "found_at": "https://github.com/sickn33/agentic-awesome-skills"
+    },
+    {
+      "repository": "vercel-labs/skills",
+      "note": "Public skills repository found through the skills.sh agent-skill registry.",
+      "found_at": "https://skills.sh"
+    }
+  ]
+}

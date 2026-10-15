@@ -25,6 +25,7 @@ audit:
 test: build
 	@python3 -B tools/check_skills.py selftest
 	@python3 -B tools/install_user_skills.py selftest
+	@python3 -B tools/test_census.py
 	@reuse lint
 
 build:
