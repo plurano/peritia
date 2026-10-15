@@ -47,3 +47,31 @@ Union Public Licence 1.2 ([LICENSES/EUPL-1.2.txt](LICENSES/EUPL-1.2.txt)).
 Upstream text keeps its own licence, recorded per file in `REUSE.toml` and
 shipped beside the skill as `LICENSE`. The repository follows the
 [REUSE](https://reuse.software) specification.
+
+<!-- praetor:readme-governance:start -->
+[![HISS Adopted][praetor-hiss-badge]][praetor-hiss-agents]
+[![Documentation Governance][praetor-docs-badge]][praetor-docs-runs]
+
+Praetor manages this repository's declared governance policy. This managed
+block records adoption state; it is not a verification certificate.
+
+**Verification**: `make verify-all` runs the repository's configured
+verification cascade.
+
+**HISS Audit**: `praetorctl audit` enforces policy, generated-surface
+integrity, and the debt ratchet.
+
+**Context Sync**: `praetorctl compile-context --verify` verifies every
+generated agent context against `AGENTS.md`.
+
+**Documentation**: `make docs-lint` enforces locked Markdown style and the
+private scratch-link policy.
+
+**Debt Baseline**: `.standards-baseline.json` anchors the debt ratchet at
+0 recorded infractions; audit forbids growth.
+
+[praetor-hiss-badge]: https://img.shields.io/badge/Standards-HISS%20Adopted-blue
+[praetor-hiss-agents]: https://github.com/plurano/peritia/blob/HEAD/AGENTS.md
+[praetor-docs-badge]: https://github.com/plurano/peritia/actions/workflows/praetor-docs.yml/badge.svg
+[praetor-docs-runs]: https://github.com/plurano/peritia/actions/workflows/praetor-docs.yml
+<!-- praetor:readme-governance:end -->
