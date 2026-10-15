@@ -75,6 +75,19 @@ guessed. Every row names its model, and an interrupted run resumes.
 `python3 tools/classify.py summary --out classified.tsv` counts the labels and
 names the domains no skill serves.
 
+`python3 tools/candidates.py run --census census.tsv --classified classified.tsv
+--checkouts <folder> --out candidates.tsv` decides, for every unique skill the
+census classified, whether it is an adoption candidate and under which licence,
+with the evidence for that licence. It resolves licences beside the skill, in
+front matter, through upstream GitHub repositories for sources marked with
+`--aggregator`, or from the repository licence, and groups them into permissive,
+weak, strong, and other classes. Permissive and weak licences become candidates,
+strong copyleft or conflicting aggregator licences are reported for review, and
+non-engineering functions, other domains, unresolvable licences, or untraced
+aggregator sources are refused with the rule recorded. `python3
+tools/candidates.py summary --candidates candidates.tsv` reports counts per
+verdict, per licence class, and per domain among candidates.
+
 ## Credits
 
 Every skill credits its upstream author and repository in its own `ORIGIN.md`.
