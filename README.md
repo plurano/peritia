@@ -1,0 +1,49 @@
+<!--
+SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
+SPDX-License-Identifier: EUPL-1.2
+-->
+
+# Peritia
+
+Peritia is one library of expert skills for coding agents: methodology
+(premise checks, verification before completion, root-cause analysis,
+estimation, decision records, postmortems, peer review), multi-agent role
+patterns, and domain experts. Each skill is adapted from an upstream source
+and keeps that source's credit, licence and pinned commit.
+
+## The name
+
+*Peritia* is Latin for expertise: practical skill that comes from experience
+(from *peritus*, experienced). It is pronounced PEH-ree-tee-ah.
+
+## Layout
+
+One directory per skill under `skills/`:
+
+| File | Holds |
+| --- | --- |
+| `SKILL.md` | the skill, in the form agent clients read |
+| `ORIGIN.md` | upstream repository, path, pinned commit, licence, and what this library changed |
+| `LICENSE` | the upstream licence text, unchanged, when the skill derives from one |
+
+A skill adapted from upstream lists its changes against the pinned upstream text
+in `ORIGIN.md`. A skill written here says so there.
+
+## Using it
+
+Pin a release tag of this repository, the way you pin any upstream dependency,
+and point your agent client's skill directory at the skills you want. A release
+never changes after it is tagged; updates arrive as new tags.
+
+## Credits
+
+Every skill credits its upstream author and repository in its own `ORIGIN.md`.
+The list of upstreams is in [CREDITS.md](CREDITS.md).
+
+## Licence
+
+Text written or adapted in this repository is licensed under the European
+Union Public Licence 1.2 ([LICENSES/EUPL-1.2.txt](LICENSES/EUPL-1.2.txt)).
+Upstream text keeps its own licence, recorded per file in `REUSE.toml` and
+shipped beside the skill as `LICENSE`. The repository follows the
+[REUSE](https://reuse.software) specification.

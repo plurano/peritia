@@ -1,0 +1,8 @@
+# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
+# SPDX-License-Identifier: EUPL-1.2
+#
+# Only files that cannot carry a header are named here: the upstream LICENSE
+# texts shipped beside each skill. There is deliberately no "**" table: a file
+# without its own header must fail `reuse lint`.
+
+version = 1
