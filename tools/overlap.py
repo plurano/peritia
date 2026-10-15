@@ -395,7 +395,7 @@ def build_groups(
         if row.get("same_use") == "true":
             a = row.get("a", "")
             b = row.get("b", "")
-            if a and b:
+            if a and b and a in items_by_id and b in items_by_id:
                 graph[a].add(b)
                 graph[b].add(a)
                 edges.add((min(a, b), max(a, b)))
@@ -430,36 +430,11 @@ def write_groups(groups_tsv: Path, groups: list[dict[str, Any]]) -> None:
             writer.writerow(g)
 
 
-def summary(
-    overlap_path: Path,
-    groups_path: Path,
-    candidates_path: Path | None = None,
-) -> str:
-    """Returns summary string counting candidates, overlap-free candidates, groups, and unjudged."""
-    num_groups = 0
-    num_groups_with_existing = 0
-    grouped_members: set[str] = set()
-    if groups_path.exists():
-        with groups_path.open(newline="", encoding="utf-8") as handle:
-            for i, row in enumerate(csv.DictReader(handle, delimiter="\t")):
-                if i >= MAX_GROUPS:
-                    break
-                num_groups += 1
-                if row.get("has_existing") == "true":
-                    num_groups_with_existing += 1
-                for m in row.get("members", "").split(","):
-                    if m.strip():
-                        grouped_members.add(m.strip())
-
-    num_unjudged = 0
-    if overlap_path.exists():
-        with overlap_path.open(newline="", encoding="utf-8") as handle:
-            for i, row in enumerate(csv.DictReader(handle, delimiter="\t")):
-                if i >= MAX_PAIRS:
-                    break
-                if row.get("same_use") == "unjudged":
-                    num_unjudged += 1
-
+def _load_summary_candidates(
+    candidates_path: Path | None,
+    limit: int | None,
+) -> tuple[int, set[str]]:
+    """Loads candidate count and candidate IDs for summary."""
     num_candidates = 0
     candidate_ids: set[str] = set()
     if candidates_path is not None and candidates_path.exists():
@@ -468,24 +443,108 @@ def summary(
                 if i >= MAX_CANDIDATES:
                     break
                 if row.get("verdict") == "candidate":
-                    num_candidates += 1
                     source = row.get("source", "").strip()
                     path_str = row.get("path", "").strip()
                     candidate_ids.add(f"{source}:{path_str}")
-
+                    num_candidates += 1
+                    if limit is not None and num_candidates >= limit:
+                        break
     if num_candidates == 0 and candidate_ids:
         num_candidates = len(candidate_ids)
+    return num_candidates, candidate_ids
 
-    if candidate_ids:
-        overlap_free_candidates = len(candidate_ids - grouped_members)
-    else:
-        overlap_free_candidates = 0
 
+def _build_valid_ids(
+    candidate_ids: set[str],
+    skills_dir: Path | None,
+) -> set[str] | None:
+    """Builds set of valid item IDs for summary filtering."""
+    if not candidate_ids:
+        return None
+    valid_ids = set(candidate_ids)
+    s_dir = skills_dir if skills_dir is not None else Path("skills")
+    if s_dir.is_dir():
+        valid_ids.update(item.item_id for item in load_existing_skills(s_dir))
+    return valid_ids
+
+
+def _count_groups(
+    groups_path: Path,
+    valid_ids: set[str] | None,
+    skills_dir: Path | None,
+) -> tuple[int, int, set[str]]:
+    """Counts groups, groups with existing skills, and grouped members."""
+    num_groups = 0
+    num_groups_with_existing = 0
+    grouped_members: set[str] = set()
+    if not groups_path.exists():
+        return num_groups, num_groups_with_existing, grouped_members
+
+    with groups_path.open(newline="", encoding="utf-8") as handle:
+        for i, row in enumerate(csv.DictReader(handle, delimiter="\t")):
+            if i >= MAX_GROUPS:
+                break
+            members = [m.strip() for m in row.get("members", "").split(",") if m.strip()]
+            if valid_ids is not None:
+                members = [
+                    m for m in members
+                    if m in valid_ids or (not (skills_dir and skills_dir.is_dir()) and m.startswith("skills/"))
+                ]
+                if len(members) < 2:
+                    continue
+            num_groups += 1
+            has_existing = any(m.startswith("skills/") for m in members) or (row.get("has_existing") == "true" and valid_ids is None)
+            if has_existing:
+                num_groups_with_existing += 1
+            for m in members:
+                grouped_members.add(m)
+    return num_groups, num_groups_with_existing, grouped_members
+
+
+def _count_unjudged(
+    overlap_path: Path,
+    valid_ids: set[str] | None,
+    skills_dir: Path | None,
+) -> int:
+    """Counts unjudged pairs between valid items."""
+    num_unjudged = 0
+    if not overlap_path.exists():
+        return 0
+    with overlap_path.open(newline="", encoding="utf-8") as handle:
+        for i, row in enumerate(csv.DictReader(handle, delimiter="\t")):
+            if i >= MAX_PAIRS:
+                break
+            if row.get("same_use") == "unjudged":
+                a = row.get("a", "")
+                b = row.get("b", "")
+                if valid_ids is not None:
+                    a_valid = a in valid_ids or (not (skills_dir and skills_dir.is_dir()) and a.startswith("skills/"))
+                    b_valid = b in valid_ids or (not (skills_dir and skills_dir.is_dir()) and b.startswith("skills/"))
+                    if not (a_valid and b_valid):
+                        continue
+                num_unjudged += 1
+    return num_unjudged
+
+
+def summary(
+    overlap_path: Path,
+    groups_path: Path,
+    candidates_path: Path | None = None,
+    skills_dir: Path | None = None,
+    limit: int | None = None,
+) -> str:
+    """Returns summary string counting candidates, overlap-free candidates, groups, and unjudged."""
+    num_candidates, candidate_ids = _load_summary_candidates(candidates_path, limit)
+    valid_ids = _build_valid_ids(candidate_ids, skills_dir)
+    num_groups, num_existing, grouped_members = _count_groups(groups_path, valid_ids, skills_dir)
+    num_unjudged = _count_unjudged(overlap_path, valid_ids, skills_dir)
+
+    overlap_free = len(candidate_ids - grouped_members) if candidate_ids else 0
     lines = [
         f"candidates: {num_candidates}",
-        f"overlap-free candidates: {overlap_free_candidates}",
+        f"overlap-free candidates: {overlap_free}",
         f"groups: {num_groups}",
-        f"groups with an existing skill: {num_groups_with_existing}",
+        f"groups with an existing skill: {num_existing}",
         f"unjudged pairs: {num_unjudged}",
     ]
     return "\n".join(lines)
@@ -631,6 +690,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     sum_cmd.add_argument("--overlap", type=Path, default=Path("overlap.tsv"), help="overlap TSV file")
     sum_cmd.add_argument("--groups", type=Path, default=Path("groups.tsv"), help="groups TSV file")
     sum_cmd.add_argument("--candidates", type=Path, default=Path("candidates.tsv"), help="candidates TSV file")
+    sum_cmd.add_argument("--skills-dir", type=Path, default=Path("skills"), help="existing skills folder")
 
     return parser.parse_args(argv)
 
@@ -638,7 +698,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
     if args.command == "summary":
-        print(summary(args.overlap, args.groups, args.candidates))
+        print(summary(args.overlap, args.groups, args.candidates, skills_dir=args.skills_dir))
         return 0
     client = OllamaClient(args.base_url, args.embed_model, args.judge_model, args.timeout)
     run(
@@ -654,7 +714,7 @@ def main(argv: list[str]) -> int:
         k=args.k,
         limit=args.limit,
     )
-    print(summary(args.out, args.groups, args.candidates))
+    print(summary(args.out, args.groups, args.candidates, skills_dir=args.skills_dir, limit=args.limit))
     return 0
 
 

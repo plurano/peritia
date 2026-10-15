@@ -34,6 +34,34 @@ def write_skill_file(folder: Path, rel_path: str, text: str) -> Path:
     return target
 
 
+def write_sample_resumption_overlap(path: Path) -> Path:
+    """Pre-writes overlap.tsv with sample pairs for resumption tests."""
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=overlap.OVERLAP_FIELDS, delimiter="\t", lineterminator="\n")
+        writer.writeheader()
+        writer.writerow({
+            "a": "s:c1/SKILL.md", "b": "s:dropped/SKILL.md", "cosine": "0.9500",
+            "rank": "1", "name_match": "false", "same_use": "true",
+            "reason": "old pair 1", "model": "old-model",
+        })
+        writer.writerow({
+            "a": "s:dropped/SKILL.md", "b": "s:c3/SKILL.md", "cosine": "0.9400",
+            "rank": "2", "name_match": "false", "same_use": "true",
+            "reason": "old pair 2", "model": "old-model",
+        })
+        writer.writerow({
+            "a": "s:c1/SKILL.md", "b": "s:c4/SKILL.md", "cosine": "0.9300",
+            "rank": "3", "name_match": "false", "same_use": "true",
+            "reason": "pair between current candidates", "model": "old-model",
+        })
+        writer.writerow({
+            "a": "s:dropped/SKILL.md", "b": "s:c4/SKILL.md", "cosine": "0.9000",
+            "rank": "4", "name_match": "false", "same_use": "unjudged",
+            "reason": "unjudged old pair", "model": "old-model",
+        })
+    return path
+
+
 class OverlapRankingTests(unittest.TestCase):
     def test_nearest_k_picks_k_nearest_and_same_name(self):
         cand = overlap.Item("source/a:cand/SKILL.md", "b_cand", "plan_work", "planning skill")
@@ -363,6 +391,77 @@ class OverlapGroupAndJudgeTests(unittest.TestCase):
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["model"], "old-model")
             self.assertEqual(rows[0]["same_use"], "true")
+
+    def test_build_groups_filters_pairs_outside_item_set(self):
+        item_a = overlap.Item("a", "ba", "a", "desc a")
+        item_c = overlap.Item("c", "bc", "c", "desc c")
+        item_d = overlap.Item("d", "bd", "d", "desc d")
+        # "dropped" is not in all_items
+        all_items = [item_a, item_c, item_d]
+        rows = [
+            {"a": "a", "b": "dropped", "same_use": "true"},
+            {"a": "dropped", "b": "c", "same_use": "true"},
+            {"a": "a", "b": "d", "same_use": "true"},
+        ]
+        groups = overlap.build_groups(rows, all_items)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["members"], "a,d")
+        self.assertEqual(groups[0]["edges"], "a|d")
+
+    def test_resumed_run_with_dropped_candidate_excludes_dropped_from_groups_and_summary(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            out_overlap = tmp / "overlap.tsv"
+            out_groups = tmp / "groups.tsv"
+            checkouts = tmp / "checkouts"
+
+            write_sample_resumption_overlap(out_overlap)
+
+            # Candidates TSV: dropped is refused, only c1, c3, c4 are candidates
+            cand_tsv = write_candidates(tmp, [
+                {"blob_id": "b1", "source": "s", "path": "c1/SKILL.md", "skill_name": "c1", "verdict": "candidate"},
+                {"blob_id": "b_drop", "source": "s", "path": "dropped/SKILL.md", "skill_name": "dropped", "verdict": "refused"},
+                {"blob_id": "b3", "source": "s", "path": "c3/SKILL.md", "skill_name": "c3", "verdict": "candidate"},
+                {"blob_id": "b4", "source": "s", "path": "c4/SKILL.md", "skill_name": "c4", "verdict": "candidate"},
+            ])
+            write_skill_file(checkouts, "s/c1/SKILL.md", "---\nname: c1\ndescription: d1\n---\n")
+            write_skill_file(checkouts, "s/c3/SKILL.md", "---\nname: c3\ndescription: d3\n---\n")
+            write_skill_file(checkouts, "s/c4/SKILL.md", "---\nname: c4\ndescription: d4\n---\n")
+
+            judge_calls = []
+            overlap.run(
+                candidates_tsv=cand_tsv,
+                checkouts=checkouts,
+                skills_dir=tmp / "skills",
+                overlap_out=out_overlap,
+                groups_out=out_groups,
+                embed_fn=lambda texts: [[1.0, 0.0] for _ in texts],
+                judge_fn=lambda prompt: judge_calls.append(prompt) or {"same_use": False, "reason": "no"},
+                judge_model="new-model",
+            )
+
+            # 1. No group is made through the dropped item:
+            with out_groups.open(newline="", encoding="utf-8") as handle:
+                groups = list(csv.DictReader(handle, delimiter="\t"))
+            self.assertEqual(len(groups), 1)
+            # A pair between two current items still groups:
+            self.assertEqual(groups[0]["members"], "s:c1/SKILL.md,s:c4/SKILL.md")
+            self.assertEqual(groups[0]["edges"], "s:c1/SKILL.md|s:c4/SKILL.md")
+            # Dropped item is not in groups, c3 is not bridged to c1
+            self.assertNotIn("s:dropped/SKILL.md", groups[0]["members"])
+            self.assertNotIn("s:c3/SKILL.md", groups[0]["members"])
+
+            # 2. Pairs outside current set stay in overlap.tsv (resume keeps them)
+            with out_overlap.open(newline="", encoding="utf-8") as handle:
+                overlap_rows = list(csv.DictReader(handle, delimiter="\t"))
+            self.assertTrue(any("s:dropped/SKILL.md" in (r["a"], r["b"]) for r in overlap_rows))
+
+            # 3. Overlap-free count and summary follow the current set:
+            rep = overlap.summary(out_overlap, out_groups, cand_tsv)
+            self.assertIn("candidates: 3", rep)
+            self.assertIn("overlap-free candidates: 1", rep)  # c3 is overlap-free
+            self.assertIn("groups: 1", rep)
+            self.assertIn("unjudged pairs: 0", rep)  # dropped-c4 unjudged pair is ignored
 
 
 class OverlapEmbeddingAndCacheTests(unittest.TestCase):
