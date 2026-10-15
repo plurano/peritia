@@ -77,3 +77,117 @@ SPDX-FileCopyrightText = [
     "Meta Platforms, Inc. and affiliates",
 ]
 SPDX-License-Identifier = "EUPL-1.2 AND MIT"
+
+[[annotations]]
+path = ["skills/pre-mortem/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "Copyright (c) 2026 avelikiy"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/skeptical-triage/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "Copyright (c) 2026 avelikiy"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/brooks-review/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "Copyright (c) 2025 hyhmrright"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/peer-review/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "Copyright (c) 2025 K-Dense Inc."
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/bernstein-run/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "Copyright 2026 Alex Chernysh"
+SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
+path = ["skills/scientific-problem-selection/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "Copyright [2025] [ToolUniverse team]"
+SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
+path = ["skills/codebase-recon/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "Copyright (c) 2026 Jiachen Yu"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/verification-before-completion/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "Copyright (c) 2025 Jesse Vincent"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/systematic-debugging/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "Copyright (c) 2025 Jesse Vincent"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/subagent-driven-development/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "Copyright (c) 2025 Jesse Vincent"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/writing-plans/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "Copyright (c) 2025 Jesse Vincent"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/writing-skills/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "Copyright (c) 2025 Jesse Vincent"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/architecture-decision-records/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "Copyright (c) 2024 Seth Hobson"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/brendangregg-use-tsa/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "Copyright (c) 2026 thecsdoctor"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/postmortem-writing/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "Copyright (c) 2024 Seth Hobson"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/progressive-estimation/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "Copyright (c) 2026 Stanislav Shymanskyi"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/experimental-design/**"]
+precedence = "override"
+SPDX-FileCopyrightText = [
+    "2026 Lusoris <lusoris@pm.me>",
+    "Copyright (c) 2025 K-Dense Inc.",
+]
+SPDX-License-Identifier = "EUPL-1.2 AND MIT"
+
+[[annotations]]
+path = ["skills/battery-modeling/**"]
+precedence = "override"
+SPDX-FileCopyrightText = [
+    "2026 Lusoris <lusoris@pm.me>",
+    "Copyright (c) 2025 K-Dense Inc.",
+]
+SPDX-License-Identifier = "EUPL-1.2 AND MIT"
