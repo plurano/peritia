@@ -85,6 +85,98 @@ class CensusTests(unittest.TestCase):
         result = self.collect(records, [source("a/no-license")])
         self.assertEqual("licence:none", result.rows[0].ineligible)
 
+    def test_nested_scripts_license_does_not_count(self):
+        records = {
+            "a/nested-lic": {
+                "pin": "a" * 40,
+                "license": "none",
+                "tree": {"truncated": False, "tree": [
+                    entry("skill-a/SKILL.md", "1" * 40),
+                    entry("skill-a/scripts/LICENSE", "2" * 40),
+                ]},
+            },
+        }
+        result = self.collect(records, [source("a/nested-lic")])
+        self.assertEqual(1, len(result.rows))
+        self.assertEqual("n", result.rows[0].folder_license)
+        self.assertEqual("licence:none", result.rows[0].ineligible)
+        self.assertEqual(2, result.rows[0].folder_file_count)
+
+    def test_license_txt_beside_skill_counts(self):
+        records = {
+            "a/txt-lic": {
+                "pin": "a" * 40,
+                "license": "none",
+                "tree": {"truncated": False, "tree": [
+                    entry("skill-a/SKILL.md", "1" * 40),
+                    entry("skill-a/LICENSE.txt", "2" * 40),
+                ]},
+            },
+        }
+        result = self.collect(records, [source("a/txt-lic")])
+        self.assertEqual(1, len(result.rows))
+        self.assertEqual("y", result.rows[0].folder_license)
+        self.assertEqual("", result.rows[0].ineligible)
+
+    def test_licence_and_copying_count(self):
+        records = {
+            "a/spelling": {
+                "pin": "a" * 40,
+                "license": "none",
+                "tree": {"truncated": False, "tree": [
+                    entry("skill-uk/SKILL.md", "1" * 40),
+                    entry("skill-uk/LICENCE", "2" * 40),
+                    entry("skill-gnu/SKILL.md", "3" * 40),
+                    entry("skill-gnu/COPYING", "4" * 40),
+                ]},
+            },
+        }
+        result = self.collect(records, [source("a/spelling")])
+        self.assertEqual(2, len(result.rows))
+        self.assertEqual("y", result.rows[0].folder_license)
+        self.assertEqual("", result.rows[0].ineligible)
+        self.assertEqual("y", result.rows[1].folder_license)
+        self.assertEqual("", result.rows[1].ineligible)
+
+    def test_root_level_skill_with_root_license_counts(self):
+        records = {
+            "a/root-skill": {
+                "pin": "a" * 40,
+                "license": "none",
+                "tree": {"truncated": False, "tree": [
+                    entry("SKILL.md", "1" * 40),
+                    entry("LICENSE", "2" * 40),
+                    entry("nested/SKILL.md", "3" * 40),
+                ]},
+            },
+        }
+        result = self.collect(records, [source("a/root-skill")])
+        self.assertEqual(2, len(result.rows))
+        self.assertEqual("SKILL.md", result.rows[0].path)
+        self.assertEqual("y", result.rows[0].folder_license)
+        self.assertEqual("", result.rows[0].ineligible)
+        self.assertEqual("nested/SKILL.md", result.rows[1].path)
+        self.assertEqual("n", result.rows[1].folder_license)
+        self.assertEqual("licence:none", result.rows[1].ineligible)
+
+    def test_is_folder_license_naming_rules(self):
+        self.assertTrue(census.is_folder_license("LICENSE"))
+        self.assertTrue(census.is_folder_license("LICENCE"))
+        self.assertTrue(census.is_folder_license("COPYING"))
+        self.assertTrue(census.is_folder_license("license"))
+        self.assertTrue(census.is_folder_license("LICENSE.txt"))
+        self.assertTrue(census.is_folder_license("LICENSE.md"))
+        self.assertTrue(census.is_folder_license("COPYING.md"))
+        self.assertTrue(census.is_folder_license("LICENCE.rst"))
+        self.assertFalse(census.is_folder_license("COPYING.LESSER"))
+        self.assertFalse(census.is_folder_license("copying.lesser"))
+        self.assertFalse(census.is_folder_license("COPYING.LESSER.txt"))
+        self.assertFalse(census.is_folder_license("LICENSE.txt.bak"))
+        self.assertFalse(census.is_folder_license("LICENSE."))
+        self.assertFalse(census.is_folder_license(".LICENSE"))
+        self.assertFalse(census.is_folder_license("SKILL.md"))
+        self.assertFalse(census.is_folder_license("README.md"))
+
     def test_truncated_tree_uses_fallback(self):
         records = {
             "a/truncated": {
