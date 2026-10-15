@@ -591,6 +591,139 @@ class CandidatesTests(unittest.TestCase):
             self.assertIn("clause functions:none 1", rep)
             self.assertIn("clause domains:other 1", rep)
 
+    def test_copies_collapsed_to_canonical(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            checkouts = folder / "checkouts"
+            write_skill(checkouts, "src/repo", "skills/x/SKILL.md", "---\nname: x\n---\nbody\n")
+            write_skill(checkouts, "src/repo", ".agents/skills/x/SKILL.md", "---\nname: x\n---\nbody\n")
+            write_skill(checkouts, "src/repo", "docs/ja-JP/skills/x/SKILL.md", "---\nname: x\n---\nbody\n")
+            census_p = write_census(folder, [
+                {"source": "src/repo", "path": "skills/x/SKILL.md", "skill_name": "x", "blob_id": "b1", "repository_license": "MIT"},
+                {"source": "src/repo", "path": ".agents/skills/x/SKILL.md", "skill_name": "x", "blob_id": "b2", "repository_license": "MIT"},
+                {"source": "src/repo", "path": "docs/ja-JP/skills/x/SKILL.md", "skill_name": "x", "blob_id": "b3", "repository_license": "MIT"},
+            ])
+            class_p = write_classified(folder, [
+                {"blob_id": "b1", "source": "src/repo", "path": "skills/x/SKILL.md", "skill_name": "x", "functions": "coding", "domains": "governance-devtooling", "status": "ok"},
+                {"blob_id": "b2", "source": "src/repo", "path": ".agents/skills/x/SKILL.md", "skill_name": "x", "functions": "coding", "domains": "governance-devtooling", "status": "ok"},
+                {"blob_id": "b3", "source": "src/repo", "path": "docs/ja-JP/skills/x/SKILL.md", "skill_name": "x", "functions": "coding", "domains": "governance-devtooling", "status": "ok"},
+            ])
+            out = folder / "out.tsv"
+            res = candidates.run(census_p, class_p, checkouts, out, [], FakeGitHubReader())
+            self.assertEqual(len(res), 3)
+            by_path = {r.path: r for r in res}
+            canonical = by_path["skills/x/SKILL.md"]
+            mirror = by_path[".agents/skills/x/SKILL.md"]
+            locale = by_path["docs/ja-JP/skills/x/SKILL.md"]
+
+            self.assertEqual(canonical.verdict, "candidate")
+            self.assertEqual(canonical.match_clause, "domain")
+            self.assertEqual(canonical.reason, "")
+
+            self.assertEqual(mirror.verdict, "refused")
+            self.assertEqual(mirror.match_clause, "")
+            self.assertEqual(mirror.reason, "copy-of:skills/x/SKILL.md")
+
+            self.assertEqual(locale.verdict, "refused")
+            self.assertEqual(locale.match_clause, "")
+            self.assertEqual(locale.reason, "copy-of:skills/x/SKILL.md")
+
+            rep = candidates.summary(out)
+            self.assertIn("copies 2", rep)
+            self.assertIn("copies=2", rep)
+
+    def test_copies_across_different_sources_stay_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            checkouts = folder / "checkouts"
+            write_skill(checkouts, "source-a/repo", "skills/x/SKILL.md", "---\nname: x\n---\nbody\n")
+            write_skill(checkouts, "source-b/repo", "skills/x/SKILL.md", "---\nname: x\n---\nbody\n")
+            census_p = write_census(folder, [
+                {"source": "source-a/repo", "path": "skills/x/SKILL.md", "skill_name": "x", "blob_id": "b1", "repository_license": "MIT"},
+                {"source": "source-b/repo", "path": "skills/x/SKILL.md", "skill_name": "x", "blob_id": "b2", "repository_license": "MIT"},
+            ])
+            class_p = write_classified(folder, [
+                {"blob_id": "b1", "source": "source-a/repo", "path": "skills/x/SKILL.md", "skill_name": "x", "functions": "coding", "domains": "governance-devtooling", "status": "ok"},
+                {"blob_id": "b2", "source": "source-b/repo", "path": "skills/x/SKILL.md", "skill_name": "x", "functions": "coding", "domains": "governance-devtooling", "status": "ok"},
+            ])
+            out = folder / "out.tsv"
+            res = candidates.run(census_p, class_p, checkouts, out, [], FakeGitHubReader())
+            self.assertEqual(len(res), 2)
+            self.assertEqual(res[0].verdict, "candidate")
+            self.assertEqual(res[0].reason, "")
+            self.assertEqual(res[1].verdict, "candidate")
+            self.assertEqual(res[1].reason, "")
+            rep = candidates.summary(out)
+            self.assertIn("copies 0", rep)
+
+    def test_canonical_choice_deterministic_all_mirrors_shortest_path_wins(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            checkouts = folder / "checkouts"
+            write_skill(checkouts, "src/repo", ".cursor/skills/x/SKILL.md", "---\nname: x\n---\nbody\n")
+            write_skill(checkouts, "src/repo", ".kiro/skills/x/SKILL.md", "---\nname: x\n---\nbody\n")
+            write_skill(checkouts, "src/repo", ".agents/skills/x/SKILL.md", "---\nname: x\n---\nbody\n")
+            census_p = write_census(folder, [
+                {"source": "src/repo", "path": ".cursor/skills/x/SKILL.md", "skill_name": "x", "blob_id": "b1", "repository_license": "MIT"},
+                {"source": "src/repo", "path": ".kiro/skills/x/SKILL.md", "skill_name": "x", "blob_id": "b2", "repository_license": "MIT"},
+                {"source": "src/repo", "path": ".agents/skills/x/SKILL.md", "skill_name": "x", "blob_id": "b3", "repository_license": "MIT"},
+            ])
+            class_p = write_classified(folder, [
+                {"blob_id": "b1", "source": "src/repo", "path": ".cursor/skills/x/SKILL.md", "skill_name": "x", "functions": "coding", "domains": "governance-devtooling", "status": "ok"},
+                {"blob_id": "b2", "source": "src/repo", "path": ".kiro/skills/x/SKILL.md", "skill_name": "x", "functions": "coding", "domains": "governance-devtooling", "status": "ok"},
+                {"blob_id": "b3", "source": "src/repo", "path": ".agents/skills/x/SKILL.md", "skill_name": "x", "functions": "coding", "domains": "governance-devtooling", "status": "ok"},
+            ])
+            out = folder / "out.tsv"
+            res = candidates.run(census_p, class_p, checkouts, out, [], FakeGitHubReader())
+            self.assertEqual(len(res), 3)
+            by_path = {r.path: r for r in res}
+            canonical = by_path[".kiro/skills/x/SKILL.md"]
+            self.assertEqual(canonical.verdict, "candidate")
+            self.assertEqual(canonical.reason, "")
+
+            cursor_copy = by_path[".cursor/skills/x/SKILL.md"]
+            self.assertEqual(cursor_copy.verdict, "refused")
+            self.assertEqual(cursor_copy.reason, "copy-of:.kiro/skills/x/SKILL.md")
+
+            agents_copy = by_path[".agents/skills/x/SKILL.md"]
+            self.assertEqual(agents_copy.verdict, "refused")
+            self.assertEqual(agents_copy.reason, "copy-of:.kiro/skills/x/SKILL.md")
+
+    def test_underscore_and_hyphen_names_collapse(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            checkouts = folder / "checkouts"
+            write_skill(checkouts, "src/repo", "skills/my_skill/SKILL.md", "---\nname: my_skill\n---\nbody\n")
+            write_skill(checkouts, "src/repo", ".agents/skills/my-skill/SKILL.md", "---\nname: my-skill\n---\nbody\n")
+            census_p = write_census(folder, [
+                {"source": "src/repo", "path": "skills/my_skill/SKILL.md", "skill_name": "my_skill", "blob_id": "b1", "repository_license": "MIT"},
+                {"source": "src/repo", "path": ".agents/skills/my-skill/SKILL.md", "skill_name": "my-skill", "blob_id": "b2", "repository_license": "MIT"},
+            ])
+            class_p = write_classified(folder, [
+                {"blob_id": "b1", "source": "src/repo", "path": "skills/my_skill/SKILL.md", "skill_name": "my_skill", "functions": "coding", "domains": "governance-devtooling", "status": "ok"},
+                {"blob_id": "b2", "source": "src/repo", "path": ".agents/skills/my-skill/SKILL.md", "skill_name": "my-skill", "functions": "coding", "domains": "governance-devtooling", "status": "ok"},
+            ])
+            out = folder / "out.tsv"
+            res = candidates.run(census_p, class_p, checkouts, out, [], FakeGitHubReader())
+            self.assertEqual(len(res), 2)
+            by_path = {r.path: r for r in res}
+            canonical = by_path["skills/my_skill/SKILL.md"]
+            mirror = by_path[".agents/skills/my-skill/SKILL.md"]
+            self.assertEqual(canonical.verdict, "candidate")
+            self.assertEqual(mirror.verdict, "refused")
+            self.assertEqual(mirror.reason, "copy-of:skills/my_skill/SKILL.md")
+
+    def test_canonical_choice_lexical_tie_breaker(self) -> None:
+        rows = [
+            candidates.CandidateRow("1", "src/repo", ".zeta/skills/x", "x", "coding", "d", "domain", "MIT", "permissive", "f", "candidate", ""),
+            candidates.CandidateRow("2", "src/repo", ".beta/skills/x", "x", "coding", "d", "domain", "MIT", "permissive", "f", "candidate", ""),
+        ]
+        res = candidates.collapse_copies(rows)
+        by_path = {r.path: r for r in res}
+        self.assertEqual(by_path[".beta/skills/x"].verdict, "candidate")
+        self.assertEqual(by_path[".zeta/skills/x"].verdict, "refused")
+        self.assertEqual(by_path[".zeta/skills/x"].reason, "copy-of:.beta/skills/x")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -88,9 +88,12 @@ them into permissive, weak, strong, and other classes. Permissive and weak
 licences become candidates, strong copyleft or conflicting aggregator licences
 are reported for review, and non-engineering functions (`none`), other domains
 when no core function applies, unresolvable licences, or untraced aggregator
-sources are refused with the rule recorded. `python3 tools/candidates.py summary
---candidates candidates.tsv` reports counts per verdict, per clause, per
-licence class, and per domain among candidates.
+sources are refused with the rule recorded. It collapses extra copies of a
+skill inside the same source repository (client mirrors, translations under
+locale folders) to one canonical candidate, refusing every other copy with
+reason `copy-of:<canonical path>`. `python3 tools/candidates.py summary
+--candidates candidates.tsv` reports counts per verdict, per clause, refused
+copies, per licence class, and per domain among candidates.
 
 `python3 tools/overlap.py run --candidates candidates.tsv --checkouts <folder>
 --out overlap.tsv --groups groups.tsv --judge-model <name>` finds, for every

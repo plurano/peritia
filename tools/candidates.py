@@ -612,6 +612,97 @@ def write_tsv(rows: list[CandidateRow], out_path: Path) -> None:
             writer.writerow(row.values())
 
 
+LOCALE_SUBDIR_PATTERN = re.compile(r"^[a-zA-Z]{2}(?:-[a-zA-Z0-9]+)*$")
+
+
+def normalize_name(name: str) -> str:
+    """Normalises skill name: lower case, - and _ equal."""
+    return name.lower().replace("_", "-")
+
+
+normalize_skill_name = normalize_name
+
+
+def is_locale_path(path_str: str) -> bool:
+    """Checks whether path contains a docs/<ll> or docs/<ll>-<RR> segment (e.g. docs/ja-JP)."""
+    parts = Path(path_str).parts
+    for i in range(len(parts) - 1):
+        if parts[i] == "docs" and LOCALE_SUBDIR_PATTERN.match(parts[i + 1]):
+            return True
+    return False
+
+
+def is_mirror_path(path_str: str) -> bool:
+    """Checks whether path contains a client mirror folder segment starting with a dot."""
+    parts = Path(path_str).parts
+    for part in parts:
+        if part.startswith(".") and part not in (".", ".."):
+            return True
+    return False
+
+
+def is_deprioritized_path(path_str: str) -> bool:
+    """A path under a locale folder or a client mirror folder."""
+    return is_locale_path(path_str) or is_mirror_path(path_str)
+
+
+def canonical_copy_key(row: CandidateRow) -> tuple[bool, int, str]:
+    """Sort key for canonical copy selection:
+
+    1. Path under neither locale nor mirror folder (False < True).
+    2. Shortest path.
+    3. Lexically first path.
+    """
+    return (is_deprioritized_path(row.path), len(row.path), row.path)
+
+
+def collapse_copies(rows: list[CandidateRow]) -> list[CandidateRow]:
+    """Collapses extra copies of a skill inside one source to one canonical candidate.
+
+    Copies: candidate rows with the same source and the same normalised skill name.
+    Canonical copy: path under neither locale nor mirror; then shortest; then lexical.
+    Every other copy has verdict refused, reason 'copy-of:<canonical path>'.
+    """
+    cand_groups: dict[tuple[str, str], list[CandidateRow]] = {}
+    for row in rows:
+        if row.verdict == "candidate":
+            key = (row.source, normalize_name(row.skill_name))
+            cand_groups.setdefault(key, []).append(row)
+
+    refused_copies: dict[int, str] = {}
+    for group in cand_groups.values():
+        if len(group) > 1:
+            canonical = min(group, key=canonical_copy_key)
+            for cand in group:
+                if cand is not canonical:
+                    refused_copies[id(cand)] = canonical.path
+
+    if not refused_copies:
+        return rows
+
+    collapsed: list[CandidateRow] = []
+    for row in rows:
+        if id(row) in refused_copies:
+            canon_path = refused_copies[id(row)]
+            collapsed.append(CandidateRow(
+                blob_id=row.blob_id,
+                source=row.source,
+                path=row.path,
+                skill_name=row.skill_name,
+                functions=row.functions,
+                domains=row.domains,
+                match_clause="",
+                licence=row.licence,
+                licence_class=row.licence_class,
+                licence_evidence=row.licence_evidence,
+                verdict="refused",
+                reason=f"copy-of:{canon_path}",
+            ))
+        else:
+            collapsed.append(row)
+    return collapsed
+
+
 def run(
     census_path: Path,
     classified_path: Path,
@@ -636,6 +727,7 @@ def run(
         if classified_row is None:
             continue
         rows.append(decide_row(census_row, classified_row, checkouts, agg_set, tracer))
+    rows = collapse_copies(rows)
     write_tsv(rows, out_path)
     return rows
 
@@ -645,6 +737,7 @@ def summary(candidates_path: Path) -> str:
     classes: Counter[str] = Counter()
     domains: Counter[str] = Counter()
     clauses: Counter[str] = Counter()
+    copies = 0
     with candidates_path.open(newline="", encoding="utf-8") as handle:
         for i, row in enumerate(csv.DictReader(handle, delimiter="\t")):
             if i >= MAX_ROWS:
@@ -662,10 +755,13 @@ def summary(candidates_path: Path) -> str:
                 r = row.get("reason", "")
                 if r in ("functions:none", "domains:other"):
                     clauses[r] += 1
+                if r.startswith("copy-of:"):
+                    copies += 1
     total = sum(verdicts.values())
-    lines = [f"candidates: rows={total} candidate={verdicts['candidate']} report={verdicts['report']} refused={verdicts['refused']}"]
+    lines = [f"candidates: rows={total} candidate={verdicts['candidate']} report={verdicts['report']} refused={verdicts['refused']} copies={copies}"]
     lines += [f"verdict {v} {verdicts[v]}" for v in ("candidate", "report", "refused")]
     lines += [f"clause {c} {clauses[c]}" for c in ("domain", "core-function", "functions:none", "domains:other")]
+    lines += [f"copies {copies}"]
     lines += [f"licence_class {c} {classes[c]}" for c in ("permissive", "weak", "strong", "other")]
     lines += [f"candidate_domain {d} {domains[d]}" for d in DOMAINS]
     return "\n".join(lines)
