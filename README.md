@@ -78,15 +78,19 @@ names the domains no skill serves.
 `python3 tools/candidates.py run --census census.tsv --classified classified.tsv
 --checkouts <folder> --out candidates.tsv` decides, for every unique skill the
 census classified, whether it is an adoption candidate and under which licence,
-with the evidence for that licence. It resolves licences beside the skill, in
-front matter, through upstream GitHub repositories for sources marked with
-`--aggregator`, or from the repository licence, and groups them into permissive,
-weak, strong, and other classes. Permissive and weak licences become candidates,
-strong copyleft or conflicting aggregator licences are reported for review, and
-non-engineering functions, other domains, unresolvable licences, or untraced
-aggregator sources are refused with the rule recorded. `python3
-tools/candidates.py summary --candidates candidates.tsv` reports counts per
-verdict, per licence class, and per domain among candidates.
+with the evidence for that licence. A skill matches when functions are not only
+`none` and either domains are not only `other` or functions include a core
+engineering class; `match_clause` records whether each candidate was admitted
+by `domain` or `core-function` (empty for refused rows). It resolves licences
+beside the skill, in front matter, through upstream GitHub repositories for
+sources marked with `--aggregator`, or from the repository licence, and groups
+them into permissive, weak, strong, and other classes. Permissive and weak
+licences become candidates, strong copyleft or conflicting aggregator licences
+are reported for review, and non-engineering functions (`none`), other domains
+when no core function applies, unresolvable licences, or untraced aggregator
+sources are refused with the rule recorded. `python3 tools/candidates.py summary
+--candidates candidates.tsv` reports counts per verdict, per clause, per
+licence class, and per domain among candidates.
 
 ## Credits
 

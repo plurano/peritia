@@ -261,7 +261,7 @@ class CandidatesTests(unittest.TestCase):
             cases = [
                 ("err", {"status": "error", "functions": "coding", "domains": "windows-platform"}, {}, "status:error"),
                 ("none_f", {"status": "ok", "functions": "none", "domains": "windows-platform"}, {}, "functions:none"),
-                ("oth_d", {"status": "ok", "functions": "coding", "domains": "other"}, {}, "domains:other"),
+                ("oth_d", {"status": "ok", "functions": "design-frontend", "domains": "other"}, {}, "domains:other"),
                 ("inel", {"status": "ok", "functions": "coding", "domains": "windows-platform"}, {"ineligible": "licence:none"}, "ineligible:licence:none"),
             ]
             for i, (name, class_overrides, census_overrides, want_reason) in enumerate(cases):
@@ -281,9 +281,9 @@ class CandidatesTests(unittest.TestCase):
             folder = Path(tmp)
             out = folder / "candidates.tsv"
             rows = [
-                candidates.CandidateRow("1", "a/b", "p1", "s1", "coding", "governance-devtooling", "MIT", "permissive", "folder", "candidate", ""),
-                candidates.CandidateRow("2", "a/b", "p2", "s2", "coding", "go-service-framework", "GPL-3.0", "strong", "folder", "report", ""),
-                candidates.CandidateRow("3", "a/b", "p3", "s3", "none", "other", "none", "other", "repository", "refused", "licence:none evidence:repository"),
+                candidates.CandidateRow("1", "a/b", "p1", "s1", "coding", "governance-devtooling", "domain", "MIT", "permissive", "folder", "candidate", ""),
+                candidates.CandidateRow("2", "a/b", "p2", "s2", "coding", "go-service-framework", "domain", "GPL-3.0", "strong", "folder", "report", ""),
+                candidates.CandidateRow("3", "a/b", "p3", "s3", "none", "other", "", "none", "other", "repository", "refused", "licence:none evidence:repository"),
             ]
             candidates.write_tsv(rows, out)
             rep = candidates.summary(out)
@@ -291,6 +291,10 @@ class CandidatesTests(unittest.TestCase):
             self.assertIn("verdict candidate 1", rep)
             self.assertIn("verdict report 1", rep)
             self.assertIn("verdict refused 1", rep)
+            self.assertIn("clause domain 1", rep)
+            self.assertIn("clause core-function 0", rep)
+            self.assertIn("clause functions:none 0", rep)
+            self.assertIn("clause domains:other 0", rep)
             self.assertIn("licence_class permissive 1", rep)
             self.assertIn("licence_class strong 1", rep)
             self.assertIn("candidate_domain governance-devtooling 1", rep)
@@ -501,6 +505,91 @@ class CandidatesTests(unittest.TestCase):
             self.assertEqual((row.licence, row.licence_class, row.verdict),
                              ("AGPL-3.0-only", "strong", "report"))
             self.assertEqual(candidates.licence_class("AGPL-3.0-only"), "strong")
+
+    def test_core_functions_is_subset_of_classify_functions(self) -> None:
+        from classify import FUNCTIONS
+        self.assertTrue(candidates.CORE_FUNCTIONS.issubset(FUNCTIONS))
+        expected_core = {
+            "coding", "review-audit", "testing", "ci-release", "docs-writing",
+            "research", "planning-fleet-mgmt", "security", "infra-ops",
+        }
+        self.assertEqual(candidates.CORE_FUNCTIONS, expected_core)
+
+    def test_domain_other_with_coding_is_candidate_core_function(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            checkouts = folder / "checkouts"
+            write_skill(checkouts, "solo/repo", "skills/s_core/SKILL.md", "---\nname: s_core\n---\nbody\n")
+            census_p = write_census(folder, [{"source": "solo/repo", "path": "skills/s_core/SKILL.md", "skill_name": "s_core", "blob_id": "b_core", "repository_license": "MIT"}])
+            class_p = write_classified(folder, [{"blob_id": "b_core", "source": "solo/repo", "path": "skills/s_core/SKILL.md", "skill_name": "s_core", "functions": "coding", "domains": "other", "status": "ok"}])
+            out = folder / "out.tsv"
+            res = candidates.run(census_p, class_p, checkouts, out, [], FakeGitHubReader())
+            self.assertEqual(len(res), 1)
+            row = res[0]
+            self.assertEqual(row.verdict, "candidate")
+            self.assertEqual(row.match_clause, "core-function")
+            self.assertEqual(row.reason, "")
+
+    def test_planted_marketing_skill_refused_functions_none(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            checkouts = folder / "checkouts"
+            write_skill(checkouts, "solo/repo", "skills/s_mkt/SKILL.md", "---\nname: s_mkt\n---\nbody\n")
+            census_p = write_census(folder, [{"source": "solo/repo", "path": "skills/s_mkt/SKILL.md", "skill_name": "s_mkt", "blob_id": "b_mkt", "repository_license": "MIT"}])
+            class_p = write_classified(folder, [{"blob_id": "b_mkt", "source": "solo/repo", "path": "skills/s_mkt/SKILL.md", "skill_name": "s_mkt", "functions": "none", "domains": "other", "status": "ok"}])
+            out = folder / "out.tsv"
+            res = candidates.run(census_p, class_p, checkouts, out, [], FakeGitHubReader())
+            self.assertEqual(len(res), 1)
+            row = res[0]
+            self.assertEqual(row.verdict, "refused")
+            self.assertEqual(row.reason, "functions:none")
+            self.assertEqual(row.match_clause, "")
+
+    def test_domain_other_non_core_refused_domains_other(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            checkouts = folder / "checkouts"
+            write_skill(checkouts, "solo/repo", "skills/s_nc/SKILL.md", "---\nname: s_nc\n---\nbody\n")
+            for non_core in ("design-frontend", "media"):
+                census_p = write_census(folder, [{"source": "solo/repo", "path": "skills/s_nc/SKILL.md", "skill_name": f"s_{non_core}", "blob_id": f"b_{non_core}", "repository_license": "MIT"}])
+                class_p = write_classified(folder, [{"blob_id": f"b_{non_core}", "source": "solo/repo", "path": "skills/s_nc/SKILL.md", "skill_name": f"s_{non_core}", "functions": non_core, "domains": "other", "status": "ok"}])
+                out = folder / f"out_{non_core}.tsv"
+                res = candidates.run(census_p, class_p, checkouts, out, [], FakeGitHubReader())
+                self.assertEqual(res[0].verdict, "refused")
+                self.assertEqual(res[0].reason, "domains:other")
+                self.assertEqual(res[0].match_clause, "")
+
+    def test_fleet_domain_skill_gets_match_clause_domain(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            checkouts = folder / "checkouts"
+            write_skill(checkouts, "solo/repo", "skills/s_fl/SKILL.md", "---\nname: s_fl\n---\nbody\n")
+            census_p = write_census(folder, [{"source": "solo/repo", "path": "skills/s_fl/SKILL.md", "skill_name": "s_fl", "blob_id": "b_fl", "repository_license": "MIT"}])
+            class_p = write_classified(folder, [{"blob_id": "b_fl", "source": "solo/repo", "path": "skills/s_fl/SKILL.md", "skill_name": "s_fl", "functions": "coding", "domains": "governance-devtooling", "status": "ok"}])
+            out = folder / "out.tsv"
+            res = candidates.run(census_p, class_p, checkouts, out, [], FakeGitHubReader())
+            self.assertEqual(len(res), 1)
+            row = res[0]
+            self.assertEqual(row.verdict, "candidate")
+            self.assertEqual(row.match_clause, "domain")
+            self.assertEqual(row.reason, "")
+
+    def test_summary_clauses_reporting(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            out = folder / "candidates.tsv"
+            rows = [
+                candidates.CandidateRow("1", "a/b", "p1", "s1", "coding", "governance-devtooling", "domain", "MIT", "permissive", "folder", "candidate", ""),
+                candidates.CandidateRow("2", "a/b", "p2", "s2", "coding", "other", "core-function", "MIT", "permissive", "folder", "candidate", ""),
+                candidates.CandidateRow("3", "a/b", "p3", "s3", "none", "other", "", "MIT", "permissive", "folder", "refused", "functions:none"),
+                candidates.CandidateRow("4", "a/b", "p4", "s4", "media", "other", "", "MIT", "permissive", "folder", "refused", "domains:other"),
+            ]
+            candidates.write_tsv(rows, out)
+            rep = candidates.summary(out)
+            self.assertIn("clause domain 1", rep)
+            self.assertIn("clause core-function 1", rep)
+            self.assertIn("clause functions:none 1", rep)
+            self.assertIn("clause domains:other 1", rep)
 
 
 if __name__ == "__main__":

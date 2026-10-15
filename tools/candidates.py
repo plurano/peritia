@@ -25,7 +25,20 @@ if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
 from check_skills import FIELD, FRONT  # noqa: E402
-from classify import DOMAINS  # noqa: E402
+from classify import DOMAINS, FUNCTIONS  # noqa: E402
+
+CORE_FUNCTIONS = frozenset({
+    "coding",
+    "review-audit",
+    "testing",
+    "ci-release",
+    "docs-writing",
+    "research",
+    "planning-fleet-mgmt",
+    "security",
+    "infra-ops",
+})
+assert CORE_FUNCTIONS.issubset(FUNCTIONS), f"unknown core functions: {CORE_FUNCTIONS - set(FUNCTIONS)}"
 
 MAX_ROWS = 200_000
 MAX_GH_CALLS = 2000
@@ -83,7 +96,7 @@ LICENSE_FILENAMES = (
 LICENSE_FILE_PATTERN = re.compile(r"\b(LICEN[SC]E|COPYING)(?:\.[A-Za-z0-9_-]+)?\b", re.I)
 
 OUTPUT_FIELDS = [
-    "blob_id", "source", "path", "skill_name", "functions", "domains",
+    "blob_id", "source", "path", "skill_name", "functions", "domains", "match_clause",
     "licence", "licence_class", "licence_evidence", "verdict", "reason",
 ]
 
@@ -122,6 +135,7 @@ class CandidateRow:
     skill_name: str
     functions: str
     domains: str
+    match_clause: str
     licence: str
     licence_class: str
     licence_evidence: str
@@ -131,7 +145,7 @@ class CandidateRow:
     def values(self) -> list[str]:
         return [
             self.blob_id, self.source, self.path, self.skill_name,
-            self.functions, self.domains, self.licence, self.licence_class,
+            self.functions, self.domains, self.match_clause, self.licence, self.licence_class,
             self.licence_evidence, self.verdict, self.reason,
         ]
 
@@ -345,7 +359,9 @@ def check_candidate_filter(classified_row: ClassifiedRow, census_row: CensusRow)
     if not func_list or set(func_list) == {"none"}:
         return "functions:none"
     dom_list = [d for d in classified_row.domains.split(";") if d]
-    if not dom_list or set(dom_list) == {"other"}:
+    has_fleet_domain = bool(dom_list and set(dom_list) != {"other"})
+    has_core_func = any(f in CORE_FUNCTIONS for f in func_list)
+    if not has_fleet_domain and not has_core_func:
         return "domains:other"
     if census_row.ineligible:
         return f"ineligible:{census_row.ineligible}"
@@ -478,6 +494,30 @@ def resolve_licence(
     return _resolve_non_aggregator_licence(census_row, skill_path, folder)
 
 
+def _escaped_row(census_row: CensusRow, classified_row: ClassifiedRow) -> CandidateRow:
+    return CandidateRow(
+        blob_id=census_row.blob_id,
+        source=census_row.source,
+        path=census_row.path,
+        skill_name=census_row.skill_name,
+        functions=classified_row.functions,
+        domains=classified_row.domains,
+        match_clause="",
+        licence="unknown",
+        licence_class="other",
+        licence_evidence="none",
+        verdict="refused",
+        reason="path leaves checkout",
+    )
+
+
+def _admit_clause(classified_row: ClassifiedRow) -> str:
+    dom_list = [d for d in classified_row.domains.split(";") if d]
+    if dom_list and set(dom_list) != {"other"}:
+        return "domain"
+    return "core-function"
+
+
 def decide_row(
     census_row: CensusRow,
     classified_row: ClassifiedRow,
@@ -487,37 +527,22 @@ def decide_row(
 ) -> CandidateRow:
     lic_res = resolve_licence(census_row, checkouts, aggregators, tracer)
     if lic_res is None:
-        return CandidateRow(
-            blob_id=census_row.blob_id,
-            source=census_row.source,
-            path=census_row.path,
-            skill_name=census_row.skill_name,
-            functions=classified_row.functions,
-            domains=classified_row.domains,
-            licence="unknown",
-            licence_class="other",
-            licence_evidence="none",
-            verdict="refused",
-            reason="path leaves checkout",
-        )
+        return _escaped_row(census_row, classified_row)
     licence, evidence = lic_res.licence, lic_res.evidence
     lic_cls = licence_class(licence)
     filter_reason = check_candidate_filter(classified_row, census_row)
     if filter_reason is not None:
-        verdict = "refused"
-        reason = filter_reason
+        verdict, reason = "refused", filter_reason
     elif lic_res.verdict is not None:
-        verdict = lic_res.verdict
-        reason = lic_res.reason
+        verdict, reason = lic_res.verdict, lic_res.reason
     elif lic_cls in ("permissive", "weak"):
-        verdict = "candidate"
-        reason = ""
+        verdict, reason = "candidate", ""
     elif lic_cls == "strong":
-        verdict = "report"
-        reason = ""
+        verdict, reason = "report", ""
     else:
-        verdict = "refused"
-        reason = f"licence:{licence} evidence:{evidence}"
+        verdict, reason = "refused", f"licence:{licence} evidence:{evidence}"
+
+    match_clause = "" if verdict == "refused" else _admit_clause(classified_row)
     return CandidateRow(
         blob_id=census_row.blob_id,
         source=census_row.source,
@@ -525,6 +550,7 @@ def decide_row(
         skill_name=census_row.skill_name,
         functions=classified_row.functions,
         domains=classified_row.domains,
+        match_clause=match_clause,
         licence=licence,
         licence_class=lic_cls,
         licence_evidence=evidence,
@@ -618,6 +644,7 @@ def summary(candidates_path: Path) -> str:
     verdicts: Counter[str] = Counter()
     classes: Counter[str] = Counter()
     domains: Counter[str] = Counter()
+    clauses: Counter[str] = Counter()
     with candidates_path.open(newline="", encoding="utf-8") as handle:
         for i, row in enumerate(csv.DictReader(handle, delimiter="\t")):
             if i >= MAX_ROWS:
@@ -628,9 +655,17 @@ def summary(candidates_path: Path) -> str:
             if v == "candidate":
                 for d in filter(None, row.get("domains", "").split(";")):
                     domains[d] += 1
+                mc = row.get("match_clause", "")
+                if mc in ("domain", "core-function"):
+                    clauses[mc] += 1
+            elif v == "refused":
+                r = row.get("reason", "")
+                if r in ("functions:none", "domains:other"):
+                    clauses[r] += 1
     total = sum(verdicts.values())
     lines = [f"candidates: rows={total} candidate={verdicts['candidate']} report={verdicts['report']} refused={verdicts['refused']}"]
     lines += [f"verdict {v} {verdicts[v]}" for v in ("candidate", "report", "refused")]
+    lines += [f"clause {c} {clauses[c]}" for c in ("domain", "core-function", "functions:none", "domains:other")]
     lines += [f"licence_class {c} {classes[c]}" for c in ("permissive", "weak", "strong", "other")]
     lines += [f"candidate_domain {d} {domains[d]}" for d in DOMAINS]
     return "\n".join(lines)
