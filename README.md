@@ -57,6 +57,14 @@ python3 tools/install_user_skills.py uninstall --apply
 every link with its target, and fails on any change. `uninstall` removes the
 links and the store and reports how many Peritia paths remain (zero).
 
+## Census
+
+`python3 tools/census.py run --out census.tsv` creates a deterministic TSV
+inventory of public `SKILL.md` files from the repositories in
+`tools/census-sources.json`. It pins each source head, records only tree
+metadata (never skill contents), and fails closed after writing any rows it
+could read. This is census data only; it does not classify or adopt skills.
+
 ## Credits
 
 Every skill credits its upstream author and repository in its own `ORIGIN.md`.
