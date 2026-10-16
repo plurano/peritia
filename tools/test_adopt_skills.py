@@ -614,6 +614,96 @@ class AdoptionTests(unittest.TestCase):
         self.assertTrue(any('extra row for extra' in p for p in problems), problems)
         self.assertEqual(check_skills.check(self.root), 1)
 
+    def test_already_adopted_candidate_is_present_and_no_second_directory(self):
+        self.fixture()
+        rows, totals = self.invoke(apply=True)
+        self.assertEqual(rows[0]['verdict'], 'adopted')
+        self.assertTrue((self.root / 'skills/demo').is_dir())
+        self.assertEqual(check_skills.check(self.root), 0)
+
+        rows2, totals2 = self.invoke(apply=True)
+        self.assertEqual(rows2[0]['verdict'], 'present')
+        self.assertEqual(rows2[0]['directory'], 'skills/demo')
+        self.assertEqual(rows2[0]['reason'], '')
+        self.assertFalse((self.root / 'skills/demo-owner').exists())
+        dirs = [p.name for p in (self.root / 'skills').iterdir() if p.is_dir()]
+        self.assertEqual(dirs, ['demo'])
+        self.assertIn('present=1', totals2)
+        self.assertIn('adopted=0', totals2)
+        self.assertEqual(check_skills.check(self.root), 0)
+
+    def test_present_candidate_different_commit_reported_not_rewritten(self):
+        self.fixture()
+        pin1 = self.census[0]['pin']
+        rows1, _ = self.invoke(apply=True)
+        self.assertEqual(rows1[0]['verdict'], 'adopted')
+        origin1 = (self.root / 'skills/demo/ORIGIN.md').read_text(encoding='utf-8')
+        self.assertIn(f'commit: {pin1}', origin1)
+
+        pin2 = 'f' * 40
+        self.census[0]['pin'] = pin2
+        rows2, _ = self.invoke(apply=True)
+        self.assertEqual(rows2[0]['verdict'], 'present')
+        self.assertEqual(rows2[0]['directory'], 'skills/demo')
+        self.assertEqual(rows2[0]['reason'], f'present: pinned {pin1[:12]}, census {pin2[:12]}')
+        origin2 = (self.root / 'skills/demo/ORIGIN.md').read_text(encoding='utf-8')
+        self.assertEqual(origin1, origin2)
+        self.assertIn(f'commit: {pin1}', origin2)
+        self.assertNotIn(pin2, origin2)
+
+    def test_group_whose_original_is_present_keeps_copy_refused(self):
+        orig_pin = self.source({'pack/demo/SKILL.md': MD.format(name='demo'), 'pack/demo/LICENSE': LICENCE},
+                                source='anthropics/skills')
+        orig_cand = self.candidate(name='demo', folder='pack/demo', source='anthropics/skills', pin=orig_pin,
+                                   blob_id='orig_blob', domains='coding;testing')
+        copy_pin = self.source({'pack/demo/SKILL.md': MD.format(name='demo'), 'pack/demo/LICENSE': LICENCE},
+                                source='ComposioHQ/awesome-claude-skills')
+        copy_cand = self.candidate(name='demo', folder='pack/demo', source='ComposioHQ/awesome-claude-skills', pin=copy_pin,
+                                   blob_id='copy_blob', domains='testing')
+        self.groups = [{
+            'group_id': '101',
+            'members': f'{orig_cand["source"]}:{orig_cand["path"]},{copy_cand["source"]}:{copy_cand["path"]}',
+        }]
+        cache_file = self.base / 'cache.json'
+        cache_file.write_text(json.dumps({'orig_blob': [1.0, 0.0], 'copy_blob': [0.99, math.sqrt(1 - 0.99**2)]}))
+
+        rows1, _ = self.invoke(apply=True, include_grouped=True, cache=cache_file)
+        self.assertEqual(rows1[0]['verdict'], 'adopted')
+        self.assertEqual(rows1[1]['verdict'], 'refused')
+        self.assertEqual(rows1[1]['reason'], f'copy-of:{orig_cand["source"]}:{orig_cand["path"]}')
+        self.assertTrue((self.root / 'skills/demo').is_dir())
+
+        rows2, _ = self.invoke(apply=True, include_grouped=True, cache=cache_file)
+        self.assertEqual(rows2[0]['verdict'], 'present')
+        self.assertEqual(rows2[0]['directory'], 'skills/demo')
+        self.assertEqual(rows2[1]['verdict'], 'refused')
+        self.assertEqual(rows2[1]['reason'], f'copy-of:{orig_cand["source"]}:{orig_cand["path"]}')
+        self.assertFalse((self.root / 'skills/demo-composiohq').exists())
+        dirs = [p.name for p in (self.root / 'skills').iterdir() if p.is_dir()]
+        self.assertEqual(dirs, ['demo'])
+
+    def test_fresh_candidate_with_colliding_name_gets_owner_suffix(self):
+        pin_other = self.source({'pack/demo/SKILL.md': MD.format(name='demo'), 'pack/demo/LICENSE': LICENCE},
+                                source='other/repo')
+        self.candidate(name='demo', folder='pack/demo', source='other/repo', pin=pin_other)
+        rows1, _ = self.invoke(apply=True)
+        self.assertEqual(rows1[0]['verdict'], 'adopted')
+        self.assertEqual(rows1[0]['directory'], 'skills/demo')
+        self.assertTrue((self.root / 'skills/demo').is_dir())
+
+        self.candidates, self.census = [], []
+        pin_fresh = self.source({'pack/custom/SKILL.md': MD.format(name='demo'), 'pack/custom/LICENSE': LICENCE},
+                                source='owner/repo')
+        self.candidate(name='demo', folder='pack/custom', source='owner/repo', pin=pin_fresh)
+        rows2, _ = self.invoke(apply=True)
+        self.assertEqual(rows2[0]['verdict'], 'adopted')
+        self.assertEqual(rows2[0]['directory'], 'skills/demo-owner')
+        skill = self.root / 'skills/demo-owner'
+        self.assertTrue(skill.is_dir())
+        self.assertIn('name: demo-owner\n', (skill / 'SKILL.md').read_text())
+        self.assertIn('name changed from demo to demo-owner', (skill / 'ORIGIN.md').read_text())
+        self.assertEqual(check_skills.check(self.root), 0)
+
 
 if __name__ == '__main__':
     unittest.main()

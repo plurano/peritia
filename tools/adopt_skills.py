@@ -494,7 +494,7 @@ def summary(rows, candidates):
     counts = Counter((candidate['functions'].split(';')[0] or 'none', row['verdict'])
                      for candidate, row in zip(candidates, rows))
     return '\n'.join(f'function {function}: ' + ', '.join(
-        f'{verdict}={counts[function, verdict]}' for verdict in ('adopted', 'refused', 'skipped-grouped'))
+        f'{verdict}={counts[function, verdict]}' for verdict in ('adopted', 'present', 'refused', 'skipped-grouped'))
         for function in sorted({function for function, _ in counts}))
 
 
@@ -519,6 +519,49 @@ def extract_source(origin_path: Path) -> str:
     if REPOSITORY.fullmatch(upstream):
         return upstream
     return upstream or 'peritia'
+
+
+def read_present_skills(skills_dir: Path) -> dict[tuple[str, str], dict[str, str]]:
+    if not skills_dir.is_dir():
+        return {}
+    present = {}
+    for d in sorted(p for p in skills_dir.iterdir() if p.is_dir()):
+        origin_file = d / 'ORIGIN.md'
+        if not origin_file.is_file():
+            continue
+        try:
+            rec = check_skills.fields(origin_file.read_text(encoding='utf-8'))
+            upstream = extract_source(origin_file)
+            if not upstream or upstream == 'peritia':
+                continue
+            raw_path = rec.get('path', '').strip()
+            if raw_path.endswith('/SKILL.md'):
+                origin_path = str(PurePosixPath(raw_path).parent)
+            elif raw_path:
+                origin_path = str(PurePosixPath(raw_path))
+            else:
+                origin_path = '.'
+            commit = rec.get('commit', '').strip()
+            key = (upstream.lower(), origin_path)
+            if key not in present:
+                present[key] = {
+                    'directory': f'skills/{d.name}',
+                    'commit': commit,
+                    'name': d.name,
+                }
+        except (OSError, UnicodeDecodeError):
+            continue
+    return present
+
+
+def candidate_folder(row: dict) -> str | None:
+    try:
+        path = safe_path(row['path'])
+        if path.name != 'SKILL.md':
+            return None
+        return str(path.parent)
+    except Refused:
+        return None
 
 
 def rebuild_index(root: Path, adopted_map: dict[str, dict] | None = None,
@@ -600,6 +643,18 @@ def get_member_skill_text(member: str, checkouts: Path, skills_dir: Path, pins: 
                     return data.decode('utf-8', errors='replace')[:judge_groups.MAX_SKILL_CHARS]
                 except Exception:
                     pass
+    if ':' in member and skills_dir.is_dir():
+        source, path_str = member.split(':', 1)
+        present = read_present_skills(skills_dir)
+        folder = str(PurePosixPath(path_str).parent) if path_str.endswith('/SKILL.md') else str(PurePosixPath(path_str))
+        key = (source.lower(), folder)
+        if key in present:
+            skill_md = skills_dir / present[key]['name'] / 'SKILL.md'
+            if skill_md.is_file():
+                try:
+                    return skill_md.read_text(encoding='utf-8', errors='replace')[:judge_groups.MAX_SKILL_CHARS]
+                except Exception:
+                    pass
     return ''
 
 
@@ -657,7 +712,8 @@ def resolve_copies(group_rows, checkouts, root, pins, all_candidates, cache, sou
 
 
 def evaluate(row, grouped, order, pins, checkouts, root, staging, occupied, apply, reader,
-             gate=markdown_gate, hiss_gate=hiss_gate, include_grouped=False, copies=None):
+             gate=markdown_gate, hiss_gate=hiss_gate, include_grouped=False, copies=None,
+             present=None):
     result = dict(zip(REPORT_FIELDS, (candidate_id(row), 'refused', '', '')))
     cid = result['candidate']
     if include_grouped:
@@ -671,6 +727,20 @@ def evaluate(row, grouped, order, pins, checkouts, root, staging, occupied, appl
     try:
         if cid not in order:
             raise Refused('candidate-not-in-census')
+        if present is None and root is not None:
+            present = read_present_skills(root / 'skills')
+        if present:
+            cand_folder = candidate_folder(row)
+            if cand_folder is not None:
+                key = (row['source'].lower(), cand_folder)
+                if key in present:
+                    info = present[key]
+                    old_commit = info['commit']
+                    new_commit = pins.get(row['source'], row.get('pin', ''))
+                    reason = ('' if old_commit == new_commit else
+                              f'present: pinned {old_commit[:12]}, census {new_commit[:12]}')
+                    result.update(verdict='present', directory=info['directory'], reason=reason)
+                    return result, None, ''
         if len(occupied) >= check_skills.MAX_SKILLS:
             raise Refused('skill-count-limit')
         skill, year = stage_one(row, pins[row['source']], checkouts, staging, occupied, apply, reader)
@@ -769,6 +839,7 @@ def run(candidates, groups, census, checkouts, root=Path('.'), *, apply=False,
 
     reuse, credits = initial_metadata(root)
     occupied = {path.name for path in (root / 'skills').iterdir() if path.is_dir()} if (root / 'skills').exists() else set()
+    present = read_present_skills(root / 'skills')
     rows = []
     adopted_map = {}
     with tempfile.TemporaryDirectory(prefix='adopt-skills-') as tmp:
@@ -780,7 +851,8 @@ def run(candidates, groups, census, checkouts, root=Path('.'), *, apply=False,
                 prepare_staging(root, staging)
                 result, skill, year = evaluate(row, grouped, order, pins, checkouts, root, staging,
                                                occupied, apply, reader, gate=gate, hiss_gate=hiss_gate,
-                                               include_grouped=include_grouped, copies=copies_map)
+                                               include_grouped=include_grouped, copies=copies_map,
+                                               present=present)
                 rows.append(result)
                 if skill is not None:
                     reuse, credits = add_metadata(reuse, credits, row, skill.name, year)
