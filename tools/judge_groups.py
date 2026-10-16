@@ -6,11 +6,10 @@
 For every same-use group from tools/overlap.py, scores each member skill on tasks from
 tools/eval-tasks.json using the eval-harness method (deterministic regex rules decide pass/fail,
 advisory model judge scores a rubric 0-10) across k trials per (skill, task). Decides
-keep-better (one member exceeds every other by >= 0.2 rule score, or by >= 2.0 judge score on
-rule ties), keep-both (members win distinct tasks where the other fails), propose-merge (tie or
-close score without distinct wins), or replace-proposed (an existing skill loses to a candidate;
-existing skills are never dropped). Outputs verdicts.tsv (including decided_by) and trials.jsonl,
-resuming previous trials without re-running.
+copy-of before model calls, then evaluates only the primary function's three tasks.
+Rule gaps >= 0.34 decide keep-better; opposite 3/3 versus 0/3 task wins decide keep-both.
+Otherwise a person decides. Rubric scores are advisory; existing skills are never dropped.
+Outputs verdicts.tsv and resumable trials.jsonl.
 """
 from __future__ import annotations
 
@@ -23,6 +22,7 @@ import urllib.error
 import urllib.request
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable
 
@@ -30,10 +30,13 @@ _TOOLS_DIR = Path(__file__).resolve().parent
 if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
-try:
-    from classify import FUNCTIONS  # noqa: E402
-except ImportError:
-    FUNCTIONS = {}
+from classify import FUNCTIONS  # noqa: E402
+from census import load_sources  # noqa: E402
+from candidates import AGGREGATOR_UPSTREAM_KEYS, parse_github_repo  # noqa: E402
+from overlap import (  # noqa: E402
+    Item, cosine_similarity, load_cache, load_candidates, load_existing_skills,
+    normalize_name, parse_frontmatter,
+)
 
 DEFAULT_MODEL = "qwen2.5:7b"
 DEFAULT_JUDGE_MODEL = "qwen2.5:7b"
@@ -44,7 +47,9 @@ DEFAULT_TIMEOUT = 300.0
 MAX_SKILL_CHARS = 6000
 ATTEMPTS = 2
 
-VERDICTS_FIELDS = ["group_id", "verdict", "decided_by", "kept", "dropped", "scores", "model", "judge_model"]
+VERDICTS_FIELDS = ["group_id", "verdict", "decided_by", "kept", "dropped", "scores", "model", "judge_model",
+                   "copies", "primary_class"]
+DEFAULT_SOURCES = _TOOLS_DIR / "census-sources.json"
 
 JUDGE_SYSTEM_PROMPT = (
     "You evaluate an AI assistant's response to an engineering task according to a rubric.\n"
@@ -77,6 +82,68 @@ def make_judge_prompt(prompt: str, rubric: str, answer: str) -> str:
 def is_existing_skill(member: str) -> bool:
     """True when skill is an existing repo skill under skills/."""
     return member.startswith("skills/")
+
+
+def primary_class(members: list[str], member_funcs: dict[str, set[str]]) -> str:
+    """Vote once per member and function; taxonomy order breaks ties."""
+    counts = Counter(fn for m in members for fn in member_funcs.get(m, set()) if fn != "none")
+    eligible = [fn for fn in FUNCTIONS if counts[fn]]
+    return max(eligible, key=lambda fn: counts[fn]) if eligible else ""
+
+
+def _copy_original(
+    a: str, b: str, items: dict[str, Item], metadata: dict[str, dict[str, str]],
+    embeddings: dict[str, list[float]], ranks: dict[str, int],
+) -> str | None:
+    """Prefer explicit provenance, then source rank, for a cross-source near-copy pair."""
+    sources = {m: m.split(":", 1)[0] if ":" in m else "" for m in (a, b)}
+    if sources[a].lower() == sources[b].lower():
+        return None
+    named = set()
+    for copy, original in ((a, b), (b, a)):
+        for field in AGGREGATOR_UPSTREAM_KEYS:
+            repo = parse_github_repo(metadata.get(copy, {}).get(field, ""))
+            if repo and repo.lower() == sources[original].lower():
+                named.add(original)
+    if named:
+        return next(iter(named)) if len(named) == 1 else None
+    if a not in items or b not in items:
+        return None
+    name_a, name_b = normalize_name(items[a].skill_name), normalize_name(items[b].skill_name)
+    if not name_a or name_a != name_b:
+        return None
+    va, vb = embeddings.get(items[a].blob_id), embeddings.get(items[b].blob_id)
+    if not va or not vb or len(va) != len(vb) or not cosine_similarity(va, vb) >= 0.97:
+        return None
+    if any(sources[m] not in ranks for m in (a, b)):
+        return None
+    return min((a, b), key=lambda m: (ranks[sources[m]], sources[m], m))
+
+
+def collapse_copies(
+    members: list[str], items: dict[str, Item], metadata: dict[str, dict[str, str]],
+    embeddings: dict[str, list[float]], ranks: dict[str, int],
+) -> tuple[list[str], dict[str, str]]:
+    """Resolve copy chains to one upstream; leave conflicts and cycles for evaluation."""
+    targets: dict[str, set[str]] = {m: set() for m in members}
+    for i, a in enumerate(members):
+        for b in members[i + 1:]:
+            original = _copy_original(a, b, items, metadata, embeddings, ranks)
+            if original:
+                targets[b if original == a else a].add(original)
+    resolved = {m: m for m in members if not targets[m]}
+    for _ in range(len(members)):
+        before = len(resolved)
+        for m in members:
+            if m in resolved or not targets[m].issubset(resolved):
+                continue
+            roots = {resolved[target] for target in targets[m]}
+            if len(roots) == 1:
+                resolved[m] = next(iter(roots))
+        if len(resolved) == before:
+            break
+    copies = {m: f"copy-of:{root}" for m, root in resolved.items() if m != root}
+    return [m for m in members if m not in copies], copies
 
 
 @dataclass(frozen=True)
@@ -316,138 +383,80 @@ class OllamaClient:
         return 0.0
 
 
+def _trial_state(records: list[dict[str, Any]], k: int) -> str:
+    """Missing or duplicated trials cannot establish an all-pass or all-fail task."""
+    if (len(records) != k or {r.get("trial") for r in records} != set(range(1, k + 1))
+            or any(type(r.get("pass")) is not bool for r in records)):
+        return "incomplete"
+    passes = sum(r["pass"] for r in records)
+    return "all-pass" if passes == k else "all-fail" if passes == 0 else "mixed"
+
+
 def _compute_metrics(
-    members: list[str],
-    tasks: list[Task],
-    trial_records: list[dict[str, Any]],
-    k: int,
-) -> tuple[dict[str, dict[str, Any]], dict[tuple[str, str], float]]:
-    """Computes pass_at_k, pass_pow_k, and member summary stats."""
+    members: list[str], tasks: list[Task], trial_records: list[dict[str, Any]], k: int,
+) -> tuple[dict[str, dict[str, Any]], dict[tuple[str, str], str]]:
+    """Report pass@k and pass^k; preserve trial completeness and unanimous outcomes."""
+    task_ids = {t.id for t in tasks}
     trials_by_mt: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for rec in trial_records:
-        trials_by_mt[(rec["member"], rec["task_id"])].append(rec)
-
-    pass_at_k: dict[tuple[str, str], float] = {}
-    pass_pow_k: dict[tuple[str, str], float] = {}
+        if rec["task_id"] in task_ids:
+            trials_by_mt[(rec["member"], rec["task_id"])].append(rec)
+    states, passed = {}, {}
     for m in members:
         for t in tasks:
-            t_trials = trials_by_mt.get((m, t.id), [])
-            passes = [bool(r.get("pass", False)) for r in t_trials]
-            pass_at_k[(m, t.id)] = 1.0 if any(passes) else 0.0
-            pass_pow_k[(m, t.id)] = 1.0 if (len(passes) >= k and all(passes)) else 0.0
-
-    stats: dict[str, dict[str, Any]] = {}
-    num_tasks = len(tasks)
+            records = trials_by_mt[(m, t.id)]
+            states[(m, t.id)] = _trial_state(records, k)
+            passed[(m, t.id)] = float(any(r.get("pass") is True for r in records))
+    stats = {}
     for m in members:
-        rule_score = (sum(pass_at_k[(m, t.id)] for t in tasks) / num_tasks) if num_tasks > 0 else 0.0
-        pass_pow = (sum(pass_pow_k[(m, t.id)] for t in tasks) / num_tasks) if num_tasks > 0 else 0.0
-        all_trials = [r for r in trial_records if r.get("member") == m]
-        rubrics = [float(r.get("rubric_score", 0.0)) for r in all_trials]
-        judge_score = (sum(rubrics) / len(rubrics)) if rubrics else 0.0
-        others = [o for o in members if o != m]
-        tasks_won = [
-            t.id for t in tasks
-            if pass_at_k[(m, t.id)] == 1.0 and any(pass_at_k[(o, t.id)] == 0.0 for o in others)
-        ]
+        rule_score = sum(passed[(m, t.id)] for t in tasks) / len(tasks) if tasks else 0.0
+        reliable = sum(states[(m, t.id)] == "all-pass" for t in tasks) / len(tasks) if tasks else 0.0
+        rubrics = [float(r.get("rubric_score", 0.0)) for t in tasks for r in trials_by_mt[(m, t.id)]]
         stats[m] = {
             "rule_score": rule_score,
-            "judge_score": judge_score,
+            "judge_score": sum(rubrics) / len(rubrics) if rubrics else 0.0,
             "pass_at_k": rule_score,
-            "pass_pow_k": pass_pow,
-            "tasks_won": tasks_won,
+            "pass_pow_k": reliable,
+            "tasks_won": [t.id for t in tasks if states[(m, t.id)] == "all-pass"
+                          and any(states[(o, t.id)] == "all-fail" for o in members if o != m)],
         }
-    return stats, pass_at_k
+    return stats, states
 
 
-def _find_distinct_pair(
-    members: list[str],
-    tasks: list[Task],
-    pass_at_k: dict[tuple[str, str], float],
-) -> tuple[str, str] | None:
-    """Finds two members who each win at least one task where the other fails."""
-    for i, a in enumerate(members):
-        for b in members[i + 1:]:
-            a_wins = any(pass_at_k[(a, t.id)] > pass_at_k[(b, t.id)] for t in tasks)
-            b_wins = any(pass_at_k[(b, t.id)] > pass_at_k[(a, t.id)] for t in tasks)
-            if a_wins and b_wins:
-                return (a, b)
-    return None
-
-
-def _judge_tie_break(
-    members: list[str],
-    member_stats: dict[str, Any],
-    scores_out: dict[str, Any],
-) -> tuple[str, list[str], list[str], dict[str, Any], str] | None:
-    """Breaks a rule-score tie if top judge score exceeds others by >= 2.0."""
-    sorted_by_judge = sorted(
-        members,
-        key=lambda m: (-round(member_stats[m]["judge_score"], 6), -round(member_stats[m]["rule_score"], 6), m),
-    )
-    top_judge, others_judge = sorted_by_judge[0], sorted_by_judge[1:]
-    top_judge_score = member_stats[top_judge]["judge_score"]
-    if all(round(top_judge_score - member_stats[o]["judge_score"], 6) >= 2.0 for o in others_judge):
-        losing_existing = [o for o in others_judge if is_existing_skill(o)]
-        dropped = [o for o in others_judge if not is_existing_skill(o)]
-        verdict = "replace-proposed" if losing_existing else "keep-better"
-        return verdict, [top_judge], dropped, scores_out, "judge"
-    return None
+def _distinct_wins(
+    a: str, b: str, tasks: list[Task], states: dict[tuple[str, str], str],
+) -> list[str]:
+    return [t.id for t in tasks if states[(a, t.id)] == "all-pass" and states[(b, t.id)] == "all-fail"]
 
 
 def decide_group(
-    members: list[str],
-    tasks: list[Task],
-    trial_records: list[dict[str, Any]],
-    k: int = DEFAULT_K,
+    members: list[str], tasks: list[Task], trial_records: list[dict[str, Any]], k: int = DEFAULT_K,
 ) -> tuple[str, list[str], list[str], dict[str, Any], str]:
-    """Decides keep-better, keep-both, propose-merge, or replace-proposed for a group."""
-    if not members:
-        return "propose-merge", [], [], {}, "none"
-
-    member_stats, pass_at_k = _compute_metrics(members, tasks, trial_records, k)
-    scores_out = {
-        m: {
-            "rule_score": round(member_stats[m]["rule_score"], 4),
-            "judge_score": round(member_stats[m]["judge_score"], 4),
-            "pass_at_k": round(member_stats[m]["pass_at_k"], 4),
-            "pass_pow_k": round(member_stats[m]["pass_pow_k"], 4),
-            "tasks_won": member_stats[m]["tasks_won"],
-        }
-        for m in members
-    }
+    """Settle only a clear rule gap or mutual unanimous task wins; rubric is advisory."""
+    if k < 1:
+        raise ValueError("k must be positive")
+    member_stats, states = _compute_metrics(members, tasks, trial_records, k)
+    scores = {m: {key: round(value, 4) if isinstance(value, float) else value
+                  for key, value in stats.items()} for m, stats in member_stats.items()}
+    undecided = ("person-decides", list(members), [], scores, "none")
+    if not members or not tasks or "incomplete" in states.values():
+        return undecided
     if len(members) == 1:
-        return "keep-better", members, [], scores_out, "rule"
-
-    sorted_members = sorted(
-        members,
-        key=lambda m: (-round(member_stats[m]["rule_score"], 6), -round(member_stats[m]["judge_score"], 6), m),
-    )
-    top, others = sorted_members[0], sorted_members[1:]
-    top_score = member_stats[top]["rule_score"]
-
-    if all(round(top_score - member_stats[o]["rule_score"], 6) >= 0.20 for o in others):
-        losing_existing = [o for o in others if is_existing_skill(o)]
-        dropped = [o for o in others if not is_existing_skill(o)]
-        verdict = "replace-proposed" if losing_existing else "keep-better"
-        return verdict, [top], dropped, scores_out, "rule"
-
-    # Rule gap < 0.2: check if top judge score exceeds every other member by >= 2.0
-    judge_decision = _judge_tie_break(members, member_stats, scores_out)
-    if judge_decision is not None:
-        return judge_decision
-
-    distinct_pair = _find_distinct_pair(members, tasks, pass_at_k)
-    if distinct_pair:
-        a, b = distinct_pair
-        a_over_b = [t.id for t in tasks if pass_at_k[(a, t.id)] > pass_at_k[(b, t.id)]]
-        b_over_a = [t.id for t in tasks if pass_at_k[(b, t.id)] > pass_at_k[(a, t.id)]]
-        scores_out[a]["distinct_use_vs"] = {b: a_over_b}
-        scores_out[b]["distinct_use_vs"] = {a: b_over_a}
-        kept = [a, b]
-        dropped = [m for m in members if m not in kept and not is_existing_skill(m)]
-        return "keep-both", kept, dropped, scores_out, "rule"
-
-    return "propose-merge", list(members), [], scores_out, "none"
+        return "keep-better", members, [], scores, "rule"
+    ordered = sorted(members, key=lambda m: (-member_stats[m]["rule_score"], m))
+    top, others = ordered[0], ordered[1:]
+    top_score = Decimal(str(member_stats[top]["rule_score"]))
+    if all(top_score - Decimal(str(member_stats[o]["rule_score"])) >= Decimal("0.34") for o in others):
+        verdict = "replace-proposed" if any(is_existing_skill(o) for o in others) else "keep-better"
+        return verdict, [top], [o for o in others if not is_existing_skill(o)], scores, "rule"
+    # Every pair must have evidence; a single pair cannot justify dropping a third member.
+    if k == 3:
+        wins = {m: {o: _distinct_wins(m, o, tasks, states) for o in members if o != m} for m in members}
+        if all(task_ids for opponents in wins.values() for task_ids in opponents.values()):
+            for m in members:
+                scores[m]["distinct_use_vs"] = wins[m]
+            return "keep-both", list(members), [], scores, "rule"
+    return undecided
 
 
 def _run_single_group(
@@ -455,30 +464,27 @@ def _run_single_group(
     eval_tasks: dict[str, list[Task]],
     member_funcs: dict[str, set[str]],
     done_trials: dict[tuple[str, str, int], dict[str, Any]],
-    checkouts: Path,
-    skills_dir: Path,
-    trials_out: Path,
+    checkouts: Path, skills_dir: Path, trials_out: Path,
     chat_fn: Callable[[str, str, float, int], str],
     judge_fn: Callable[[str], float],
-    model: str,
-    judge_model: str,
-    k: int,
-    temperature: float,
+    model: str, judge_model: str, k: int, temperature: float,
+    items: dict[str, Item],
+    embeddings: dict[str, list[float]],
+    ranks: dict[str, int],
 ) -> dict[str, Any]:
     """Evaluates a single group across tasks, recording new trials and returning a verdict row."""
     group_id, members = g["group_id"], g["members"]
-    union_funcs: set[str] = set()
-    for m in members:
-        union_funcs.update(member_funcs.get(m, set()))
-
-    group_tasks: list[Task] = []
-    for fn in sorted(union_funcs):
-        if fn in eval_tasks:
-            group_tasks.extend(eval_tasks[fn])
+    texts = {m: get_skill_text(m, checkouts, skills_dir) for m in members}
+    metadata = {m: parse_frontmatter(text) for m, text in texts.items()}
+    members, copies = collapse_copies(members, items, metadata, embeddings, ranks)
+    primary = primary_class(members, member_funcs)
+    group_tasks = eval_tasks.get(primary, [])
+    if primary and len(group_tasks) != 3:
+        raise ValueError(f"{primary}: expected exactly three evaluation tasks")
 
     group_trials: list[dict[str, Any]] = []
     for m in members:
-        skill_text = get_skill_text(m, checkouts, skills_dir)
+        skill_text = texts[m]
         for t in group_tasks:
             for trial_idx in range(1, k + 1):
                 key = (m, t.id, trial_idx)
@@ -499,6 +505,8 @@ def _run_single_group(
                 group_trials.append(rec)
 
     verdict, kept, dropped, scores, decided_by = decide_group(members, group_tasks, group_trials, k=k)
+    if verdict == "keep-better" and any(is_existing_skill(m) for m in copies):
+        verdict = "replace-proposed"
     return {
         "group_id": group_id,
         "verdict": verdict,
@@ -508,6 +516,8 @@ def _run_single_group(
         "scores": json.dumps(scores, sort_keys=True),
         "model": model,
         "judge_model": judge_model,
+        "copies": json.dumps(copies, sort_keys=True),
+        "primary_class": primary,
     }
 
 
@@ -529,8 +539,12 @@ def run(
     k: int = DEFAULT_K,
     temperature: float = DEFAULT_TEMPERATURE,
     limit: int | None = None,
+    cache_path: Path | None = None,
+    sources_path: Path = DEFAULT_SOURCES,
 ) -> list[dict[str, Any]]:
     """Runs evaluation on groups, writing verdicts.tsv and trials.jsonl."""
+    if k < 1:
+        raise ValueError("k must be positive")
     groups = load_groups(groups_tsv)
     if limit is not None:
         groups = groups[:limit]
@@ -538,6 +552,12 @@ def run(
     eval_tasks = load_eval_tasks(eval_tasks_json)
     member_funcs = load_member_functions(candidates_tsv, classified_tsv)
     done_trials = load_done_trials(trials_out)
+    ranks = {s.repository: s.rank for s in load_sources(sources_path)}
+    if cache_path is not None and not cache_path.is_file():
+        raise ValueError(f"embedding cache not found: {cache_path}")
+    embeddings = load_cache(cache_path)
+    candidates = load_candidates(candidates_tsv, checkouts) if candidates_tsv is not None else []
+    items = {item.item_id: item for item in candidates + load_existing_skills(skills_dir)}
 
     if chat_fn is None or judge_fn is None:
         client = OllamaClient(base_url, model, judge_model, timeout)
@@ -547,7 +567,7 @@ def run(
     verdicts_rows = [
         _run_single_group(
             g, eval_tasks, member_funcs, done_trials, checkouts, skills_dir,
-            trials_out, chat_fn, judge_fn, model, judge_model, k, temperature,
+            trials_out, chat_fn, judge_fn, model, judge_model, k, temperature, items, embeddings, ranks,
         )
         for g in groups
     ]
@@ -565,7 +585,7 @@ def run(
 def summary(verdicts_path: Path) -> str:
     """Summarises verdicts: counts per verdict, kept/dropped counts, and models used."""
     if not verdicts_path.exists():
-        return "groups: 0\nkeep-better: 0\nkeep-both: 0\npropose-merge: 0\nreplace-proposed: 0\ntotal kept skills: 0\ntotal dropped skills: 0\nmodels: none\njudge models: none"
+        return "groups: 0\nkeep-better: 0\nkeep-both: 0\nperson-decides: 0\nreplace-proposed: 0\ntotal kept skills: 0\ntotal dropped skills: 0\nmodels: none\njudge models: none"
     counts: Counter = Counter()
     total_kept = 0
     total_dropped = 0
@@ -589,7 +609,7 @@ def summary(verdicts_path: Path) -> str:
         f"groups: {total_groups}",
         f"keep-better: {counts['keep-better']}",
         f"keep-both: {counts['keep-both']}",
-        f"propose-merge: {counts['propose-merge']}",
+        f"person-decides: {counts['person-decides']}",
         f"replace-proposed: {counts['replace-proposed']}",
         f"total kept skills: {total_kept}",
         f"total dropped skills: {total_dropped}",
@@ -607,6 +627,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     run_cmd.add_argument("--groups", type=Path, default=Path("groups.tsv"), help="groups TSV from overlap.py")
     run_cmd.add_argument("--candidates", type=Path, default=Path("candidates.tsv"), help="candidates TSV")
     run_cmd.add_argument("--classified", type=Path, default=Path("classified.tsv"), help="classified TSV")
+    run_cmd.add_argument("--cache", type=Path, default=None, help="overlap stage blob-id embedding cache")
+    run_cmd.add_argument("--sources", type=Path, default=DEFAULT_SOURCES, help="ranked source manifest")
     run_cmd.add_argument("--checkouts", type=Path, default=Path("checkouts"), help="folder of checkouts")
     run_cmd.add_argument("--skills-dir", type=Path, default=Path("skills"), help="existing skills folder")
     run_cmd.add_argument("--eval-tasks", type=Path, default=Path("tools/eval-tasks.json"), help="eval tasks JSON")
@@ -640,6 +662,8 @@ def main(argv: list[str]) -> int:
         trials_out=args.trials_out,
         candidates_tsv=args.candidates,
         classified_tsv=args.classified,
+        cache_path=args.cache,
+        sources_path=args.sources,
         model=args.model,
         judge_model=args.judge_model,
         base_url=args.base_url,

@@ -10,7 +10,7 @@ import census
 
 
 def source(repository):
-    return census.Source(repository=repository, note="test source", found_at="https://example.test")
+    return census.Source(repository=repository, note="test source", found_at="https://example.test", rank=1)
 
 
 class FakeReader:
@@ -214,7 +214,7 @@ class ManifestTests(unittest.TestCase):
             return census.load_sources(path)
 
     def entry(self, repository="owner/name", **extra):
-        return {"repository": repository, "note": "a note", "found_at": "https://example.test", **extra}
+        return {"repository": repository, "note": "a note", "found_at": "https://example.test", "rank": 1, **extra}
 
     def test_shipped_manifest_loads(self):
         sources = census.load_sources(Path(__file__).with_name("census-sources.json"))
@@ -240,6 +240,16 @@ class ManifestTests(unittest.TestCase):
         for label, document in refused.items():
             with self.subTest(label), self.assertRaises(ValueError):
                 self.load(document)
+
+    def test_rank_validation(self):
+        self.assertEqual(self.load({"sources": [self.entry(rank=3)]})[0].rank, 3)
+        for rank in (0, -1, True, False, "1", 1.5, None):
+            with self.subTest(rank=rank), self.assertRaises(ValueError):
+                self.load({"sources": [self.entry(rank=rank)]})
+        missing = self.entry()
+        del missing["rank"]
+        with self.assertRaises(ValueError):
+            self.load({"sources": [missing]})
 
     def test_count_bound(self):
         at_bound = {"sources": [self.entry(f"owner/n{index}") for index in range(census.MAX_SOURCES)]}

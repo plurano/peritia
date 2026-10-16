@@ -24,7 +24,7 @@ from typing import Any, Iterable
 NETWORK_TIMEOUT_SECONDS = 30
 MAX_SOURCES = 1000
 MAX_MANIFEST_BYTES = 1 << 20
-SOURCE_FIELDS = frozenset({"repository", "note", "found_at"})
+SOURCE_FIELDS = frozenset({"repository", "note", "found_at", "rank"})
 REPOSITORY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+")
 MAX_SKILLS_PER_SOURCE = 100_000
 TEXT_SUFFIXES = frozenset({"", ".txt", ".rst", ".adoc", ".log", ".csv", ".tsv"})
@@ -64,6 +64,7 @@ class Source:
     repository: str
     note: str
     found_at: str
+    rank: int
 
 
 @dataclass
@@ -140,9 +141,11 @@ def load_sources(path: Path) -> list[Source]:
     seen: set[str] = set()
     for number, entry in enumerate(entries, 1):
         if not isinstance(entry, dict) or set(entry) != SOURCE_FIELDS:
-            raise ValueError(f"{path}: source {number} needs exactly repository, note and found_at")
-        if not all(isinstance(entry[key], str) and entry[key].strip() for key in SOURCE_FIELDS):
+            raise ValueError(f"{path}: source {number} needs exactly repository, note, found_at and rank")
+        if not all(isinstance(entry[key], str) and entry[key].strip() for key in SOURCE_FIELDS - {"rank"}):
             raise ValueError(f"{path}: source {number} has an empty or non-text field")
+        if type(entry["rank"]) is not int or entry["rank"] < 1:
+            raise ValueError(f"{path}: source {number} rank must be a positive integer")
         repository = entry["repository"]
         if not REPOSITORY_RE.fullmatch(repository):
             raise ValueError(f"{path}: source {number} repository {repository!r} is not owner/name")

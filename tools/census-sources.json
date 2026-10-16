@@ -3,52 +3,62 @@
     {
       "repository": "ComposioHQ/awesome-claude-skills",
       "note": "Seed awesome list named in the census brief.",
-      "found_at": "https://github.com/ComposioHQ/awesome-claude-skills"
+      "found_at": "https://github.com/ComposioHQ/awesome-claude-skills",
+      "rank": 3
     },
     {
       "repository": "K-Dense-AI/scientific-agent-skills",
       "note": "Seed scientific skills repository named in the census brief.",
-      "found_at": "https://github.com/K-Dense-AI/scientific-agent-skills"
+      "found_at": "https://github.com/K-Dense-AI/scientific-agent-skills",
+      "rank": 2
     },
     {
       "repository": "affaan-m/ecc",
       "note": "Seed repository named in the census brief.",
-      "found_at": "https://github.com/affaan-m/ecc"
+      "found_at": "https://github.com/affaan-m/ecc",
+      "rank": 2
     },
     {
       "repository": "anthropics/skills",
       "note": "Seed repository named in the census brief.",
-      "found_at": "https://github.com/anthropics/skills"
+      "found_at": "https://github.com/anthropics/skills",
+      "rank": 1
     },
     {
       "repository": "bergside/awesome-design-skills",
       "note": "Public awesome list found by fresh GitHub repository search for SKILL.md.",
-      "found_at": "https://github.com/search?q=SKILL.md&type=repositories"
+      "found_at": "https://github.com/search?q=SKILL.md&type=repositories",
+      "rank": 2
     },
     {
       "repository": "composio-community/awesome-codex-skills",
       "note": "Seed awesome list named in the census brief.",
-      "found_at": "https://github.com/composio-community/awesome-codex-skills"
+      "found_at": "https://github.com/composio-community/awesome-codex-skills",
+      "rank": 3
     },
     {
       "repository": "microsoft/skills",
       "note": "Public skills repository found by fresh GitHub repository search for SKILL.md.",
-      "found_at": "https://github.com/search?q=SKILL.md&type=repositories"
+      "found_at": "https://github.com/search?q=SKILL.md&type=repositories",
+      "rank": 1
     },
     {
       "repository": "obra/superpowers",
       "note": "Seed repository named in the census brief.",
-      "found_at": "https://github.com/obra/superpowers"
+      "found_at": "https://github.com/obra/superpowers",
+      "rank": 1
     },
     {
       "repository": "sickn33/agentic-awesome-skills",
       "note": "Seed awesome list named in the census brief.",
-      "found_at": "https://github.com/sickn33/agentic-awesome-skills"
+      "found_at": "https://github.com/sickn33/agentic-awesome-skills",
+      "rank": 4
     },
     {
       "repository": "vercel-labs/skills",
       "note": "Public skills repository found through the skills.sh agent-skill registry.",
-      "found_at": "https://skills.sh"
+      "found_at": "https://skills.sh",
+      "rank": 1
     }
   ]
 }
