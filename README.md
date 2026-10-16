@@ -130,6 +130,8 @@ are saved in `trials.jsonl` so interrupted runs resume without re-running, and
 `python3 tools/judge_groups.py summary --verdicts verdicts.tsv` reports counts
 per verdict, kept and dropped skills, and models used.
 
+`python3 -B tools/adopt_skills.py --candidates candidates.tsv --groups groups.tsv --census census.tsv --checkouts <folder> --root .` previews adoption in census order; add `--apply` to write accepted skills and upstream attribution in `REUSE.toml` and `CREDITS.md`, downloading missing licence texts into `LICENSES/` with `reuse`. `--report <path>` writes `adopt-report.tsv` there; without it no report file is written, and the repository root is refused as a report location. Grouped candidates wait for the group judge. Each skill comes from its census pin, with its licence text and an `ORIGIN.md`; collisions receive an owner suffix. Opening code fences without an info string in Markdown files get language `text` and record that in `ORIGIN.md`. Folders exceeding 200 files or 2 MiB, symlinks, unsafe paths, missing licence text, and failures of the skill checker, repository markdown gate, or HISS gate (staging the skill alone in a temporary root with `.standards.yaml` and `.standards-baseline.json` under `praetorctl baseline --verify --all-violations`) are refused individually; markdown and HISS refusals report the failing rule IDs and file. A missing `praetorctl` binary fails the run. Both modes print the same report and counts per primary function class; previews leave the repository and supplied checkout sparse patterns unchanged, fetching missing candidate blobs at their pin to evaluate every candidate.
+
 ## Credits
 
 Every skill credits its upstream author and repository in its own `ORIGIN.md`.
