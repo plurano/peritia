@@ -12,7 +12,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-MAX_SKILLS = 1000  # bounds the directories read (HISS-02)
+MAX_SKILLS = 5000  # bounds the directories read (HISS-02)
 FRONT = re.compile(r"\A---\n(.*?)\n---\n", re.S)
 FIELD = re.compile(r"^(?P<key>[a-z_]+):\s*(?P<value>.+)$", re.M)
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
