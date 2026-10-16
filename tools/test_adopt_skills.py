@@ -5,6 +5,8 @@
 import base64
 import csv
 import hashlib
+import json
+import math
 import shutil
 import subprocess
 import tempfile
@@ -83,9 +85,14 @@ class AdoptionTests(unittest.TestCase):
         adopt.git(checkout, 'sparse-checkout', 'set', mode, '--stdin', data=patterns)
         return pin
 
-    def candidate(self, name='demo', folder='pack/demo', source='owner/repo', pin=None, evidence='folder'):
+    def candidate(self, name='demo', folder='pack/demo', source='owner/repo', pin=None, evidence='folder',
+                  blob_id=None, domains=None):
         row = dict(source=source, path=folder + '/SKILL.md' if folder else 'SKILL.md', skill_name=name,
                    verdict='candidate', licence='MIT', licence_evidence=evidence, functions='testing;coding')
+        if blob_id is not None:
+            row['blob_id'] = blob_id
+        if domains is not None:
+            row['domains'] = domains
         self.candidates.append(row)
         self.census.append({key: row[key] for key in ('source', 'path')} | {'pin': pin})
         return row
@@ -105,14 +112,20 @@ class AdoptionTests(unittest.TestCase):
         return answers[endpoint]
 
     def invoke(self, *, apply=True, gate=passing_gate, hiss_gate=passing_gate, reader=None,
-               report=None, runner=None):
-        tsv(self.base / 'candidates.tsv', CANDIDATE_FIELDS, self.candidates)
+               report=None, runner=None, include_grouped=False, cache=None, sources=None):
+        cand_fields = list(CANDIDATE_FIELDS)
+        for key in ('blob_id', 'domains'):
+            if any(key in c for c in self.candidates) and key not in cand_fields:
+                cand_fields.append(key)
+        tsv(self.base / 'candidates.tsv', cand_fields, self.candidates)
         tsv(self.base / 'census.tsv', ['source', 'path', 'pin'], self.census)
-        tsv(self.base / 'groups.tsv', ['members'], self.groups)
+        group_fields = ['group_id', 'members'] if any('group_id' in g for g in self.groups) else ['members']
+        tsv(self.base / 'groups.tsv', group_fields, self.groups)
         return adopt.run(self.base / 'candidates.tsv', self.base / 'groups.tsv', self.base / 'census.tsv',
                          self.checkouts, self.root, apply=apply,
                          reader=self.reader if reader is None else reader, gate=gate,
-                         hiss_gate=hiss_gate, report=report, runner=runner)
+                         hiss_gate=hiss_gate, report=report, runner=runner,
+                         include_grouped=include_grouped, cache=cache, sources=sources)
 
     def test_folder_licence_origin_reuse_and_checker(self):
         self.fixture(extra={'pack/demo/scripts/helper.py': 'print("example")\n'})
@@ -490,6 +503,116 @@ class AdoptionTests(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             self.invoke(report=self.root / 'adopt-report.tsv')
         self.assertIn('repository root refused', str(ctx.exception))
+
+    def test_group_adopts_original_and_refuses_composio_copy(self):
+        orig_pin = self.source({'pack/demo/SKILL.md': MD.format(name='demo'), 'pack/demo/LICENSE': LICENCE},
+                               source='anthropics/skills')
+        orig_cand = self.candidate(name='demo', folder='pack/demo', source='anthropics/skills', pin=orig_pin,
+                                   blob_id='orig_blob', domains='coding;testing')
+        copy_pin = self.source({'pack/demo/SKILL.md': MD.format(name='demo'), 'pack/demo/LICENSE': LICENCE},
+                               source='ComposioHQ/awesome-claude-skills')
+        copy_cand = self.candidate(name='demo', folder='pack/demo', source='ComposioHQ/awesome-claude-skills', pin=copy_pin,
+                                   blob_id='copy_blob', domains='testing')
+        self.groups = [{
+            'group_id': '101',
+            'members': f'{orig_cand["source"]}:{orig_cand["path"]},{copy_cand["source"]}:{copy_cand["path"]}',
+        }]
+        cache_file = self.base / 'cache.json'
+        cache_file.write_text(json.dumps({'orig_blob': [1.0, 0.0], 'copy_blob': [0.99, math.sqrt(1 - 0.99**2)]}))
+        rows, _ = self.invoke(apply=True, include_grouped=True, cache=cache_file)
+        self.assertEqual(len(rows), 2)
+        # Anthropics original adopted
+        self.assertEqual(rows[0]['verdict'], 'adopted')
+        self.assertEqual(rows[0]['directory'], 'skills/demo')
+        # Composio copy refused as copy-of original
+        self.assertEqual(rows[1]['verdict'], 'refused')
+        self.assertEqual(rows[1]['reason'], f'copy-of:{orig_cand["source"]}:{orig_cand["path"]}')
+        self.assertTrue((self.root / 'skills/demo').is_dir())
+        self.assertFalse((self.root / 'skills/demo-composiohq').exists())
+        # Check INDEX.tsv has demo with overlap_group 101
+        index_text = (self.root / 'skills/INDEX.tsv').read_text(encoding='utf-8')
+        lines = index_text.splitlines()
+        self.assertEqual(lines[0], adopt.INDEX_HEADER)
+        row_demo = [l for l in lines[1:] if l.startswith('demo\t')][0]
+        parts = row_demo.split('\t')
+        self.assertEqual(parts[0], 'demo')
+        self.assertEqual(parts[1], 'anthropics/skills')
+        self.assertEqual(parts[2], 'testing;coding')
+        self.assertEqual(parts[3], 'coding;testing')
+        self.assertEqual(parts[4], '101')
+        self.assertEqual(check_skills.check(self.root), 0)
+
+    def test_group_different_skills_adopts_both_with_group_id(self):
+        pin_a = self.source({'pack/alpha/SKILL.md': MD.format(name='alpha'), 'pack/alpha/LICENSE': LICENCE},
+                            source='anthropics/skills')
+        cand_a = self.candidate(name='alpha', folder='pack/alpha', source='anthropics/skills', pin=pin_a,
+                                blob_id='alpha_blob', domains='science')
+        pin_b = self.source({'pack/beta/SKILL.md': MD.format(name='beta'), 'pack/beta/LICENSE': LICENCE},
+                            source='obra/superpowers')
+        cand_b = self.candidate(name='beta', folder='pack/beta', source='obra/superpowers', pin=pin_b,
+                                blob_id='beta_blob', domains='dev')
+        self.groups = [{
+            'group_id': '42',
+            'members': f'{cand_a["source"]}:{cand_a["path"]},{cand_b["source"]}:{cand_b["path"]}',
+        }]
+        cache_file = self.base / 'cache.json'
+        cache_file.write_text(json.dumps({'alpha_blob': [1.0, 0.0], 'beta_blob': [0.0, 1.0]}))
+        rows, _ = self.invoke(apply=True, include_grouped=True, cache=cache_file)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]['verdict'], 'adopted')
+        self.assertEqual(rows[1]['verdict'], 'adopted')
+        self.assertTrue((self.root / 'skills/alpha').is_dir())
+        self.assertTrue((self.root / 'skills/beta').is_dir())
+        index_text = (self.root / 'skills/INDEX.tsv').read_text(encoding='utf-8')
+        lines = index_text.splitlines()
+        row_alpha = [l for l in lines[1:] if l.startswith('alpha\t')][0]
+        row_beta = [l for l in lines[1:] if l.startswith('beta\t')][0]
+        self.assertEqual(row_alpha.split('\t')[4], '42')
+        self.assertEqual(row_beta.split('\t')[4], '42')
+        self.assertEqual(check_skills.check(self.root), 0)
+
+    def test_original_refused_by_gate_leaves_copy_refused(self):
+        orig_pin = self.source({'pack/demo/SKILL.md': MD.format(name='demo'), 'pack/demo/LICENSE': LICENCE},
+                               source='anthropics/skills')
+        orig_cand = self.candidate(name='demo', folder='pack/demo', source='anthropics/skills', pin=orig_pin,
+                                   blob_id='orig_blob')
+        copy_pin = self.source({'pack/demo/SKILL.md': MD.format(name='demo'), 'pack/demo/LICENSE': LICENCE},
+                               source='ComposioHQ/awesome-claude-skills')
+        copy_cand = self.candidate(name='demo', folder='pack/demo', source='ComposioHQ/awesome-claude-skills', pin=copy_pin,
+                                   blob_id='copy_blob')
+        self.groups = [{
+            'group_id': '101',
+            'members': f'{orig_cand["source"]}:{orig_cand["path"]},{copy_cand["source"]}:{copy_cand["path"]}',
+        }]
+        cache_file = self.base / 'cache.json'
+        cache_file.write_text(json.dumps({'orig_blob': [1.0, 0.0], 'copy_blob': [0.99, math.sqrt(1 - 0.99**2)]}))
+        def gate_reject_demo(root, staging, skill):
+            if skill.name == 'demo':
+                raise adopt.Refused('markdown: reject original')
+        rows, _ = self.invoke(apply=True, include_grouped=True, cache=cache_file, gate=gate_reject_demo)
+        self.assertEqual(rows[0]['verdict'], 'refused')
+        self.assertEqual(rows[0]['reason'], 'markdown: reject original')
+        self.assertEqual(rows[1]['verdict'], 'refused')
+        self.assertEqual(rows[1]['reason'], f'copy-of:{orig_cand["source"]}:{orig_cand["path"]}')
+        self.assertFalse((self.root / 'skills/demo').exists())
+        self.assertFalse((self.root / 'skills/demo-composiohq').exists())
+
+    def test_index_tsv_lists_every_skill_and_check_refuses_missing_and_extra(self):
+        self.fixture()
+        self.invoke(apply=True)
+        self.assertTrue((self.root / 'skills/demo').is_dir())
+        self.assertTrue((self.root / 'skills/INDEX.tsv').is_file())
+        self.assertEqual(check_skills.check(self.root), 0)
+        # Check missing row refused
+        check_skills.write_index(self.root, [])
+        problems = check_skills.index_problems(self.root)
+        self.assertTrue(any('missing row for demo' in p for p in problems), problems)
+        self.assertEqual(check_skills.check(self.root), 1)
+        # Check extra row refused
+        check_skills.write_index(self.root, [{'skill': 'demo', 'source': 'owner/repo'}, {'skill': 'extra', 'source': 'owner/repo'}])
+        problems = check_skills.index_problems(self.root)
+        self.assertTrue(any('extra row for extra' in p for p in problems), problems)
+        self.assertEqual(check_skills.check(self.root), 1)
 
 
 if __name__ == '__main__':

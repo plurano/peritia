@@ -73,19 +73,67 @@ def check_install_set(root):
         return [f"install-set.txt: {exc}"]
 
 
+INDEX_HEADER = "skill\tsource\tfunctions\tdomains\toverlap_group"
+
+
+def index_problems(root, skills=None):
+    """Problems of skills/INDEX.tsv: exact header, every skills/ directory listed exactly once, nothing else."""
+    index_file = root / "skills" / "INDEX.tsv"
+    if not index_file.is_file():
+        return ["skills/INDEX.tsv: file missing"]
+    text = index_file.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    if not lines or lines[0] != INDEX_HEADER:
+        return [f"skills/INDEX.tsv: header must be exact {INDEX_HEADER!r}"]
+    if skills is None:
+        skills = sorted(p for p in (root / "skills").iterdir() if p.is_dir())[:MAX_SKILLS] if (root / "skills").is_dir() else []
+    actual_skills = {s.name for s in skills}
+    seen = {}
+    problems = []
+    for line_idx, line in enumerate(lines[1:], 2):
+        if not line:
+            continue
+        parts = line.split("\t")
+        if len(parts) != 5:
+            problems.append(f"skills/INDEX.tsv:{line_idx}: row must have 5 columns")
+            continue
+        skill_name = parts[0]
+        if not skill_name:
+            problems.append(f"skills/INDEX.tsv:{line_idx}: empty skill name")
+            continue
+        if skill_name in seen:
+            problems.append(f"skills/INDEX.tsv: duplicate row for {skill_name}")
+        seen[skill_name] = seen.get(skill_name, 0) + 1
+    for name in sorted(actual_skills - set(seen.keys())):
+        problems.append(f"skills/INDEX.tsv: missing row for {name}")
+    for name in sorted(set(seen.keys()) - actual_skills):
+        problems.append(f"skills/INDEX.tsv: extra row for {name}")
+    return problems
+
+
 def check(root):
     skills = sorted(p for p in (root / "skills").iterdir() if p.is_dir())[:MAX_SKILLS] if (root / "skills").is_dir() else []
     problems = [p for s in skills for p in skill_problems(s)]
     problems += check_install_set(root)
+    problems.extend(index_problems(root, skills))
     for p in problems:
         print(f"[FAIL] {p}")
     print(f"skills: {len(skills)} checked, {len(problems)} problems")
     return 1 if problems else 0
 
 
+def write_index(root, rows):
+    d = root / "skills"
+    d.mkdir(parents=True, exist_ok=True)
+    lines = [INDEX_HEADER]
+    for r in sorted(rows, key=lambda x: x["skill"]):
+        lines.append(f"{r['skill']}\t{r.get('source', '')}\t{r.get('functions', '')}\t{r.get('domains', '')}\t{r.get('overlap_group', '')}")
+    (d / "INDEX.tsv").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def write(root, name, skill_md, origin=None, licence=True):
     d = root / "skills" / name
-    d.mkdir(parents=True)
+    d.mkdir(parents=True, exist_ok=True)
     (d / "SKILL.md").write_text(skill_md, encoding="utf-8")
     if origin is not None:
         (d / "ORIGIN.md").write_text(origin, encoding="utf-8")
@@ -101,7 +149,36 @@ def selftest():
         root = Path(tmp)
         write(root, "good", good_md.format(n="good"), good_origin)
         write(root, "own", good_md.format(n="own"), "upstream: own\n", licence=False)
+        write_index(root, [
+            {"skill": "good", "source": "o/r"},
+            {"skill": "own", "source": "peritia"},
+        ])
         assert check(root) == 0, "a complete adapted skill and an own skill pass"
+
+        write_index(root, [{"skill": "good", "source": "o/r"}])
+        probs = index_problems(root)
+        assert any("missing row for own" in p for p in probs), probs
+
+        write_index(root, [
+            {"skill": "good", "source": "o/r"},
+            {"skill": "own", "source": "peritia"},
+            {"skill": "extra", "source": "o/r"},
+        ])
+        probs = index_problems(root)
+        assert any("extra row for extra" in p for p in probs), probs
+
+        (root / "skills" / "INDEX.tsv").write_text("bad\theader\n", encoding="utf-8")
+        probs = index_problems(root)
+        assert any("header must be exact" in p for p in probs), probs
+
+        (root / "skills" / "INDEX.tsv").unlink()
+        probs = index_problems(root)
+        assert any("file missing" in p for p in probs), probs
+
+        write_index(root, [
+            {"skill": "good", "source": "o/r"},
+            {"skill": "own", "source": "peritia"},
+        ])
         (root / "install-set.txt").write_text("good\n", encoding="utf-8")
         assert check(root) == 0, "a valid install-set.txt passes"
         (root / "install-set.txt").write_text("good\nunknown-skill\n", encoding="utf-8")
