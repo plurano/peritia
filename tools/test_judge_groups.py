@@ -4,9 +4,11 @@
 """Offline self-tests for judge_groups.py; no test calls a live model."""
 import csv
 import json
+import math
 import re
 import tempfile
 import unittest
+from unittest.mock import Mock, patch
 from pathlib import Path
 import sys
 
@@ -56,175 +58,165 @@ class RuleGraderTests(unittest.TestCase):
         self.assertTrue(any("unexpected" in f for f in failed))
 
 
+def make_tasks(count=3):
+    return [judge_groups.Task(f"t{i}", f"prompt {i}", ("hello",), (), "rubric") for i in range(count)]
+
+
+def records_for(outcomes, rubric=None):
+    return [{"member": member, "task_id": f"t{i}", "trial": j + 1,
+             "pass": passed, "rubric_score": (rubric or {}).get(member, 5.0)}
+            for member, tasks in outcomes.items() for i, passes in enumerate(tasks)
+            for j, passed in enumerate(passes)]
+
+
 class ScoringAndVerdictTests(unittest.TestCase):
+    def decide(self, outcomes, rubric=None):
+        return judge_groups.decide_group(list(outcomes), make_tasks(), records_for(outcomes, rubric))
+
     def test_pass_at_k_vs_pass_pow_k(self):
-        tasks = [
-            judge_groups.Task("t1", "prompt 1", ("match",), (), "rubric 1"),
-            judge_groups.Task("t2", "prompt 2", ("match",), (), "rubric 2"),
-            judge_groups.Task("t3", "prompt 3", ("match",), (), "rubric 3"),
-        ]
-        # t1: 1 pass, 2 fails -> pass@3 = 1.0, pass^3 = 0.0
-        # t2: 3 passes -> pass@3 = 1.0, pass^3 = 1.0
-        # t3: 3 fails -> pass@3 = 0.0, pass^3 = 0.0
-        trial_records = [
-            {"member": "m1", "task_id": "t1", "trial": 1, "pass": True, "rubric_score": 7.0},
-            {"member": "m1", "task_id": "t1", "trial": 2, "pass": False, "rubric_score": 4.0},
-            {"member": "m1", "task_id": "t1", "trial": 3, "pass": False, "rubric_score": 3.0},
-            {"member": "m1", "task_id": "t2", "trial": 1, "pass": True, "rubric_score": 9.0},
-            {"member": "m1", "task_id": "t2", "trial": 2, "pass": True, "rubric_score": 8.0},
-            {"member": "m1", "task_id": "t2", "trial": 3, "pass": True, "rubric_score": 8.5},
-            {"member": "m1", "task_id": "t3", "trial": 1, "pass": False, "rubric_score": 1.0},
-            {"member": "m1", "task_id": "t3", "trial": 2, "pass": False, "rubric_score": 2.0},
-            {"member": "m1", "task_id": "t3", "trial": 3, "pass": False, "rubric_score": 1.5},
-        ]
-        verdict, kept, dropped, scores, decided_by = judge_groups.decide_group(["m1"], tasks, trial_records, k=3)
-        self.assertEqual(verdict, "keep-better")
-        self.assertEqual(decided_by, "rule")
-        self.assertAlmostEqual(scores["m1"]["pass_at_k"], 2 / 3, places=3)
-        self.assertAlmostEqual(scores["m1"]["pass_pow_k"], 1 / 3, places=3)
+        result = self.decide({"a": [[True, False, False], [True] * 3, [False] * 3]})
+        self.assertEqual(result[0], "keep-better")
+        self.assertAlmostEqual(result[3]["a"]["pass_at_k"], 2 / 3, places=3)
+        self.assertAlmostEqual(result[3]["a"]["pass_pow_k"], 1 / 3, places=3)
 
-    def test_keep_better_at_gap(self):
-        tasks = [
-            judge_groups.Task(f"t{i}", f"prompt {i}", ("match",), (), "rubric")
-            for i in range(1, 5)
-        ]
-        # Cand A passes 3/4 tasks (rule_score = 0.75), judge_score = 4.0 (lower)
-        # Cand B passes 2/4 tasks (rule_score = 0.50), judge_score = 9.0 (higher)
-        # Rule score gap is 0.75 - 0.50 = 0.25 >= 0.20 -> keep-better for Cand A (decided_by rule).
-        trial_records = []
-        for i in range(1, 5):
-            for seed in range(1, 4):
-                a_pass = i <= 3  # passes t1, t2, t3
-                b_pass = i <= 2  # passes t1, t2
-                trial_records.append({
-                    "member": "cand-a", "task_id": f"t{i}", "trial": seed,
-                    "pass": a_pass, "rubric_score": 4.0,
-                })
-                trial_records.append({
-                    "member": "cand-b", "task_id": f"t{i}", "trial": seed,
-                    "pass": b_pass, "rubric_score": 9.0,
-                })
+    def test_two_tasks_vs_one_is_person_decides(self):
+        result = self.decide({"a": [[True] * 3, [True] * 3, [False] * 3],
+                              "b": [[True] * 3, [False] * 3, [False] * 3]})
+        self.assertEqual(result[0], "person-decides")
+        self.assertEqual(result[1:3], (["a", "b"], []))
+        self.assertEqual(result[4], "none")
 
-        verdict, kept, dropped, scores, decided_by = judge_groups.decide_group(["cand-a", "cand-b"], tasks, trial_records, k=3)
-        self.assertEqual(verdict, "keep-better")
-        self.assertEqual(decided_by, "rule")
-        self.assertEqual(kept, ["cand-a"])
-        self.assertEqual(dropped, ["cand-b"])
-        self.assertEqual(scores["cand-a"]["rule_score"], 0.75)
-        self.assertEqual(scores["cand-b"]["rule_score"], 0.50)
+    def test_partial_trial_split_is_not_distinct_use(self):
+        result = self.decide({"a": [[True, True, False], [True, False, False], [False] * 3],
+                              "b": [[True, False, False], [True, True, False], [False] * 3]})
+        self.assertEqual(result[0], "person-decides")
 
-    def test_judge_tie_break_picks_higher_judge_score(self):
-        tasks = [
-            judge_groups.Task("t1", "prompt 1", ("m1",), (), "rubric 1"),
-            judge_groups.Task("t2", "prompt 2", ("m2",), (), "rubric 2"),
-        ]
-        # Both Cand A and Cand B pass t1 and fail t2 -> rule score tie (0.50 vs 0.50, gap 0.0 < 0.2)
-        # Cand A has judge score 6.0, Cand B has judge score 8.5 -> judge gap = 2.5 >= 2.0
-        # Judge tie-break picks Cand B with keep-better (decided_by judge)
-        trial_records = [
-            {"member": "cand-a", "task_id": "t1", "trial": 1, "pass": True, "rubric_score": 6.0},
-            {"member": "cand-a", "task_id": "t2", "trial": 1, "pass": False, "rubric_score": 6.0},
-            {"member": "cand-b", "task_id": "t1", "trial": 1, "pass": True, "rubric_score": 8.5},
-            {"member": "cand-b", "task_id": "t2", "trial": 1, "pass": False, "rubric_score": 8.5},
-        ]
-        verdict, kept, dropped, scores, decided_by = judge_groups.decide_group(["cand-a", "cand-b"], tasks, trial_records, k=1)
-        self.assertEqual(verdict, "keep-better")
-        self.assertEqual(kept, ["cand-b"])
-        self.assertEqual(dropped, ["cand-a"])
-        self.assertEqual(decided_by, "judge")
+    def test_keep_both_requires_opposite_unanimous_tasks(self):
+        result = self.decide({"a": [[True] * 3, [False] * 3, [False] * 3],
+                              "b": [[False] * 3, [True] * 3, [False] * 3]})
+        self.assertEqual(result[:3], ("keep-both", ["a", "b"], []))
+        self.assertEqual(result[3]["a"]["distinct_use_vs"], {"b": ["t0"]})
+        self.assertEqual(result[3]["b"]["distinct_use_vs"], {"a": ["t1"]})
 
-    def test_rule_gap_overrides_contrary_judge_score(self):
-        tasks = [
-            judge_groups.Task(f"t{i}", f"prompt {i}", ("m",), (), "rubric")
-            for i in range(1, 5)
-        ]
-        # Cand A rule_score = 0.75, judge_score = 3.0
-        # Cand B rule_score = 0.50, judge_score = 9.5 (contrary judge gap = 6.5 >= 2.0)
-        # Rule gap is 0.25 >= 0.20 -> rule gap overrides judge score, Cand A wins (decided_by rule)
-        trial_records = []
-        for i in range(1, 5):
-            trial_records.append({
-                "member": "cand-a", "task_id": f"t{i}", "trial": 1,
-                "pass": i <= 3, "rubric_score": 3.0,
-            })
-            trial_records.append({
-                "member": "cand-b", "task_id": f"t{i}", "trial": 1,
-                "pass": i <= 2, "rubric_score": 9.5,
-            })
-        verdict, kept, dropped, scores, decided_by = judge_groups.decide_group(["cand-a", "cand-b"], tasks, trial_records, k=1)
-        self.assertEqual(verdict, "keep-better")
-        self.assertEqual(kept, ["cand-a"])
-        self.assertEqual(dropped, ["cand-b"])
-        self.assertEqual(decided_by, "rule")
+    def test_one_pass_vs_zero_is_not_unanimous(self):
+        result = self.decide({"a": [[True, False, False], [False] * 3, [False] * 3],
+                              "b": [[False] * 3, [True, False, False], [False] * 3]})
+        self.assertEqual(result[0], "person-decides")
 
-    def test_keep_both_when_each_wins_one_task(self):
-        tasks = [
-            judge_groups.Task("t1", "prompt 1", ("m1",), (), "rubric 1"),
-            judge_groups.Task("t2", "prompt 2", ("m2",), (), "rubric 2"),
-        ]
-        # Member A passes t1, fails t2 (wins t1)
-        # Member B fails t1, passes t2 (wins t2)
-        # Rule gap < 0.2, judge gap 0.5 < 2.0 -> keep-both with distinct wins
-        trial_records = [
-            {"member": "cand-a", "task_id": "t1", "trial": 1, "pass": True, "rubric_score": 8.0},
-            {"member": "cand-a", "task_id": "t2", "trial": 1, "pass": False, "rubric_score": 2.0},
-            {"member": "cand-b", "task_id": "t1", "trial": 1, "pass": False, "rubric_score": 3.0},
-            {"member": "cand-b", "task_id": "t2", "trial": 1, "pass": True, "rubric_score": 8.5},
-        ]
-        verdict, kept, dropped, scores, decided_by = judge_groups.decide_group(["cand-a", "cand-b"], tasks, trial_records, k=1)
-        self.assertEqual(verdict, "keep-both")
-        self.assertEqual(decided_by, "rule")
-        self.assertCountEqual(kept, ["cand-a", "cand-b"])
-        self.assertEqual(dropped, [])
-        self.assertIn("distinct_use_vs", scores["cand-a"])
-        self.assertEqual(scores["cand-a"]["distinct_use_vs"]["cand-b"], ["t1"])
-        self.assertEqual(scores["cand-b"]["distinct_use_vs"]["cand-a"], ["t2"])
+    def test_one_trial_is_not_three(self):
+        outcomes = {"a": [[True], [False], [False]], "b": [[False], [True], [False]]}
+        result = judge_groups.decide_group(list(outcomes), make_tasks(), records_for(outcomes), k=1)
+        self.assertEqual(result[0], "person-decides")
 
-    def test_propose_merge_on_tie(self):
-        tasks = [
-            judge_groups.Task("t1", "prompt 1", ("m1",), (), "rubric 1"),
-            judge_groups.Task("t2", "prompt 2", ("m2",), (), "rubric 2"),
-        ]
-        # Both pass t1, both fail t2; neither wins where other fails; judge gap = 1.0 < 2.0
-        trial_records = [
-            {"member": "cand-a", "task_id": "t1", "trial": 1, "pass": True, "rubric_score": 7.0},
-            {"member": "cand-a", "task_id": "t2", "trial": 1, "pass": False, "rubric_score": 3.0},
-            {"member": "cand-b", "task_id": "t1", "trial": 1, "pass": True, "rubric_score": 8.0},
-            {"member": "cand-b", "task_id": "t2", "trial": 1, "pass": False, "rubric_score": 3.5},
-        ]
-        verdict, kept, dropped, scores, decided_by = judge_groups.decide_group(["cand-a", "cand-b"], tasks, trial_records, k=1)
-        self.assertEqual(verdict, "propose-merge")
-        self.assertEqual(decided_by, "none")
-        self.assertCountEqual(kept, ["cand-a", "cand-b"])
-        self.assertEqual(dropped, [])
+    def test_judge_score_never_breaks_rule_tie(self):
+        result = self.decide({"a": [[True] * 3, [False] * 3, [False] * 3],
+                              "b": [[True] * 3, [False] * 3, [False] * 3]}, {"a": 0, "b": 10})
+        self.assertEqual(result[0], "person-decides")
+        self.assertEqual(result[3]["b"]["judge_score"], 10)
+
+    def test_rule_gap_ignores_contrary_judge(self):
+        result = self.decide({"a": [[True] * 3] * 3, "b": [[False] * 3] * 3}, {"a": 0, "b": 10})
+        self.assertEqual(result[:3], ("keep-better", ["a"], ["b"]))
+        self.assertEqual(result[4], "rule")
+
+    def test_gap_boundary(self):
+        for other_passes, verdict in ((17, "person-decides"), (16, "keep-better")):
+            with self.subTest(gap=(50 - other_passes) / 100):
+                outcomes = {"a": [[i < 50] * 3 for i in range(100)],
+                            "b": [[i < other_passes] * 3 for i in range(100)]}
+                result = judge_groups.decide_group(list(outcomes), make_tasks(100), records_for(outcomes))
+                self.assertEqual(result[0], verdict)
 
     def test_existing_skill_never_dropped_replace_proposed(self):
-        tasks = [
-            judge_groups.Task(f"t{i}", f"prompt {i}", ("m",), (), "rubric")
-            for i in range(1, 5)
-        ]
-        existing = "skills/pre-mortem"
-        cand = "owner/repo:skills/pre-mortem/SKILL.md"
+        result = self.decide({"skills/example": [[False] * 3] * 3, "a": [[True] * 3] * 3})
+        self.assertEqual(result[:3], ("replace-proposed", ["a"], []))
 
-        # Candidate passes 4/4 (rule_score = 1.0)
-        # Existing passes 2/4 (rule_score = 0.5)
-        # Candidate wins by gap 0.50 >= 0.20
-        trial_records = []
-        for i in range(1, 5):
-            trial_records.append({
-                "member": cand, "task_id": f"t{i}", "trial": 1, "pass": True, "rubric_score": 9.0,
-            })
-            trial_records.append({
-                "member": existing, "task_id": f"t{i}", "trial": 1, "pass": (i <= 2), "rubric_score": 5.0,
-            })
+    def test_no_tasks_or_incomplete_trials_require_person(self):
+        for tasks, records in (([], []), (make_tasks(), []),
+                               (make_tasks(), records_for({"a": [[True] * 3] * 3}))):
+            with self.subTest(tasks=tasks, records=records):
+                result = judge_groups.decide_group(["a", "b"], tasks, records)
+                self.assertEqual(result[0], "person-decides")
+                self.assertEqual(result[2], [])
 
-        verdict, kept, dropped, scores, decided_by = judge_groups.decide_group([existing, cand], tasks, trial_records, k=1)
-        self.assertEqual(verdict, "replace-proposed")
-        self.assertEqual(decided_by, "rule")
-        self.assertEqual(kept, [cand])
-        # Existing skill must NEVER be dropped
-        self.assertNotIn(existing, dropped)
-        self.assertEqual(dropped, [])
+    def test_duplicate_trials_are_not_evidence(self):
+        records = records_for({"a": [[True] * 3] * 3, "b": [[False] * 3] * 3})
+        records[1]["trial"] = 1
+        self.assertEqual(judge_groups.decide_group(["a", "b"], make_tasks(), records)[0], "person-decides")
+
+    def test_distinct_pair_does_not_drop_unproven_third_member(self):
+        result = self.decide({"a": [[True] * 3, [False] * 3, [False] * 3],
+                              "b": [[False] * 3, [True] * 3, [False] * 3],
+                              "c": [[True] * 3, [False] * 3, [False] * 3]})
+        self.assertEqual(result[:3], ("person-decides", ["a", "b", "c"], []))
+
+
+class CopyCollapseTests(unittest.TestCase):
+    def setUp(self):
+        self.original = "anthropics/skills:skills/pdf/SKILL.md"
+        self.copy = "ComposioHQ/awesome-claude-skills:pdf/SKILL.md"
+        self.items = {self.original: judge_groups.Item(self.original, "upstream-blob", "PDF_tool", ""),
+                      self.copy: judge_groups.Item(self.copy, "copy-blob", "pdf-tool", "")}
+        self.ranks = {s.repository: s.rank for s in judge_groups.load_sources(judge_groups.DEFAULT_SOURCES)}
+
+    def collapse(self, cosine=0.99, metadata=None, ranks=None, members=None):
+        embeddings = {"upstream-blob": [1, 0], "copy-blob": [cosine, math.sqrt(1 - cosine ** 2)]}
+        return judge_groups.collapse_copies(members or [self.copy, self.original], self.items,
+                                            metadata or {}, embeddings, ranks or self.ranks)
+
+    def test_anthropics_original_beats_composio_copy(self):
+        kept, copies = self.collapse()
+        self.assertEqual(kept, [self.original])
+        self.assertEqual(copies, {self.copy: f"copy-of:{self.original}"})
+        self.assertEqual(self.collapse(members=[self.original, self.copy]), (kept, copies))
+
+    def test_source_repo_overrides_rank_without_name_or_embedding(self):
+        kept, copies = judge_groups.collapse_copies(
+            [self.copy, self.original], {},
+            {self.original: {"source_repo": "https://github.com/ComposioHQ/awesome-claude-skills.git"}},
+            {}, self.ranks)
+        self.assertEqual(kept, [self.copy])
+        self.assertEqual(copies, {self.original: f"copy-of:{self.copy}"})
+
+    def test_all_source_fields_recognise_original(self):
+        for field in ("source", "source_repo", "license_source", "upstream", "origin", "repository", "homepage"):
+            with self.subTest(field=field):
+                self.assertEqual(self.collapse(0.90, {self.copy: {field: "anthropics/skills"}})[0], [self.original])
+
+    def test_same_name_cosine_point_nine_is_not_copy(self):
+        self.assertEqual(self.collapse(0.90), ([self.copy, self.original], {}))
+
+    def test_cosine_boundary(self):
+        self.assertEqual(self.collapse(0.97)[0], [self.original])
+        self.assertEqual(self.collapse(0.9699)[1], {})
+
+    def test_equal_rank_uses_lexical_source(self):
+        self.assertEqual(self.collapse(ranks={key: 1 for key in self.ranks})[0], [self.copy])
+
+    def test_missing_cache_does_not_infer_copy(self):
+        self.assertEqual(judge_groups.collapse_copies([self.copy, self.original], self.items, {}, {}, self.ranks)[1], {})
+
+    def test_provenance_must_match_whole_repository(self):
+        for source in ("anthropics/skills-extra", "other/skills"):
+            with self.subTest(source=source):
+                self.assertEqual(self.collapse(0.9, {self.copy: {"source_repo": source}})[1], {})
+
+    def test_different_names_are_not_embedding_copies(self):
+        self.items[self.copy] = judge_groups.Item(self.copy, "copy-blob", "other", "")
+        self.assertEqual(self.collapse()[1], {})
+
+
+class PrimaryClassTests(unittest.TestCase):
+    def test_majority(self):
+        self.assertEqual(judge_groups.primary_class(["a", "b", "c"],
+                         {"a": {"coding", "testing"}, "b": {"testing"}, "c": {"research"}}), "testing")
+
+    def test_ties_follow_taxonomy(self):
+        self.assertEqual(judge_groups.primary_class(["a", "b"],
+                         {"a": {"coding"}, "b": {"ci-release"}}), "coding")
+
+    def test_no_function_has_no_primary(self):
+        self.assertEqual(judge_groups.primary_class(["a"], {"a": {"none"}}), "")
 
 
 def _setup_resume_env(tmp: Path) -> tuple[Path, Path, Path, Path, Path, Path, Path]:
@@ -253,17 +245,92 @@ def _setup_resume_env(tmp: Path) -> tuple[Path, Path, Path, Path, Path, Path, Pa
         "version": 1,
         "classes": {
             "coding": [{
-                "id": "code-1", "prompt": "write a greeting module in python",
+                "id": f"code-{i}", "prompt": "write a greeting module in python",
                 "must_match": ["hello"], "must_not_match": ["bad"],
                 "rubric": "friendly greeting",
-            }]
+            } for i in range(3)]
         },
     }
     eval_tasks_json.write_text(json.dumps(tasks_data), encoding="utf-8")
     return groups_tsv, eval_tasks_json, candidates_tsv, verdicts_tsv, trials_jsonl, checkouts, skills_dir
 
 
+def setup_copy_env(tmp):
+    paths = _setup_resume_env(tmp)
+    groups, tasks, candidates, verdicts, trials, checkouts, skills = paths
+    rows = []
+    for source, blob, function in (("anthropics/skills", "original", "coding"),
+                                   ("ComposioHQ/awesome-claude-skills", "copy", "testing")):
+        skill = checkouts / source.replace("/", "__") / "pdf" / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text(f"---\nname: pdf\ndescription: {blob}\n---\n{blob} content\n")
+        rows.append({"source": source, "path": "pdf/SKILL.md", "skill_name": "pdf", "blob_id": blob,
+                     "functions": function, "verdict": "candidate"})
+    with candidates.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]), delimiter="\t")
+        writer.writeheader()
+        writer.writerows(rows)
+    members = [f"{row['source']}:{row['path']}" for row in rows]
+    groups.write_text("group_id\tmembers\n1\t" + ",".join(members) + "\n")
+    cache = tmp / "cache.json"
+    cache.write_text(json.dumps({"original": [1, 0], "copy": [0.99, math.sqrt(1 - 0.99 ** 2)]}))
+    return paths, members, cache
+
+
 class EndToEndAndResumeTests(unittest.TestCase):
+    def test_cli_uses_cache_and_never_calls_models_for_copy(self):
+        with tempfile.TemporaryDirectory() as folder:
+            paths, members, cache = setup_copy_env(Path(folder))
+            groups, tasks, candidates, verdicts, trials, checkouts, skills = paths
+            chat, judge = Mock(return_value="hello"), Mock(return_value=9.0)
+            with patch.object(judge_groups.OllamaClient, "chat", chat), patch.object(judge_groups.OllamaClient, "judge", judge):
+                status = judge_groups.main(["run", "--groups", str(groups), "--eval-tasks", str(tasks),
+                                           "--candidates", str(candidates), "--classified", str(Path(folder) / "absent"),
+                                           "--checkouts", str(checkouts), "--skills-dir", str(skills),
+                                           "--out", str(verdicts), "--trials-out", str(trials), "--cache", str(cache)])
+            self.assertEqual(status, 0)
+            self.assertEqual(chat.call_count, 9)
+            self.assertEqual(judge.call_count, 9)
+            self.assertTrue(all("original content" in call.args[0] for call in chat.call_args_list))
+            with verdicts.open() as handle:
+                row = next(csv.DictReader(handle, delimiter="\t"))
+            self.assertEqual(row["primary_class"], "coding")
+            self.assertEqual(json.loads(row["copies"]), {members[1]: f"copy-of:{members[0]}"})
+            records = [json.loads(line) for line in trials.read_text().splitlines()]
+            self.assertEqual({r["member"] for r in records}, {members[0]})
+
+    def test_only_majority_class_tasks_run(self):
+        with tempfile.TemporaryDirectory() as folder:
+            groups, tasks, candidates, verdicts, trials, checkouts, skills = _setup_resume_env(Path(folder))
+            candidates.write_text(candidates.read_text().replace("coding", "coding;testing", 1).replace("cand-2\tcoding", "cand-2\ttesting"))
+            data = json.loads(tasks.read_text())
+            data["classes"]["testing"] = [{"id": f"test-{i}", "prompt": f"test prompt {i}", "must_match": ["hello"]}
+                                           for i in range(3)]
+            tasks.write_text(json.dumps(data))
+            chat = Mock(return_value="hello")
+            row = judge_groups.run(groups, tasks, checkouts, skills, verdicts, trials, candidates,
+                                   chat_fn=chat, judge_fn=lambda prompt: 8)[0]
+            self.assertEqual(row["primary_class"], "testing")
+            self.assertEqual(chat.call_count, 18)
+            self.assertEqual({call.args[1] for call in chat.call_args_list}, {f"test prompt {i}" for i in range(3)})
+
+    def test_existing_copy_is_replacement_proposal_never_dropped(self):
+        with tempfile.TemporaryDirectory() as folder:
+            paths, members, cache = setup_copy_env(Path(folder))
+            groups, tasks, candidates, verdicts, trials, checkouts, skills = paths
+            existing = skills / "pdf"
+            existing.mkdir()
+            (existing / "SKILL.md").write_text("---\nname: pdf\nsource_repo: anthropics/skills\n---\nExisting content\n")
+            groups.write_text("group_id\tmembers\n1\t" + members[0] + ",skills/pdf\n")
+            chat = Mock(return_value="hello")
+            row = judge_groups.run(groups, tasks, checkouts, skills, verdicts, trials, candidates,
+                                   chat_fn=chat, judge_fn=lambda prompt: 8, cache_path=cache)[0]
+            self.assertEqual(row["verdict"], "replace-proposed")
+            self.assertEqual(row["dropped"], "")
+            self.assertEqual(json.loads(row["copies"]), {"skills/pdf": f"copy-of:{members[0]}"})
+            self.assertTrue((existing / "SKILL.md").exists())
+            self.assertEqual(chat.call_count, 9)
+
     def test_resume_skips_done_trials(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             groups_tsv, eval_tasks_json, candidates_tsv, verdicts_tsv, trials_jsonl, checkouts, skills_dir = (
@@ -287,11 +354,11 @@ class EndToEndAndResumeTests(unittest.TestCase):
                 "judge_fn": fake_judge, "k": 1,
             }
 
-            # First run: 2 calls
+            # First run: 2 members, 3 primary tasks
             judge_groups.run(**run_kwargs)
-            self.assertEqual(chat_counter, 2)
+            self.assertEqual(chat_counter, 6)
             self.assertTrue(trials_jsonl.exists())
-            self.assertEqual(len(trials_jsonl.read_text(encoding="utf-8").strip().splitlines()), 2)
+            self.assertEqual(len(trials_jsonl.read_text(encoding="utf-8").strip().splitlines()), 6)
             self.assertTrue(verdicts_tsv.exists())
 
             with verdicts_tsv.open(encoding="utf-8") as f:
@@ -299,12 +366,12 @@ class EndToEndAndResumeTests(unittest.TestCase):
                 self.assertIn("decided_by", reader.fieldnames)
                 rows = list(reader)
                 self.assertEqual(len(rows), 1)
-                self.assertIn(rows[0]["decided_by"], ("rule", "judge", "none"))
+                self.assertIn(rows[0]["decided_by"], ("rule", "none"))
 
             # Second run: all trials done -> 0 new chat calls
             judge_groups.run(**run_kwargs)
-            self.assertEqual(chat_counter, 2)
-            self.assertEqual(len(trials_jsonl.read_text(encoding="utf-8").strip().splitlines()), 2)
+            self.assertEqual(chat_counter, 6)
+            self.assertEqual(len(trials_jsonl.read_text(encoding="utf-8").strip().splitlines()), 6)
 
 
 class EvalTasksJsonTests(unittest.TestCase):

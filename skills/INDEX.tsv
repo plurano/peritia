@@ -1,0 +1,264 @@
+skill	source	functions	domains	overlap_group
+aas-compose-stack	sickn33/agentic-awesome-skills			
+aas-discover	sickn33/agentic-awesome-skills			
+aas-review-stack	sickn33/agentic-awesome-skills			
+academy-guide	anthropics/skills			
+accessibility	affaan-m/ecc	design-frontend;review-audit	other	24
+agent-runtime-gateway-smoke-test	affaan-m/ecc			
+agent-security-hardening	affaan-m/ecc			
+agent-sort	affaan-m/ecc			
+agenttrace-session-audit	sickn33/agentic-awesome-skills			
+ai-logo-maker	sickn33/agentic-awesome-skills			
+ai-multilingual-dubbing	sickn33/agentic-awesome-skills			
+ai-photo-restyler	sickn33/agentic-awesome-skills			
+ai-podcast-voiceover	sickn33/agentic-awesome-skills	media	media-automation-apps;other	113
+android-clean-architecture	affaan-m/ecc			
+api-connector-builder	affaan-m/ecc			
+api-contract-testing	sickn33/agentic-awesome-skills			
+applicationinsights-web-ts	microsoft/skills	docs-writing	other	98
+architecture-decision-records	wshobson/agents			29
+artifact-yylo	sickn33/agentic-awesome-skills			
+atlas-cloud-media	sickn33/agentic-awesome-skills	media	media-automation-apps;other	11
+audit-logging	sickn33/agentic-awesome-skills			
+automation-audit-ops	affaan-m/ecc			
+aws-cloudtrail	sickn33/agentic-awesome-skills			
+azure-advisor-actionability	microsoft/skills			
+azure-eventhub-java	microsoft/skills	coding	other	87
+azure-local	microsoft/skills			
+azure-local-multi-rack	microsoft/skills			
+azure-monitor-audit	sickn33/agentic-awesome-skills			
+azure-storage-blob-java	microsoft/skills			
+backend-patterns	affaan-m/ecc			
+battery-modeling	K-Dense-AI/scientific-agent-skills			17
+beatra	sickn33/agentic-awesome-skills	media	media-automation-apps;other	112
+beatra-ai-video-studio	sickn33/agentic-awesome-skills			
+before-you-build	sickn33/agentic-awesome-skills	review-audit;planning-fleet-mgmt	other	40
+benchmark-methodology	affaan-m/ecc			
+benchmark-optimization-loop	affaan-m/ecc			
+bernstein-run	chernistry/bernstein			
+bgpt-paper-search	K-Dense-AI/scientific-agent-skills			
+brain-to-docs	sickn33/agentic-awesome-skills	docs-writing;planning-fleet-mgmt	other	126
+brand-voice	affaan-m/ecc			
+brendangregg-use-tsa	thecsdoctor/brendangregg-use-tsa-skill			
+brooks-review	hyhmrright/brooks-lint			
+browser-extension-launch	sickn33/agentic-awesome-skills			
+business-continuity	sickn33/agentic-awesome-skills			
+buywhere-product-catalog	sickn33/agentic-awesome-skills			
+carrier-relationship-management	affaan-m/ecc	research;planning-fleet-mgmt	other	20
+cellprofiler	K-Dense-AI/scientific-agent-skills			
+change-impact	affaan-m/ecc			
+cisco-ios-patterns	affaan-m/ecc	review-audit	kubernetes-hosts-networking	47
+codebase-recon	yujiachen-y/codebase-recon-skill			
+codex-subagent	sickn33/agentic-awesome-skills	coding;review-audit;testing	other	110
+compile-knowledge	sickn33/agentic-awesome-skills	docs-writing;research	other	48
+compose-multiplatform-patterns	affaan-m/ecc			
+connections-optimizer	affaan-m/ecc			
+context-budget	affaan-m/ecc			
+contract-first	affaan-m/ecc			
+conventional-commit-review	affaan-m/ecc	review-audit;docs-writing	governance-devtooling	32
+council-multi-model	affaan-m/ecc	review-audit;planning-fleet-mgmt	agent-runtime-llm-serving;other	50
+counterparty-channel-discipline	affaan-m/ecc			
+cpp-testing	affaan-m/ecc			
+dashboard-builder	affaan-m/ecc			
+data-throughput-accelerator	affaan-m/ecc			
+deep-research-framework	sickn33/agentic-awesome-skills	research;docs-writing	other	15
+define-my-content-pillars	sickn33/agentic-awesome-skills			
+delegating-to-agents	sickn33/agentic-awesome-skills	planning-fleet-mgmt	other	30
+dev-team	affaan-m/ecc			
+dhdna-profiler	K-Dense-AI/scientific-agent-skills			
+diagnose-android-overheating	sickn33/agentic-awesome-skills			
+discernment-nudge	anthropics/skills			
+ditto	sickn33/agentic-awesome-skills			
+documentation-lookup	affaan-m/ecc			
+draft-my-comments	sickn33/agentic-awesome-skills			
+dsh-deepread	sickn33/agentic-awesome-skills			
+dynamic-workflow-mode	affaan-m/ecc	planning-fleet-mgmt;review-audit	agent-runtime-llm-serving;governance-devtooling	3
+ecc-guide	affaan-m/ecc			
+ecc-tools-cost-audit	affaan-m/ecc			
+ecommerce-listing-image-set	sickn33/agentic-awesome-skills			
+email-ops	affaan-m/ecc			
+equibles	sickn33/agentic-awesome-skills	research	other	140
+error-handling	affaan-m/ecc			
+esign-field-placement	affaan-m/ecc			
+evm-token-decimals	affaan-m/ecc			
+experimental-design	K-Dense-AI/scientific-agent-skills			10
+famulor-skill	sickn33/agentic-awesome-skills			
+fastapi-patterns	affaan-m/ecc			
+feature-tracking	sickn33/agentic-awesome-skills	planning-fleet-mgmt;docs-writing	other	48
+fedramp-compliance	sickn33/agentic-awesome-skills			
+finance-billing-ops	affaan-m/ecc	research;data-science	other	21
+five-axis-code-review	sickn33/agentic-awesome-skills	review-audit	other	106
+frontend-a11y	affaan-m/ecc	design-frontend;review-audit	other	24
+frontend-patterns	affaan-m/ecc	coding;design-frontend	other	36
+git-commit-message	sickn33/agentic-awesome-skills	docs-writing	other	32
+glasser	sickn33/agentic-awesome-skills	research	other	9
+google-workspace-ops	affaan-m/ecc			
+graceful-shutdown	sickn33/agentic-awesome-skills			
+hermes-imports	affaan-m/ecc	docs-writing;review-audit	governance-devtooling	56
+hexagonal-architecture	affaan-m/ecc			
+hipaa-compliance	affaan-m/ecc	review-audit;security	legal-licence-compliance;other	55
+hipaa-compliance-sickn33	sickn33/agentic-awesome-skills	security;review-audit	legal-licence-compliance;other	55
+homelab-network-readiness	affaan-m/ecc			
+homelab-network-setup	affaan-m/ecc			
+homelab-pihole-dns	affaan-m/ecc			
+homelab-vlan-segmentation	affaan-m/ecc			
+homelab-wireguard-vpn	affaan-m/ecc			
+i18n-sync	affaan-m/ecc			
+idea-autopsy	sickn33/agentic-awesome-skills	research	other	40
+incident-management	sickn33/agentic-awesome-skills	planning-fleet-mgmt;security	other	115
+invokely-statistics	sickn33/agentic-awesome-skills			
+iso27001-compliance	sickn33/agentic-awesome-skills			
+ito-baskets	affaan-m/ecc			
+ito-compute	affaan-m/ecc			
+ito-inference	affaan-m/ecc			
+ito-training	affaan-m/ecc			
+jet-browser	sickn33/agentic-awesome-skills			
+kotlin-coroutines-flows	affaan-m/ecc			
+laravel-development-workflow	sickn33/agentic-awesome-skills			
+laravel-patterns	affaan-m/ecc			
+laravel-verification	affaan-m/ecc			
+latency-critical-systems	affaan-m/ecc			
+llm-trading-agent-security	affaan-m/ecc			
+mageck	K-Dense-AI/scientific-agent-skills			
+mailtrap-email-integration	affaan-m/ecc			
+make-interfaces-feel-better	affaan-m/ecc	docs-writing	other	22
+manim-video	affaan-m/ecc			
+markstream-angular	sickn33/agentic-awesome-skills			
+markstream-migration	sickn33/agentic-awesome-skills			
+markstream-nuxt	sickn33/agentic-awesome-skills			
+markstream-react	sickn33/agentic-awesome-skills			
+markstream-svelte	sickn33/agentic-awesome-skills			
+markstream-vue	sickn33/agentic-awesome-skills			
+markstream-vue2	sickn33/agentic-awesome-skills	coding;design-frontend	other	156
+markstream-vue2-cli	sickn33/agentic-awesome-skills			
+markstream-vue2-vite	sickn33/agentic-awesome-skills	coding;design-frontend	other	156
+md2video-audio	sickn33/agentic-awesome-skills			
+mdpr-skill	sickn33/agentic-awesome-skills			
+meeting-notes	sickn33/agentic-awesome-skills	docs-writing	other	157
+messages-ops	affaan-m/ecc	docs-writing	other	22
+motion-advanced	affaan-m/ecc	docs-writing	other	22
+motion-foundations	affaan-m/ecc	docs-writing	other	22
+motion-patterns	affaan-m/ecc	docs-writing	other	22
+muapi-media	sickn33/agentic-awesome-skills	media	media-automation-apps;other	11
+music-generation-studio	sickn33/agentic-awesome-skills			
+mybatis-patterns	affaan-m/ecc			
+mysql-patterns	affaan-m/ecc			
+nanoclaw-repl	affaan-m/ecc			
+nasiko-control-plane	affaan-m/ecc			
+nestjs-patterns	affaan-m/ecc			
+netmiko-ssh-automation	affaan-m/ecc			
+network-bgp-diagnostics	affaan-m/ecc			
+network-config-validation	affaan-m/ecc	review-audit;security	kubernetes-hosts-networking	47
+network-interface-health	affaan-m/ecc			
+nexrad-mosaic-access	sickn33/agentic-awesome-skills			
+nexrad-product-access	sickn33/agentic-awesome-skills			
+nextjs-turbopack	affaan-m/ecc			
+noaa-radar-satellite-fetching	sickn33/agentic-awesome-skills			
+nodejs-keccak256	affaan-m/ecc			
+nutrient-document-processing	affaan-m/ecc	docs-writing	other	13
+nuxt4-patterns	affaan-m/ecc			
+openclaw-deployment-hardening	sickn33/agentic-awesome-skills			
+operator-approval-loop	affaan-m/ecc			
+optim-agent	sickn33/agentic-awesome-skills			
+orch-add-feature	affaan-m/ecc	planning-fleet-mgmt	other	30
+orch-build-mvp	affaan-m/ecc	planning-fleet-mgmt;coding;ci-release	other	58
+orch-change-feature	affaan-m/ecc			
+orch-fix-defect	affaan-m/ecc			
+orch-refine-code	affaan-m/ecc	coding;review-audit;testing	other	59
+orchestrate	sickn33/agentic-awesome-skills	planning-fleet-mgmt	other	30
+outreachagent	sickn33/agentic-awesome-skills			
+parallel-execution-optimizer	affaan-m/ecc	planning-fleet-mgmt	other	30
+parallel-search-mcp	sickn33/agentic-awesome-skills	research	other	9
+pci-dss-compliance	sickn33/agentic-awesome-skills			
+peer-review	K-Dense-AI/scientific-agent-skills			16
+pi-web-search	sickn33/agentic-awesome-skills			
+plan-canvas	affaan-m/ecc			
+plan-ledger-tasks-yylo	sickn33/agentic-awesome-skills			
+poster-design-studio	sickn33/agentic-awesome-skills			
+postmortem-writing	wshobson/agents			
+pr-labeling	vercel-labs/skills			
+pre-mortem	avelikiy/great_cto			
+pre-release-review	sickn33/agentic-awesome-skills	review-audit;ci-release	governance-devtooling;other	35
+pre-ship-gate	sickn33/agentic-awesome-skills	review-audit;ci-release	governance-devtooling;other	35
+prediction-market-oracle-research	affaan-m/ecc			
+prediction-market-risk-review	affaan-m/ecc			
+product-capability	affaan-m/ecc	planning-fleet-mgmt;docs-writing	other	30
+product-photo-studio	sickn33/agentic-awesome-skills			
+production-runtime-certification	sickn33/agentic-awesome-skills	review-audit;ci-release	governance-devtooling;other	35
+progressive-estimation	Enreign/progressive-estimation			
+prompt-caching-strategy	affaan-m/ecc			
+pycalphad	K-Dense-AI/scientific-agent-skills			
+radar-satellite-analysis	sickn33/agentic-awesome-skills			
+rails-patterns	affaan-m/ecc			
+recursive-decision-ledger	affaan-m/ecc			
+repo-maintainer	sickn33/agentic-awesome-skills	review-audit;ci-release;docs-writing	governance-devtooling;other	155
+repurpose-into-a-post	sickn33/agentic-awesome-skills			
+research-ops	affaan-m/ecc			
+research-prompt	sickn33/agentic-awesome-skills			
+resumable-implementation-contracts	sickn33/agentic-awesome-skills			
+safety-guard	affaan-m/ecc	security;review-audit	governance-devtooling;other	63
+same-idea-both-platforms	sickn33/agentic-awesome-skills			
+scientific-db-pubmed-database	affaan-m/ecc			
+scientific-db-uspto-database	affaan-m/ecc			
+scientific-problem-selection	mims-harvard/ToolUniverse			18
+scientific-thinking-literature-review	affaan-m/ecc	research;docs-writing	science-research-writing	14
+scientific-thinking-scholar-evaluation	affaan-m/ecc	research;review-audit;docs-writing	science-research-writing	16
+security-automation	sickn33/agentic-awesome-skills			
+security-bounty-hunter	affaan-m/ecc	security;research	other	64
+seo-drift	sickn33/agentic-awesome-skills			
+serply-search-mcp	sickn33/agentic-awesome-skills	research	other	9
+setup-help	sickn33/agentic-awesome-skills			
+shopify-review-triage	sickn33/agentic-awesome-skills			
+skeleton-first	sickn33/agentic-awesome-skills			
+skeptical-triage	avelikiy/great_cto			
+skill-host-compat	affaan-m/ecc			
+skill-porter	sickn33/agentic-awesome-skills			
+skill-scout	affaan-m/ecc			
+skill-security-audit	sickn33/agentic-awesome-skills			
+soc2-compliance	sickn33/agentic-awesome-skills			
+social-graph-ranker	affaan-m/ecc			
+spec-driven-loop	sickn33/agentic-awesome-skills	planning-fleet-mgmt;review-audit;testing	other	30
+springboot-security	affaan-m/ecc			
+sshepherd	sickn33/agentic-awesome-skills	infra-ops	kubernetes-hosts-networking;other	166
+subagent-driven-development	obra/superpowers			105
+suno-lyrics-to-song	sickn33/agentic-awesome-skills			
+swift-protocol-di-testing	affaan-m/ecc			
+systematic-debugging	obra/superpowers			107
+taisly-social-media-posting	sickn33/agentic-awesome-skills			
+talking-avatar-video	sickn33/agentic-awesome-skills			
+team-agent-orchestration	affaan-m/ecc	planning-fleet-mgmt	other	30
+tech-writing-proofread	sickn33/agentic-awesome-skills			
+terminal-ops	affaan-m/ecc			
+tokenleak	sickn33/agentic-awesome-skills	planning-fleet-mgmt	agent-runtime-llm-serving;governance-devtooling	143
+trading-ledger	sickn33/agentic-awesome-skills			
+tree-ring-memory	sickn33/agentic-awesome-skills			
+triage	vercel-labs/skills			
+turn-this-into-a-thread	sickn33/agentic-awesome-skills			
+ui-demo	affaan-m/ecc			
+understand-project-yylo	sickn33/agentic-awesome-skills			
+unslop	sickn33/agentic-awesome-skills	docs-writing	other	134
+unsloth-finetuning	sickn33/agentic-awesome-skills			
+upstash-redis	sickn33/agentic-awesome-skills			
+verification-before-completion	obra/superpowers			108
+video-router	sickn33/agentic-awesome-skills			
+viral-video-teardown-remake	sickn33/agentic-awesome-skills			
+voice-cloning-studio	sickn33/agentic-awesome-skills			
+voiceover-narration-studio	sickn33/agentic-awesome-skills	media	media-automation-apps;other	113
+warehouse	sickn33/agentic-awesome-skills			
+weather-data-lifecycle-management	sickn33/agentic-awesome-skills			
+weather-data-reproducibility	sickn33/agentic-awesome-skills			
+weather-model-data-fetching	sickn33/agentic-awesome-skills			
+weather-model-run-discovery	sickn33/agentic-awesome-skills			
+weather-observation-fetching	sickn33/agentic-awesome-skills			
+weather-pipeline-performance-diagnosis	sickn33/agentic-awesome-skills			
+what-could-break	sickn33/agentic-awesome-skills			
+why-did-this-post-flop	sickn33/agentic-awesome-skills			
+wiki-builder	sickn33/agentic-awesome-skills	docs-writing;research	science-research-writing;other	48
+wiki-changelog	microsoft/skills			
+wiki-qa	microsoft/skills			
+wiki-yylo	sickn33/agentic-awesome-skills	docs-writing;planning-fleet-mgmt	other	48
+workflow-yylo	sickn33/agentic-awesome-skills			
+write-in-my-voice	sickn33/agentic-awesome-skills			
+writing-plans	obra/superpowers			76
+writing-skills	obra/superpowers			109
+youtube-transcript-skills	sickn33/agentic-awesome-skills	research	other	151

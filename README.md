@@ -125,26 +125,28 @@ groups.tsv --candidates candidates.tsv` reports counts of candidates,
 overlap-free candidates, groups, groups with an existing skill, and unjudged
 pairs.
 
-`python3 tools/judge_groups.py run --groups groups.tsv --candidates candidates.tsv
---checkouts <folder> --eval-tasks tools/eval-tasks.json --out verdicts.tsv
---trials-out trials.jsonl --model <name> --judge-model <name>` scores each
-member skill in same-use overlap groups on concrete engineering tasks from
-`tools/eval-tasks.json` across function classes using the eval-harness method.
-Deterministic regular expression assertions (`must_match` and `must_not_match`)
-decide pass/fail across k trials per task (measuring pass@3 and pass^3), while a
-local chat model scores a 0-10 rubric to break rule-score ties. It decides
-`keep-better` when one member's rule score exceeds every other's by at least 0.2
-(decided by rule) or when the rule gap is under 0.2 and the judge score exceeds
-others by at least 2.0 (decided by judge), `keep-both` with distinct use when
-members win different tasks where the other fails, or `propose-merge` on ties.
-Verdicts in `verdicts.tsv` record `decided_by` along with kept and dropped
-skills. Existing skills under `skills/` are never dropped; when an existing skill
-loses, the verdict records `replace-proposed` for human review. Completed trials
-are saved in `trials.jsonl` so interrupted runs resume without re-running, and
-`python3 tools/judge_groups.py summary --verdicts verdicts.tsv` reports counts
-per verdict, kept and dropped skills, and models used.
+`python3 -B tools/judge_groups.py run --groups groups.tsv --candidates candidates.tsv
+--checkouts <folder> --cache <overlap-cache.json> --eval-tasks tools/eval-tasks.json
+--out verdicts.tsv --trials-out trials.jsonl --model <name> --judge-model <name>`
+collapses cross-source near-copies before any model call. Equal normalised names
+and cached embedding cosine >= 0.97 identify a copy, as does a front-matter source
+field naming the other repository. Explicit provenance selects the original;
+otherwise lower `rank` in `tools/census-sources.json` wins, with lexical source
+order breaking ties. The remaining members vote for one primary function class
+(ties follow `classify.FUNCTIONS` order); only its three tasks run. Deterministic
+regular expression assertions decide pass/fail across k trials per task, reporting
+pass@k and pass^k. `keep-better` requires a rule-score gap >= 0.34 over every other
+member. `keep-both` requires opposite tasks with 3/3 versus 0/3 passes for every
+pair; incomplete or inconclusive evidence yields `person-decides` with scores.
+Rubric scores remain advisory and never select a verdict. `verdicts.tsv` records
+`copies` as a JSON mapping of member to `copy-of:<original>`, `primary_class`,
+`decided_by`, kept and dropped skills, and scores. Existing skills under `skills/`
+are never dropped; losing or being identified as a copy yields `replace-proposed`
+for human review. Completed trials in `trials.jsonl` allow interrupted runs to
+resume. `python3 -B tools/judge_groups.py summary --verdicts verdicts.tsv` reports
+counts per verdict, kept and dropped skills, and models used.
 
-`python3 -B tools/adopt_skills.py --candidates candidates.tsv --groups groups.tsv --census census.tsv --checkouts <folder> --root .` previews adoption in census order; add `--apply` to write accepted skills and upstream attribution in `REUSE.toml` and `CREDITS.md`, downloading missing licence texts into `LICENSES/` with `reuse`. `--report <path>` writes `adopt-report.tsv` there; without it no report file is written, and the repository root is refused as a report location. Grouped candidates wait for the group judge. Each skill comes from its census pin, with its licence text and an `ORIGIN.md`; collisions receive an owner suffix. Opening code fences without an info string in Markdown files get language `text` and record that in `ORIGIN.md`. Folders exceeding 200 files or 2 MiB, symlinks, unsafe paths, missing licence text, and failures of the skill checker, repository markdown gate, or HISS gate (staging the skill alone in a temporary root with `.standards.yaml` and `.standards-baseline.json` under `praetorctl baseline --verify --all-violations`) are refused individually; markdown and HISS refusals report the failing rule IDs and file. A missing `praetorctl` binary fails the run. Both modes print the same report and counts per primary function class; previews leave the repository and supplied checkout sparse patterns unchanged, fetching missing candidate blobs at their pin to evaluate every candidate.
+`python3 -B tools/adopt_skills.py --candidates candidates.tsv --groups groups.tsv --census census.tsv --checkouts <folder> --root .` previews adoption in census order; add `--apply` to write accepted skills, upstream attribution in `REUSE.toml` and `CREDITS.md`, and rebuild `skills/INDEX.tsv`, downloading missing licence texts into `LICENSES/` with `reuse`. `--include-grouped` requires `--cache <embed-cache.json>` and reads `tools/census-sources.json` ranks to adopt group members: `judge_groups.collapse_copies` resolves copy pairs, refusing copies with reason `copy-of:<original candidate>` while surviving members run the same gates as overlap-free candidates; an original refused by a gate does not promote its copy. Without `--include-grouped`, grouped candidates wait for the group judge. `--report <path>` writes `adopt-report.tsv` there; without it no report file is written, and the repository root is refused as a report location. Each skill comes from its census pin, with its licence text and an `ORIGIN.md`; collisions receive an owner suffix. Opening code fences without an info string in Markdown files get language `text` and record that in `ORIGIN.md`. Folders exceeding 200 files or 2 MiB, symlinks, unsafe paths, missing licence text, and failures of the skill checker, repository markdown gate, or HISS gate (staging the skill alone in a temporary root with `.standards.yaml` and `.standards-baseline.json` under `praetorctl baseline --verify --all-violations`) are refused individually; markdown and HISS refusals report the failing rule IDs and file. A missing `praetorctl` binary fails the run. `skills/INDEX.tsv` lists every directory under `skills/` with columns `skill`, `source` (`owner/repo` from `ORIGIN.md` or `peritia`), `functions`, `domains` (from `--candidates` for census skills, `;`-separated, empty otherwise), and `overlap_group` (the group ID from `--groups`, empty otherwise), keeping values for existing skills not named by census inputs. Both modes print the same report and counts per primary function class; previews leave the repository and supplied checkout sparse patterns unchanged, fetching missing candidate blobs at their pin to evaluate every candidate.
 
 ## Credits
 

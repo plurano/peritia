@@ -26,14 +26,19 @@ from pathlib import Path, PurePosixPath
 
 import census
 import check_skills
+import judge_groups
 from candidates import LICENSE_FILENAMES, MAX_ROWS, find_folder_licence_file, normalize_name
 from census import LiveReader, SourceReadError
+from judge_groups import collapse_copies, get_skill_text, is_existing_skill, load_sources
+from overlap import Item, git_blob_id, load_cache, parse_frontmatter
 
 MAX_FILES = 200
 MAX_BYTES = 2 * 1024 * 1024
 MAX_TREE_BYTES = 32 * 1024 * 1024
 TIMEOUT = 60
 REPORT_FIELDS = ['candidate', 'verdict', 'directory', 'reason']
+INDEX_FIELDS = ['skill', 'source', 'functions', 'domains', 'overlap_group']
+INDEX_HEADER = '\t'.join(INDEX_FIELDS)
 REPOSITORY = re.compile(r'[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9][A-Za-z0-9._-]*\Z')
 NAME = re.compile(r'[a-z0-9][a-z0-9-]*\Z')
 MARKDOWN_EXTENSIONS = ('.md', '.markdown', '.mdx')
@@ -86,8 +91,8 @@ def candidate_id(row):
 
 
 def inputs(candidates, groups, census):
-    candidates = read_rows(candidates, {'source', 'path', 'skill_name', 'verdict',
-                                      'licence', 'licence_evidence', 'functions'})
+    candidate_rows = read_rows(candidates, {'source', 'path', 'skill_name', 'verdict',
+                                            'licence', 'licence_evidence', 'functions'})
     census = read_rows(census, {'source', 'path', 'pin'})
     groups = read_rows(groups, {'members'})
     order, pins = {}, {}
@@ -97,12 +102,19 @@ def inputs(candidates, groups, census):
             raise ValueError(f'{source}: invalid or conflicting census pin')
         pins[source] = pin
         order.setdefault(candidate_id(row), index)
-    selected = [row for row in candidates if row['verdict'] == 'candidate']
+    selected = [row for row in candidate_rows if row['verdict'] == 'candidate']
     if len({candidate_id(row) for row in selected}) != len(selected):
         raise ValueError('duplicate candidate rows')
     selected.sort(key=lambda row: (order.get(candidate_id(row), MAX_ROWS), candidate_id(row)))
     grouped = {member.strip() for row in groups for member in row['members'].split(',')}
-    return selected, grouped, order, pins
+    group_map = {}
+    for row in groups:
+        gid = row.get('group_id', '').strip()
+        for member in row['members'].split(','):
+            m = member.strip()
+            if m:
+                group_map[m] = gid
+    return selected, grouped, order, pins, groups, group_map, candidate_rows
 
 
 def safe_path(raw):
@@ -482,7 +494,7 @@ def summary(rows, candidates):
     counts = Counter((candidate['functions'].split(';')[0] or 'none', row['verdict'])
                      for candidate, row in zip(candidates, rows))
     return '\n'.join(f'function {function}: ' + ', '.join(
-        f'{verdict}={counts[function, verdict]}' for verdict in ('adopted', 'refused', 'skipped-grouped'))
+        f'{verdict}={counts[function, verdict]}' for verdict in ('adopted', 'present', 'refused', 'skipped-grouped'))
         for function in sorted({function for function, _ in counts}))
 
 
@@ -494,15 +506,241 @@ def prepare_staging(root, staging):
             shutil.copyfile(manifest, staging / name)
 
 
-def evaluate(row, grouped, order, pins, checkouts, root, staging, occupied, apply, reader,
-             gate=markdown_gate, hiss_gate=hiss_gate):
-    result = dict(zip(REPORT_FIELDS, (candidate_id(row), 'refused', '', '')))
-    if result['candidate'] in grouped:
-        result.update(verdict='skipped-grouped', reason='awaiting-group-judge')
-        return result, None, ''
+def extract_source(origin_path: Path) -> str:
+    if not origin_path.is_file():
+        return 'peritia'
+    rec = check_skills.fields(origin_path.read_text(encoding='utf-8'))
+    upstream = rec.get('upstream', '').strip().strip('<>').strip()
+    if not upstream or upstream == 'own':
+        return 'peritia'
+    m = re.search(r'github\.com/([^/]+/[^/]+?)(?:\.git|/|\Z)', upstream)
+    if m:
+        return m.group(1)
+    if REPOSITORY.fullmatch(upstream):
+        return upstream
+    return upstream or 'peritia'
+
+
+def read_present_skills(skills_dir: Path) -> dict[tuple[str, str], dict[str, str]]:
+    if not skills_dir.is_dir():
+        return {}
+    present = {}
+    for d in sorted(p for p in skills_dir.iterdir() if p.is_dir()):
+        origin_file = d / 'ORIGIN.md'
+        if not origin_file.is_file():
+            continue
+        try:
+            rec = check_skills.fields(origin_file.read_text(encoding='utf-8'))
+            upstream = extract_source(origin_file)
+            if not upstream or upstream == 'peritia':
+                continue
+            raw_path = rec.get('path', '').strip()
+            if raw_path.endswith('/SKILL.md'):
+                origin_path = str(PurePosixPath(raw_path).parent)
+            elif raw_path:
+                origin_path = str(PurePosixPath(raw_path))
+            else:
+                origin_path = '.'
+            commit = rec.get('commit', '').strip()
+            key = (upstream.lower(), origin_path)
+            if key not in present:
+                present[key] = {
+                    'directory': f'skills/{d.name}',
+                    'commit': commit,
+                    'name': d.name,
+                }
+        except (OSError, UnicodeDecodeError):
+            continue
+    return present
+
+
+def candidate_folder(row: dict) -> str | None:
     try:
-        if result['candidate'] not in order:
+        path = safe_path(row['path'])
+        if path.name != 'SKILL.md':
+            return None
+        return str(path.parent)
+    except Refused:
+        return None
+
+
+def rebuild_index(root: Path, adopted_map: dict[str, dict] | None = None,
+                  group_map: dict[str, str] | None = None) -> list[dict[str, str]]:
+    skills_dir = root / 'skills'
+    if not skills_dir.is_dir():
+        return []
+    index_file = skills_dir / 'INDEX.tsv'
+    existing = {}
+    if index_file.is_file():
+        try:
+            with index_file.open(encoding='utf-8', newline='') as handle:
+                reader = csv.DictReader(handle, delimiter='\t')
+                for row in reader:
+                    if row.get('skill'):
+                        existing[row['skill']] = row
+        except Exception:
+            existing = {}
+
+    adopted_map = adopted_map or {}
+    group_map = group_map or {}
+
+    dirs = sorted(p for p in skills_dir.iterdir() if p.is_dir())[:check_skills.MAX_SKILLS]
+    rows = []
+    for d in dirs:
+        name = d.name
+        source = extract_source(d / 'ORIGIN.md')
+        if name in adopted_map:
+            cand = adopted_map[name]
+            functions = cand.get('functions', '')
+            domains = cand.get('domains', '')
+            cid = candidate_id(cand)
+            overlap_group = group_map.get(cid, '')
+        elif name in existing:
+            prev = existing[name]
+            functions = prev.get('functions', '')
+            domains = prev.get('domains', '')
+            overlap_group = group_map.get(f'skills/{name}', group_map.get(name, prev.get('overlap_group', '')))
+        else:
+            functions = ''
+            domains = ''
+            overlap_group = group_map.get(f'skills/{name}', group_map.get(name, ''))
+
+        rows.append({
+            'skill': name,
+            'source': source,
+            'functions': functions,
+            'domains': domains,
+            'overlap_group': overlap_group,
+        })
+    rows.sort(key=lambda r: r['skill'])
+    return rows
+
+
+def write_index(root: Path, adopted_map: dict[str, dict] | None = None,
+                group_map: dict[str, str] | None = None) -> None:
+    skills_dir = root / 'skills'
+    if not skills_dir.is_dir():
+        return
+    rows = rebuild_index(root, adopted_map, group_map)
+    index_file = skills_dir / 'INDEX.tsv'
+    with index_file.open('w', encoding='utf-8', newline='') as handle:
+        writer = csv.DictWriter(handle, fieldnames=INDEX_FIELDS, delimiter='\t', lineterminator='\n')
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def get_member_skill_text(member: str, checkouts: Path, skills_dir: Path, pins: dict[str, str] | None = None) -> str:
+    text = get_skill_text(member, checkouts, skills_dir)
+    if text:
+        return text
+    if ':' in member and pins:
+        source, path_str = member.split(':', 1)
+        if source in pins:
+            checkout = checkouts / source.replace('/', '__')
+            if checkout.is_dir():
+                try:
+                    data = git(checkout, 'show', f'{pins[source]}:{path_str}')
+                    return data.decode('utf-8', errors='replace')[:judge_groups.MAX_SKILL_CHARS]
+                except Exception:
+                    pass
+    if ':' in member and skills_dir.is_dir():
+        source, path_str = member.split(':', 1)
+        present = read_present_skills(skills_dir)
+        folder = str(PurePosixPath(path_str).parent) if path_str.endswith('/SKILL.md') else str(PurePosixPath(path_str))
+        key = (source.lower(), folder)
+        if key in present:
+            skill_md = skills_dir / present[key]['name'] / 'SKILL.md'
+            if skill_md.is_file():
+                try:
+                    return skill_md.read_text(encoding='utf-8', errors='replace')[:judge_groups.MAX_SKILL_CHARS]
+                except Exception:
+                    pass
+    return ''
+
+
+def resolve_copies(group_rows, checkouts, root, pins, all_candidates, cache, sources):
+    if cache is None:
+        raise ValueError('--include-grouped requires --cache')
+    cache_path = Path(cache)
+    if not cache_path.is_file():
+        raise ValueError(f'embedding cache not found: {cache_path}')
+    embeddings = load_cache(cache_path)
+
+    if sources is None:
+        sources_path = Path(__file__).resolve().parent / 'census-sources.json'
+    else:
+        sources_path = Path(sources)
+    if isinstance(sources, dict):
+        ranks = dict(sources)
+    else:
+        loaded_src = load_sources(sources_path)
+        ranks = {s.repository: s.rank for s in loaded_src}
+        for s in loaded_src:
+            ranks[s.repository.lower()] = s.rank
+
+    cand_by_cid = {candidate_id(r): r for r in all_candidates}
+    all_members = {m.strip() for grow in group_rows for m in grow['members'].split(',') if m.strip()}
+    items: dict[str, Item] = {}
+    metadata: dict[str, dict[str, str]] = {}
+    for m in all_members:
+        text = get_member_skill_text(m, checkouts, root / 'skills', pins)
+        meta = parse_frontmatter(text)
+        metadata[m] = meta
+        if is_existing_skill(m):
+            rel = m[len('skills/'):].strip('/')
+            sf = root / 'skills' / rel / 'SKILL.md'
+            b_id = git_blob_id(sf.read_bytes()) if sf.is_file() else ''
+            name = meta.get('name') or rel
+            desc = meta.get('description', '')
+            items[m] = Item(item_id=m, blob_id=b_id, skill_name=name, description=desc, is_existing=True)
+        else:
+            cand = cand_by_cid.get(m)
+            b_id = cand.get('blob_id', '').strip() if cand else ''
+            if not b_id and text:
+                b_id = git_blob_id(text.encode('utf-8'))
+            name = (cand.get('skill_name') if cand else None) or meta.get('name') or ''
+            desc = meta.get('description', '')
+            items[m] = Item(item_id=m, blob_id=b_id, skill_name=name, description=desc, is_existing=False)
+
+    copies_map = {}
+    for grow in group_rows:
+        members = [m.strip() for m in grow['members'].split(',') if m.strip()]
+        _, g_copies = collapse_copies(members, items, metadata, embeddings, ranks)
+        for copy_member, reason in g_copies.items():
+            copies_map[copy_member] = reason
+    return copies_map
+
+
+def evaluate(row, grouped, order, pins, checkouts, root, staging, occupied, apply, reader,
+             gate=markdown_gate, hiss_gate=hiss_gate, include_grouped=False, copies=None,
+             present=None):
+    result = dict(zip(REPORT_FIELDS, (candidate_id(row), 'refused', '', '')))
+    cid = result['candidate']
+    if include_grouped:
+        if copies and cid in copies:
+            result.update(verdict='refused', reason=copies[cid])
+            return result, None, ''
+    else:
+        if cid in grouped:
+            result.update(verdict='skipped-grouped', reason='awaiting-group-judge')
+            return result, None, ''
+    try:
+        if cid not in order:
             raise Refused('candidate-not-in-census')
+        if present is None and root is not None:
+            present = read_present_skills(root / 'skills')
+        if present:
+            cand_folder = candidate_folder(row)
+            if cand_folder is not None:
+                key = (row['source'].lower(), cand_folder)
+                if key in present:
+                    info = present[key]
+                    old_commit = info['commit']
+                    new_commit = pins.get(row['source'], row.get('pin', ''))
+                    reason = ('' if old_commit == new_commit else
+                              f'present: pinned {old_commit[:12]}, census {new_commit[:12]}')
+                    result.update(verdict='present', directory=info['directory'], reason=reason)
+                    return result, None, ''
         if len(occupied) >= check_skills.MAX_SKILLS:
             raise Refused('skill-count-limit')
         skill, year = stage_one(row, pins[row['source']], checkouts, staging, occupied, apply, reader)
@@ -555,7 +793,7 @@ def sync_licences(root: Path, reuse_text: str, runner=default_download_runner):
                 raise ValueError(f'licence download failed for {spdx_id}') from error
 
 
-def publish(root, saved, rows, reuse, credits, runner=default_download_runner):
+def publish(root, saved, rows, reuse, credits, adopted_map=None, group_map=None, runner=default_download_runner):
     # All gates have completed before publishing any skill. Never overwrite a skill.
     for row in rows:
         if row['verdict'] == 'adopted':
@@ -563,6 +801,7 @@ def publish(root, saved, rows, reuse, credits, runner=default_download_runner):
     for name, text in [('REUSE.toml', reuse), ('CREDITS.md', credits)]:
         (root / name).write_text(text, encoding='utf-8')
     sync_licences(root, reuse, runner=runner)
+    write_index(root, adopted_map=adopted_map, group_map=group_map)
 
 
 def resolve_report_path(report: Path | None, root: Path) -> Path | None:
@@ -579,22 +818,30 @@ def resolve_report_path(report: Path | None, root: Path) -> Path | None:
 
 def run(candidates, groups, census, checkouts, root=Path('.'), *, apply=False,
         reader=default_reader, gate=markdown_gate, hiss_gate=hiss_gate,
-        report=None, runner=None, download_runner=None):
+        report=None, runner=None, download_runner=None,
+        include_grouped=False, cache=None, sources=None):
     if download_runner is not None:
         runner = download_runner
     if runner is None:
         runner = default_download_runner
     root, checkouts = root.resolve(), checkouts.resolve()
     report_file = resolve_report_path(report, root)
-    selected, grouped, order, pins = inputs(candidates, groups, census)
+    selected, grouped, order, pins, group_rows, group_map, all_candidates = inputs(candidates, groups, census)
     for name in ('skills', 'REUSE.toml', 'CREDITS.md'):
         if (root / name).is_symlink():
             raise ValueError(f'{name}: output symlink refused')
     if report_file is not None and report_file.is_symlink():
         raise ValueError('report output symlink refused')
+
+    copies_map = {}
+    if include_grouped:
+        copies_map = resolve_copies(group_rows, checkouts, root, pins, all_candidates, cache, sources)
+
     reuse, credits = initial_metadata(root)
-    occupied = {path.name for path in (root / 'skills').iterdir()} if (root / 'skills').exists() else set()
+    occupied = {path.name for path in (root / 'skills').iterdir() if path.is_dir()} if (root / 'skills').exists() else set()
+    present = read_present_skills(root / 'skills')
     rows = []
+    adopted_map = {}
     with tempfile.TemporaryDirectory(prefix='adopt-skills-') as tmp:
         saved = Path(tmp) / 'accepted'
         saved.mkdir()
@@ -603,14 +850,17 @@ def run(candidates, groups, census, checkouts, root=Path('.'), *, apply=False,
                 staging = Path(work)
                 prepare_staging(root, staging)
                 result, skill, year = evaluate(row, grouped, order, pins, checkouts, root, staging,
-                                               occupied, apply, reader, gate=gate, hiss_gate=hiss_gate)
+                                               occupied, apply, reader, gate=gate, hiss_gate=hiss_gate,
+                                               include_grouped=include_grouped, copies=copies_map,
+                                               present=present)
                 rows.append(result)
                 if skill is not None:
                     reuse, credits = add_metadata(reuse, credits, row, skill.name, year)
                     occupied.add(skill.name)
                     shutil.move(str(skill), saved / skill.name)
+                    adopted_map[skill.name] = row
         if apply:
-            publish(root, saved, rows, reuse, credits, runner=runner)
+            publish(root, saved, rows, reuse, credits, adopted_map=adopted_map, group_map=group_map, runner=runner)
     if report_file is not None:
         report_file.parent.mkdir(parents=True, exist_ok=True)
         report_file.write_text(report_text(rows), encoding='utf-8')
@@ -624,10 +874,13 @@ def main(argv=None):
     parser.add_argument('--root', type=Path, default=Path('.'))
     parser.add_argument('--apply', action='store_true', help='write accepted skills and attribution')
     parser.add_argument('--report', type=Path, default=None, help='write adopt-report.tsv to this path')
+    parser.add_argument('--include-grouped', action='store_true', help='adopt overlap-group members except collapsed copies')
+    parser.add_argument('--cache', type=Path, default=None, help='embedding cache JSON path (required by --include-grouped)')
     args = parser.parse_args(argv)
     try:
         rows, totals = run(args.candidates, args.groups, args.census, args.checkouts, args.root,
-                           apply=args.apply, report=args.report)
+                           apply=args.apply, report=args.report,
+                           include_grouped=args.include_grouped, cache=args.cache)
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
         print(f'adopt-skills: {error}', file=sys.stderr)
         return 1
