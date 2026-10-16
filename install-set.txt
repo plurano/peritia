@@ -1,0 +1,27 @@
+# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
+# SPDX-License-Identifier: EUPL-1.2
+#
+# Peritia install set: skills installed at user scope by tools/install_user_skills.py.
+# Clients enforce a ceiling on user-scope skills (e.g. Codex lists at most 129 skills,
+# measured 2026-10-15); the library retains all skills while the installer links only
+# this curated install set (default small).
+# The census batch report proposes additions for the operator veto.
+
+architecture-decision-records
+battery-modeling
+bernstein-run
+brendangregg-use-tsa
+brooks-review
+codebase-recon
+experimental-design
+peer-review
+postmortem-writing
+pre-mortem
+progressive-estimation
+scientific-problem-selection
+skeptical-triage
+subagent-driven-development
+systematic-debugging
+verification-before-completion
+writing-plans
+writing-skills

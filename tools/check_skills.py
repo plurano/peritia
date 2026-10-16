@@ -12,6 +12,11 @@ import sys
 import tempfile
 from pathlib import Path
 
+try:
+    from install_user_skills import read_install_set
+except ImportError:
+    from tools.install_user_skills import read_install_set
+
 MAX_SKILLS = 5000  # bounds the directories read (HISS-02)
 FRONT = re.compile(r"\A---\n(.*?)\n---\n", re.S)
 FIELD = re.compile(r"^(?P<key>[a-z_]+):\s*(?P<value>.+)$", re.M)
@@ -56,9 +61,22 @@ def skill_problems(skill):
     return out
 
 
+def check_install_set(root):
+    """Validate install-set.txt if present using the shared reader."""
+    path = root / "install-set.txt"
+    if not path.is_file():
+        return []
+    try:
+        read_install_set(root)
+        return []
+    except (ValueError, SystemExit) as exc:
+        return [f"install-set.txt: {exc}"]
+
+
 def check(root):
     skills = sorted(p for p in (root / "skills").iterdir() if p.is_dir())[:MAX_SKILLS] if (root / "skills").is_dir() else []
     problems = [p for s in skills for p in skill_problems(s)]
+    problems += check_install_set(root)
     for p in problems:
         print(f"[FAIL] {p}")
     print(f"skills: {len(skills)} checked, {len(problems)} problems")
@@ -84,6 +102,11 @@ def selftest():
         write(root, "good", good_md.format(n="good"), good_origin)
         write(root, "own", good_md.format(n="own"), "upstream: own\n", licence=False)
         assert check(root) == 0, "a complete adapted skill and an own skill pass"
+        (root / "install-set.txt").write_text("good\n", encoding="utf-8")
+        assert check(root) == 0, "a valid install-set.txt passes"
+        (root / "install-set.txt").write_text("good\nunknown-skill\n", encoding="utf-8")
+        assert check(root) == 1, "an unknown skill in install-set.txt is refused"
+        (root / "install-set.txt").unlink()
         cases = {
             "wrong-name": (good_md.format(n="other"), good_origin, True, "front matter name"),
             "no-origin": (good_md.format(n="no-origin"), None, True, "ORIGIN.md missing"),
@@ -96,7 +119,7 @@ def selftest():
             write(planted, name, md, origin, licence)
             problems = skill_problems(planted / "skills" / name)
             assert any(want in p for p in problems), (name, problems)
-    print(f"selftest ok: 2 clean skills pass, {len(cases)} planted defects refused")
+    print(f"selftest ok: 2 clean skills pass, {len(cases)} planted defects refused, install-set validated")
     return 0
 
 

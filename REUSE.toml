@@ -9,7 +9,7 @@ version = 1
 
 # The root licence text and files that cannot carry a header of their own.
 [[annotations]]
-path = ["LICENSE", ".gitignore", "renovate.json", "tools/census-sources.json", "tools/eval-tasks.json"]
+path = ["LICENSE", ".gitignore", "renovate.json", "tools/census-sources.json", "tools/eval-tasks.json", "install-set.txt"]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 Lusoris <lusoris@pm.me>"
 SPDX-License-Identifier = "EUPL-1.2"
@@ -19,6 +19,7 @@ SPDX-License-Identifier = "EUPL-1.2"
 [[annotations]]
 path = [
     ".agents/**",
+    ".brief/**",
     ".claude/**",
     ".codex/**",
     ".config/**",

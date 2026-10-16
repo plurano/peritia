@@ -31,6 +31,8 @@ REPO = "https://github.com/plurano/peritia"
 TAG = "v0.1.0"
 STORE_PARENT = ".local/share/praetor-tools/skills"
 MANIFEST = "peritia-user-skills.json"
+INSTALL_SET_FILE = "install-set.txt"
+INSTALL_LIMIT = 129  # Codex skill list limit (measured 2026-10-15)
 GIT_TIMEOUT = 300  # seconds for one clone or ls-remote (HISS-02)
 MAX_FILES = 20000  # bounds every tree walk (HISS-02)
 # Windows refuses a symbolic link without developer mode or admin rights; a directory junction needs neither.
@@ -92,15 +94,62 @@ def release_files(tree):
         if len(walked) > MAX_FILES:
             raise SystemExit(f"refused: {top} holds more than {MAX_FILES} files")
         picked += [p.relative_to(tree).as_posix() for p in walked]
-    return picked + [name for name in ("CREDITS.md", "LICENSE") if (tree / name).is_file()]
+    return picked + [name for name in ("CREDITS.md", "LICENSE", INSTALL_SET_FILE) if (tree / name).is_file()]
 
 
 def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def read_install_set(tree):
+    """Return ordered skill names from install-set.txt.
+
+    Refuse duplicate names, path separators, names missing skills/<name>/SKILL.md,
+    and lists longer than INSTALL_LIMIT.
+    """
+    root = tree if tree.is_dir() else tree.parent
+    path = root / INSTALL_SET_FILE if tree.is_dir() else tree
+    skills_dir = root / "skills"
+    if not path.is_file():
+        raise ValueError(f"install set missing: {path}")
+    names = []
+    seen = set()
+    for n, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        clean = raw.split("#", 1)[0].strip()
+        if not clean:
+            continue
+        if "/" in clean or "\\" in clean or (os.sep in clean and os.sep != "/"):
+            raise ValueError(f"refused: path separator in skill name {clean!r} at line {n}")
+        if clean in seen:
+            raise ValueError(f"refused: duplicate skill {clean!r} at line {n}")
+        skill_md = skills_dir / clean / "SKILL.md"
+        if not skill_md.is_file():
+            raise ValueError(f"refused: unknown skill {clean!r} (missing skills/{clean}/SKILL.md)")
+        names.append(clean)
+        seen.add(clean)
+    if len(names) > INSTALL_LIMIT:
+        raise ValueError(f"refused: install set holds {len(names)} skills, exceeding limit of {INSTALL_LIMIT}")
+    return names
+
+
 def skill_names(tree):
-    return sorted(p.name for p in (tree / "skills").iterdir() if (p / "SKILL.md").is_file())
+    """Return ordered skill names: install-set.txt if present in release tree, else all skills."""
+    if (tree / INSTALL_SET_FILE).is_file():
+        try:
+            return read_install_set(tree)
+        except ValueError as exc:
+            raise SystemExit(str(exc))
+    skills_dir = tree / "skills"
+    return sorted(p.name for p in skills_dir.iterdir() if (p / "SKILL.md").is_file()) if skills_dir.is_dir() else []
+
+
+def skill_source_desc(tree, names):
+    """Return source description string for plan/install/verify."""
+    skills_dir = tree / "skills"
+    all_count = len([p for p in skills_dir.iterdir() if (p / "SKILL.md").is_file()]) if skills_dir.is_dir() else 0
+    if (tree / INSTALL_SET_FILE).is_file():
+        return f"install set: {len(names)} of {all_count} skills"
+    return f"no install set: all {all_count} skills"
 
 
 def is_junction(path):
@@ -178,9 +227,11 @@ def install(args, home, apply):
         tree = Path(tmp) / "release"
         commit = fetch(repo, tag, tree)
         store = home / STORE_PARENT / f"peritia@{commit}"
-        names, files = skill_names(tree), release_files(tree)
+        names = skill_names(tree)
+        source = skill_source_desc(tree, names)
+        files = release_files(tree)
         links, collisions = plan_links(names, dirs, store)
-        report(tag, commit, store, dirs, skipped, links, collisions, apply)
+        report(tag, commit, store, dirs, skipped, links, collisions, apply, source)
         if not apply:
             return 0
         if (home / STORE_PARENT / MANIFEST).exists():
@@ -192,15 +243,16 @@ def install(args, home, apply):
         if link_target(link) is None:
             modes.add(make_link(link, target))
     print("link mode: " + (", ".join(sorted(modes)) or "links already present"))
-    manifest = {"repo": repo, "tag": tag, "commit": commit, "store": str(store), "files": sums,
+    manifest = {"repo": repo, "tag": tag, "commit": commit, "store": str(store),
+                "source": source, "files": sums,
                 "links": [{"client": c, "link": str(l), "target": str(t)} for c, l, t in links],
                 "skipped_clients": skipped, "collisions": collisions}
     (home / STORE_PARENT / MANIFEST).write_text(json.dumps(manifest, indent=1) + "\n", encoding="utf-8")
     return verify(home)
 
 
-def report(tag, commit, store, dirs, skipped, links, collisions, apply):
-    print(f"{'install' if apply else 'plan (dry run)'}: Peritia {tag} at {commit} -> {store}")
+def report(tag, commit, store, dirs, skipped, links, collisions, apply, source):
+    print(f"{'install' if apply else 'plan (dry run)'}: Peritia {tag} at {commit} ({source}) -> {store}")
     for client, folder in sorted(dirs.items()):
         print(f"  {client}: {sum(1 for c, _l, _t in links if c == client)} links in {folder}")
     for client, why in sorted(skipped.items()):
@@ -244,8 +296,20 @@ def verify(home):
     bad = store_problems(manifest) + link_problems(manifest)
     for line in bad:
         print(f"verify: {line}")
+    source = manifest.get("source")
+    if not source:
+        store = Path(manifest["store"])
+        all_s = [p.name for p in (store / "skills").iterdir() if (p / "SKILL.md").is_file()] if (store / "skills").is_dir() else []
+        if (store / INSTALL_SET_FILE).is_file():
+            try:
+                iset = read_install_set(store)
+                source = f"install set: {len(iset)} of {len(all_s)} skills"
+            except Exception:
+                source = f"install set: unknown of {len(all_s)} skills"
+        else:
+            source = f"no install set: all {len(all_s)} skills"
     clients = sorted({row["client"] for row in manifest["links"]})
-    print(f"verify: Peritia {manifest['tag']} {manifest['commit'][:12]}: {len(manifest['files'])} files, "
+    print(f"verify: Peritia {manifest['tag']} {manifest['commit'][:12]} ({source}): {len(manifest['files'])} files, "
           f"{len(manifest['links'])} links for {', '.join(clients) or 'no client'}: {'FAIL' if bad else 'ok'}")
     return 1 if bad else 0
 
@@ -279,13 +343,15 @@ def leftovers(home, manifest):
     return left
 
 
-def fixture_repo(root):
-    """A local repository with two skills and an annotated tag v9.9.9, standing in for the release."""
-    src = root / "src"
-    for name in ("alpha", "beta"):
+def fixture_repo(root, dirname="src", skills=("alpha", "beta"), install_set=None):
+    """A local repository with given skills and optional install-set.txt, tagged v9.9.9."""
+    src = root / dirname
+    for name in skills:
         (src / "skills" / name).mkdir(parents=True)
         (src / "skills" / name / "SKILL.md").write_text(f"---\nname: {name}\n---\n# {name}\n", encoding="utf-8")
     (src / "CREDITS.md").write_text("# Credits\n", encoding="utf-8")
+    if install_set is not None:
+        (src / INSTALL_SET_FILE).write_text(install_set, encoding="utf-8")
     env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
     for args in (["init", "-q", "-b", "main"], ["add", "-A"],
                  ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "fixture"],
@@ -301,6 +367,53 @@ def quiet(fn, *args):
         return fn(*args)
 
 
+def selftest_install_set_cases(root):
+    five = ("s1", "s2", "s3", "s4", "s5")
+    repo = fixture_repo(root, dirname="src_set", skills=five, install_set="# 3 curated\ns1\ns2\ns3\n")
+    home = root / "home_set"
+    os.environ["CODEX_HOME"] = str(home / ".codex")
+    args = {"--tag": "v9.9.9", "--repo": repo, "--clients": "all"}
+    cases = [("install set 3 of 5 installs ok", quiet(install, args, home, True) == 0)]
+    manifest = load_manifest(home)
+    cases.append(("install set source recorded", manifest.get("source") == "install set: 3 of 5 skills"))
+    cases.append(("15 links: 3 skills x 5 clients", len(manifest["links"]) == 15))
+    dirs, _ = client_dirs(home, True)
+    read_back_ok = True
+    for _client, folder in dirs.items():
+        if sorted(p.name for p in folder.iterdir()) != ["s1", "s2", "s3"]:
+            read_back_ok = False
+        for s in ("s1", "s2", "s3"):
+            if link_target(folder / s) != Path(manifest["store"]) / "skills" / s:
+                read_back_ok = False
+        if (folder / "s4").exists() or (folder / "s5").exists():
+            read_back_ok = False
+    cases.append(("read-back lists exactly 3 skills per client", read_back_ok))
+    cases.append(("install set verify ok", quiet(verify, home) == 0))
+    return cases
+
+
+def selftest_reader_cases(root):
+    neg_tree = root / "neg_tree"
+    for name in ("s1", "s2"):
+        (neg_tree / "skills" / name).mkdir(parents=True, exist_ok=True)
+        (neg_tree / "skills" / name / "SKILL.md").write_text(f"---\nname: {name}\n---\n", encoding="utf-8")
+    (neg_tree / INSTALL_SET_FILE).write_text("s1\ns1\n", encoding="utf-8")
+    cases = [("negative: duplicate refused", refused(lambda: read_install_set(neg_tree)))]
+    (neg_tree / INSTALL_SET_FILE).write_text("s1\nunknown_skill\n", encoding="utf-8")
+    cases.append(("negative: unknown name refused", refused(lambda: read_install_set(neg_tree))))
+    (neg_tree / INSTALL_SET_FILE).write_text("s1\nsub/s2\n", encoding="utf-8")
+    cases.append(("negative: path separator refused", refused(lambda: read_install_set(neg_tree))))
+    bound_tree = root / "bound_tree"
+    for i in range(130):
+        (bound_tree / "skills" / f"sk{i}").mkdir(parents=True, exist_ok=True)
+        (bound_tree / "skills" / f"sk{i}" / "SKILL.md").write_text(f"---\nname: sk{i}\n---\n", encoding="utf-8")
+    (bound_tree / INSTALL_SET_FILE).write_text("\n".join(f"sk{i}" for i in range(130)) + "\n", encoding="utf-8")
+    cases.append(("negative: 130 names refused", refused(lambda: read_install_set(bound_tree))))
+    (bound_tree / INSTALL_SET_FILE).write_text("\n".join(f"sk{i}" for i in range(129)) + "\n", encoding="utf-8")
+    cases.append(("boundary: 129 names accepted", len(read_install_set(bound_tree)) == 129))
+    return cases
+
+
 def selftest_cases(root):
     home, repo = root / "home", fixture_repo(root)
     os.environ["CODEX_HOME"] = str(home / ".codex")
@@ -310,6 +423,7 @@ def selftest_cases(root):
     cases.append(("install reads back ok", quiet(install, args, home, True) == 0))
     manifest = load_manifest(home)
     cases.append(("9 links: 2 skills x 5 clients minus 1 collision", len(manifest["links"]) == 9))
+    cases.append(("boundary: no install-set.txt installs all", manifest.get("source") == "no install set: all 2 skills"))
     cases.append(("collision left as it is", (home / ".claude/skills/beta").is_dir()
                   and not (home / ".claude/skills/beta").is_symlink() and len(manifest["collisions"]) == 1))
     target = Path(manifest["store"]) / "skills/alpha/SKILL.md"
@@ -328,13 +442,13 @@ def selftest_cases(root):
     cases.append(("second install refused", refused(lambda: quiet(install, args, home, True))))
     cases.append(("uninstall leaves zero Peritia files", quiet(uninstall, home, True) == 0
                   and not leftovers(home, manifest) and (home / ".claude/skills/beta").is_dir()))
-    return cases
+    return cases + selftest_install_set_cases(root) + selftest_reader_cases(root)
 
 
 def refused(call):
     try:
         call()
-    except SystemExit:
+    except (SystemExit, ValueError):
         return True
     return False
 
@@ -358,7 +472,7 @@ def selftest():
     if bad:
         raise SystemExit(f"selftest failed: {bad}")
     print(f"selftest ok: {len(cases)} cases, link modes {', '.join(modes)} "
-          "(plan, install, collision, tamper, add, link, reinstall, uninstall)")
+          "(plan, install, collision, tamper, add, link, reinstall, uninstall, install-set)")
     return 0
 
 

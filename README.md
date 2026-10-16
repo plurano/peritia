@@ -41,10 +41,23 @@ in a store named after the tagged commit, and links each skill into the user
 skill folder of every client it finds: Claude Code (`~/.claude/skills`), Codex
 (`$CODEX_HOME/skills`), Antigravity (`~/.gemini/config/skills`), Gemini CLI
 (`~/.gemini/skills`) and opencode (`~/.agents/skills`, which opencode reads
-beside `~/.claude/skills`). It never replaces an existing entry of the same
-name, and it prints a plan unless you pass `--apply`. On Windows, where a
-symbolic link needs developer mode or administrator rights, a refused link
-becomes a directory junction, and the output names the mode it used:
+beside `~/.claude/skills`).
+
+Coding clients enforce limits on user-scope skills (e.g. Codex lists at most 129
+skills, measured 2026-10-15), so installing an entire library of ~200 skills
+would cause clients to hide skills. Per operator decision
+`peritia-client-distribution-20261016 = a`, the library keeps every skill, while
+the user-scope installer installs only the curated skills named in
+`install-set.txt` at the root of the release (never more than `INSTALL_LIMIT = 129`).
+Release v0.1.0 pins the 18 curated skills (default small). Releases without
+`install-set.txt` fall back to installing every skill in the release. The
+`plan`, `install` and `verify` commands report which source decided
+(`install set: 18 of 197 skills` or `no install set: all N skills`).
+
+It never replaces an existing entry of the same name, and it prints a plan
+unless you pass `--apply`. On Windows, where a symbolic link needs developer
+mode or administrator rights, a refused link becomes a directory junction, and
+the output names the mode it used:
 
 ```sh
 python3 tools/install_user_skills.py plan --tag v0.1.0
@@ -54,8 +67,9 @@ python3 tools/install_user_skills.py uninstall --apply
 ```
 
 `verify` compares every stored file with the sha256 recorded at install and
-every link with its target, and fails on any change. `uninstall` removes the
-links and the store and reports how many Peritia paths remain (zero).
+every link with its target, reports the install source, and fails on any change.
+`uninstall` removes the links and the store and reports how many Peritia paths
+remain (zero).
 
 ## Census
 
