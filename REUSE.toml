@@ -1272,3 +1272,399 @@ path = ["skills/triage/**"]
 precedence = "override"
 SPDX-FileCopyrightText = "2026 vercel-labs and contributors"
 SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/carrier-relationship-management/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 affaan-m and contributors"
+SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
+path = ["skills/make-interfaces-feel-better/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 affaan-m and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/messages-ops/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 affaan-m and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/motion-advanced/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 affaan-m and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/motion-foundations/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 affaan-m and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/motion-patterns/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 affaan-m and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/accessibility/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 affaan-m and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/conventional-commit-review/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 affaan-m and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/frontend-a11y/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 affaan-m and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/frontend-patterns/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 affaan-m and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/parallel-execution-optimizer/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 affaan-m and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/product-capability/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 affaan-m and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/cisco-ios-patterns/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 affaan-m and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/council-multi-model/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 affaan-m and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/dynamic-workflow-mode/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 affaan-m and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/finance-billing-ops/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 affaan-m and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/hermes-imports/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 affaan-m and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/hipaa-compliance/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 affaan-m and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/network-config-validation/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 affaan-m and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/nutrient-document-processing/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 affaan-m and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/orch-add-feature/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 affaan-m and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/orch-build-mvp/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 affaan-m and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/orch-refine-code/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 affaan-m and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/safety-guard/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 affaan-m and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/scientific-thinking-literature-review/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 affaan-m and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/scientific-thinking-scholar-evaluation/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 affaan-m and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/security-bounty-hunter/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 affaan-m and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/team-agent-orchestration/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 affaan-m and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/azure-eventhub-java/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 microsoft and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/applicationinsights-web-ts/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 microsoft and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/ai-podcast-voiceover/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 sickn33 and contributors"
+SPDX-License-Identifier = "MIT-0"
+
+[[annotations]]
+path = ["skills/atlas-cloud-media/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 sickn33 and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/beatra/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 sickn33 and contributors"
+SPDX-License-Identifier = "MIT-0"
+
+[[annotations]]
+path = ["skills/before-you-build/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 sickn33 and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/brain-to-docs/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 sickn33 and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/compile-knowledge/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 sickn33 and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/deep-research-framework/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 sickn33 and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/equibles/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 sickn33 and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/feature-tracking/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 sickn33 and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/five-axis-code-review/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 sickn33 and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/git-commit-message/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 sickn33 and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/glasser/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 sickn33 and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/hipaa-compliance-sickn33/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 sickn33 and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/idea-autopsy/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 sickn33 and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/incident-management/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 sickn33 and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/markstream-vue2-vite/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 sickn33 and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/markstream-vue2/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 sickn33 and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/meeting-notes/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 sickn33 and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/muapi-media/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 sickn33 and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/orchestrate/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 sickn33 and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/parallel-search-mcp/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 sickn33 and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/pre-release-review/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 sickn33 and contributors"
+SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
+path = ["skills/pre-ship-gate/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 sickn33 and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/production-runtime-certification/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 sickn33 and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/repo-maintainer/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 sickn33 and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/serply-search-mcp/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 sickn33 and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/spec-driven-loop/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 sickn33 and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/tokenleak/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 sickn33 and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/unslop/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 sickn33 and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/voiceover-narration-studio/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 sickn33 and contributors"
+SPDX-License-Identifier = "MIT-0"
+
+[[annotations]]
+path = ["skills/wiki-builder/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 sickn33 and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/wiki-yylo/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 sickn33 and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/youtube-transcript-skills/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 sickn33 and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/codex-subagent/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 sickn33 and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/delegating-to-agents/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 sickn33 and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/sshepherd/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 sickn33 and contributors"
+SPDX-License-Identifier = "MIT"
