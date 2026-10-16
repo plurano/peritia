@@ -111,6 +111,25 @@ groups.tsv --candidates candidates.tsv` reports counts of candidates,
 overlap-free candidates, groups, groups with an existing skill, and unjudged
 pairs.
 
+`python3 tools/judge_groups.py run --groups groups.tsv --candidates candidates.tsv
+--checkouts <folder> --eval-tasks tools/eval-tasks.json --out verdicts.tsv
+--trials-out trials.jsonl --model <name> --judge-model <name>` scores each
+member skill in same-use overlap groups on concrete engineering tasks from
+`tools/eval-tasks.json` across function classes using the eval-harness method.
+Deterministic regular expression assertions (`must_match` and `must_not_match`)
+decide pass/fail across k trials per task (measuring pass@3 and pass^3), while a
+local chat model scores a 0-10 rubric to break rule-score ties. It decides
+`keep-better` when one member's rule score exceeds every other's by at least 0.2
+(decided by rule) or when the rule gap is under 0.2 and the judge score exceeds
+others by at least 2.0 (decided by judge), `keep-both` with distinct use when
+members win different tasks where the other fails, or `propose-merge` on ties.
+Verdicts in `verdicts.tsv` record `decided_by` along with kept and dropped
+skills. Existing skills under `skills/` are never dropped; when an existing skill
+loses, the verdict records `replace-proposed` for human review. Completed trials
+are saved in `trials.jsonl` so interrupted runs resume without re-running, and
+`python3 tools/judge_groups.py summary --verdicts verdicts.tsv` reports counts
+per verdict, kept and dropped skills, and models used.
+
 ## Credits
 
 Every skill credits its upstream author and repository in its own `ORIGIN.md`.
