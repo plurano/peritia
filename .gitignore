@@ -9,4 +9,6 @@ bin/
 /.standards/worktrees/
 /.agents/mcp_config.json
 /.standards/cache/
+/.claude/settings.local.json
+/.standards-receipt.json
 # END praetor private artifacts
