@@ -5,7 +5,7 @@
 
 Stage 2 of the skill census. ``classify.py run`` reads the census TSV (tools/census.py), keeps
 one row per unique blob, reads that SKILL.md from a checkout of its source at the census pin,
-and asks a model served by Ollama for two multi-label sets: what the skill does (FUNCTIONS) and
+and asks an OpenAI-compatible model for two multi-label sets: what the skill does (FUNCTIONS) and
 which domain it serves (DOMAINS). The answer is constrained by a JSON schema and checked against
 the same label lists; a row whose answer fails twice is written with status error, never
 guessed. Every row names the model that produced it. ``classify.py summary`` counts the labels
@@ -18,13 +18,19 @@ import argparse
 import csv
 import hashlib
 import json
+import os
 import sys
 import urllib.error
-import urllib.request
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
+
+_TOOLS_DIR = Path(__file__).resolve().parent
+if str(_TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(_TOOLS_DIR))
+
+from llm_client import LLMClient  # noqa: E402
 
 FUNCTIONS = {
     "coding": "writes or changes program code",
@@ -142,24 +148,20 @@ def checked_labels(answer: Any) -> tuple[list[str], list[str]] | None:
     return result[0], result[1]
 
 
-class OllamaClient:
-    """The only network boundary: one /api/chat call per question."""
+class SkillClassifier:
+    """Thin wrapper around LLMClient for skill classification."""
 
-    def __init__(self, base_url: str, model: str, timeout: float) -> None:
-        self.base_url, self.model, self.timeout = base_url.rstrip("/"), model, timeout
+    def __init__(self, client: LLMClient, model: str) -> None:
+        self.client, self.model = client, model
 
     def ask(self, text: str) -> Any:
-        body = {
-            "model": self.model, "stream": False, "think": False,
-            "messages": [{"role": "system", "content": SYSTEM_PROMPT},
-                         {"role": "user", "content": "<skill>\n" + text + "\n</skill>"}],
-            "format": label_schema(), "options": {"temperature": 0, "seed": 1},
-        }
-        request = urllib.request.Request(self.base_url + "/api/chat", data=json.dumps(body).encode("utf-8"),
-                                         headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(request, timeout=self.timeout) as response:  # noqa: S310 - local URL from the operator
-            reply = json.loads(response.read())
-        return json.loads(reply["message"]["content"])
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": f"<skill>\n{text}\n</skill>"},
+        ]
+        return self.client.chat_json(
+            self.model, messages, schema=label_schema(), schema_name="skill_labels"
+        )
 
 
 def classify_one(ask: Callable[[str], Any], text: str) -> tuple[list[str], list[str]] | None:
@@ -239,13 +241,21 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     go.add_argument("--checkouts", type=Path, required=True,
                     help="folder of <owner>__<name> checkouts at the census pins")
     go.add_argument("--out", type=Path, required=True)
-    go.add_argument("--model", required=True)
-    go.add_argument("--base-url", default="http://127.0.0.1:11434")
+    go.add_argument("--model", default=os.environ.get("PERITIA_LLM_MODEL"),
+                    help="model name for classification (PERITIA_LLM_MODEL)")
+    go.add_argument("--base-url", default=os.environ.get("PERITIA_LLM_BASE_URL"),
+                    help="OpenAI-compatible base URL (PERITIA_LLM_BASE_URL)")
     go.add_argument("--timeout", type=float, default=300.0)
     go.add_argument("--limit", type=int)
     report = commands.add_parser("summary", help="count labels and name the domains no skill serves")
     report.add_argument("--out", type=Path, required=True)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.command == "run":
+        if not args.base_url:
+            parser.error("missing --base-url (or set PERITIA_LLM_BASE_URL)")
+        if not args.model:
+            parser.error("missing --model (or set PERITIA_LLM_MODEL)")
+    return args
 
 
 def main(argv: list[str]) -> int:
@@ -253,8 +263,9 @@ def main(argv: list[str]) -> int:
     if args.command == "summary":
         print(summary(args.out))
         return 0
-    client = OllamaClient(args.base_url, args.model, args.timeout)
-    counts = run(unique_items(args.census), args.checkouts, args.out, client.ask, args.model, args.limit)
+    client = LLMClient(args.base_url, args.timeout, api_key=os.environ.get("PERITIA_LLM_API_KEY"))
+    classifier = SkillClassifier(client, args.model)
+    counts = run(unique_items(args.census), args.checkouts, args.out, classifier.ask, args.model, args.limit)
     print(f"model={args.model} prompt_sha256={prompt_digest()} ok={counts['ok']} error={counts['error']}")
     return 1 if counts["error"] else 0
 

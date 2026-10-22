@@ -42,6 +42,7 @@ test: tools build
 	@$(BIN)/python -B tools/test_overlap.py
 	@$(BIN)/python -B tools/test_judge_groups.py
 	@$(BIN)/python -B tools/test_adopt_skills.py
+	@$(BIN)/python -B tools/test_llm_client.py
 	@reuse lint
 
 build: tools

@@ -283,11 +283,13 @@ class EndToEndAndResumeTests(unittest.TestCase):
             paths, members, cache = setup_copy_env(Path(folder))
             groups, tasks, candidates, verdicts, trials, checkouts, skills = paths
             chat, judge = Mock(return_value="hello"), Mock(return_value=9.0)
-            with patch.object(judge_groups.OllamaClient, "chat", chat), patch.object(judge_groups.OllamaClient, "judge", judge):
+            with patch.object(judge_groups.JudgeHarness, "chat", chat), patch.object(judge_groups.JudgeHarness, "judge", judge):
                 status = judge_groups.main(["run", "--groups", str(groups), "--eval-tasks", str(tasks),
                                            "--candidates", str(candidates), "--classified", str(Path(folder) / "absent"),
                                            "--checkouts", str(checkouts), "--skills-dir", str(skills),
-                                           "--out", str(verdicts), "--trials-out", str(trials), "--cache", str(cache)])
+                                           "--out", str(verdicts), "--trials-out", str(trials), "--cache", str(cache),
+                                           "--base-url", "http://127.0.0.1:9999/v1", "--model", "test-model",
+                                           "--judge-model", "test-judge"])
             self.assertEqual(status, 0)
             self.assertEqual(chat.call_count, 9)
             self.assertEqual(judge.call_count, 9)
