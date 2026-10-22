@@ -16,10 +16,10 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import re
 import sys
 import urllib.error
-import urllib.request
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from decimal import Decimal
@@ -34,16 +34,17 @@ from classify import FUNCTIONS  # noqa: E402
 from census import load_sources  # noqa: E402
 from candidates import AGGREGATOR_UPSTREAM_KEYS, parse_github_repo  # noqa: E402
 from check_skills import front_matter_or_empty  # noqa: E402
+from llm_client import LLMClient  # noqa: E402
 from overlap import (  # noqa: E402
     Item, cosine_similarity, load_cache, load_candidates, load_existing_skills,
     normalize_name,
 )
 
-DEFAULT_MODEL = "qwen2.5:7b"
-DEFAULT_JUDGE_MODEL = "qwen2.5:7b"
+DEFAULT_MODEL = os.environ.get("PERITIA_LLM_MODEL")
+DEFAULT_JUDGE_MODEL = os.environ.get("PERITIA_LLM_JUDGE_MODEL")
 DEFAULT_K = 3
 DEFAULT_TEMPERATURE = 0.7
-DEFAULT_BASE_URL = "http://127.0.0.1:11434"
+DEFAULT_BASE_URL = os.environ.get("PERITIA_LLM_BASE_URL")
 DEFAULT_TIMEOUT = 300.0
 MAX_SKILL_CHARS = 6000
 ATTEMPTS = 2
@@ -319,63 +320,36 @@ def append_trial(trials_path: Path, record: dict[str, Any]) -> None:
         f.flush()
 
 
-class OllamaClient:
-    """The only network boundary: /api/chat calls for task answers and rubric judging."""
+class JudgeHarness:
+    """Thin wrapper around LLMClient for task answers and rubric judging."""
 
     def __init__(
         self,
-        base_url: str,
+        client: LLMClient,
         model: str,
         judge_model: str,
-        timeout: float = DEFAULT_TIMEOUT,
     ) -> None:
-        self.base_url = base_url.rstrip("/")
+        self.client = client
         self.model = model
         self.judge_model = judge_model
-        self.timeout = timeout
 
     def chat(self, system_prompt: str, user_prompt: str, temperature: float = DEFAULT_TEMPERATURE, seed: int = 1) -> str:
-        body = {
-            "model": self.model,
-            "stream": False,
-            "think": False,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            "options": {"temperature": temperature, "seed": seed},
-        }
-        request = urllib.request.Request(
-            self.base_url + "/api/chat",
-            data=json.dumps(body).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(request, timeout=self.timeout) as resp:  # noqa: S310
-            reply = json.loads(resp.read().decode("utf-8"))
-        return reply["message"]["content"]
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        return self.client.chat(self.model, messages, temperature=temperature, seed=seed)
 
     def judge(self, prompt: str) -> float:
+        messages = [
+            {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ]
         for _ in range(ATTEMPTS):
             try:
-                body = {
-                    "model": self.judge_model,
-                    "stream": False,
-                    "think": False,
-                    "messages": [
-                        {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
-                        {"role": "user", "content": prompt},
-                    ],
-                    "format": judge_schema(),
-                    "options": {"temperature": 0, "seed": 1},
-                }
-                request = urllib.request.Request(
-                    self.base_url + "/api/chat",
-                    data=json.dumps(body).encode("utf-8"),
-                    headers={"Content-Type": "application/json"},
+                content = self.client.chat_json(
+                    self.judge_model, messages, schema=judge_schema(), schema_name="judge_rubric"
                 )
-                with urllib.request.urlopen(request, timeout=self.timeout) as resp:  # noqa: S310
-                    reply = json.loads(resp.read().decode("utf-8"))
-                content = json.loads(reply["message"]["content"])
                 if isinstance(content, dict) and "score" in content:
                     score = float(content["score"])
                     return max(0.0, min(10.0, score))
@@ -522,6 +496,35 @@ def _run_single_group(
     }
 
 
+def _init_callables(
+    base_url: str | None,
+    model: str,
+    judge_model: str,
+    timeout: float,
+    chat_fn: Callable[[str, str, float, int], str] | None,
+    judge_fn: Callable[[str], float] | None,
+) -> tuple[Callable[[str, str, float, int], str], Callable[[str], float]]:
+    """Initialises chat and judge functions using LLMClient if either is absent."""
+    if chat_fn is not None and judge_fn is not None:
+        return chat_fn, judge_fn
+    base_url_str = base_url or os.environ.get("PERITIA_LLM_BASE_URL") or ""
+    if not base_url_str:
+        raise ValueError("missing base_url (or set PERITIA_LLM_BASE_URL)")
+    client = LLMClient(base_url_str, timeout, api_key=os.environ.get("PERITIA_LLM_API_KEY"))
+    harness = JudgeHarness(client, model, judge_model)
+    return chat_fn or harness.chat, judge_fn or harness.judge
+
+
+def _write_verdicts(verdicts_out: Path, verdicts_rows: list[dict[str, Any]]) -> None:
+    """Writes verdict rows to the verdicts TSV file."""
+    verdicts_out.parent.mkdir(parents=True, exist_ok=True)
+    with verdicts_out.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=VERDICTS_FIELDS, delimiter="\t", lineterminator="\n")
+        writer.writeheader()
+        for r in verdicts_rows:
+            writer.writerow(r)
+
+
 def run(
     groups_tsv: Path,
     eval_tasks_json: Path,
@@ -533,9 +536,9 @@ def run(
     classified_tsv: Path | None = None,
     chat_fn: Callable[[str, str, float, int], str] | None = None,
     judge_fn: Callable[[str], float] | None = None,
-    model: str = DEFAULT_MODEL,
-    judge_model: str = DEFAULT_JUDGE_MODEL,
-    base_url: str = DEFAULT_BASE_URL,
+    model: str | None = DEFAULT_MODEL,
+    judge_model: str | None = DEFAULT_JUDGE_MODEL,
+    base_url: str | None = DEFAULT_BASE_URL,
     timeout: float = DEFAULT_TIMEOUT,
     k: int = DEFAULT_K,
     temperature: float = DEFAULT_TEMPERATURE,
@@ -560,26 +563,19 @@ def run(
     candidates = load_candidates(candidates_tsv, checkouts) if candidates_tsv is not None else []
     items = {item.item_id: item for item in candidates + load_existing_skills(skills_dir)}
 
-    if chat_fn is None or judge_fn is None:
-        client = OllamaClient(base_url, model, judge_model, timeout)
-        chat_fn = chat_fn or client.chat
-        judge_fn = judge_fn or client.judge
+    model_str = model or os.environ.get("PERITIA_LLM_MODEL") or ""
+    judge_model_str = judge_model or os.environ.get("PERITIA_LLM_JUDGE_MODEL") or ""
+    chat_fn, judge_fn = _init_callables(base_url, model_str, judge_model_str, timeout, chat_fn, judge_fn)
 
     verdicts_rows = [
         _run_single_group(
             g, eval_tasks, member_funcs, done_trials, checkouts, skills_dir,
-            trials_out, chat_fn, judge_fn, model, judge_model, k, temperature, items, embeddings, ranks,
+            trials_out, chat_fn, judge_fn, model_str, judge_model_str, k, temperature, items, embeddings, ranks,
         )
         for g in groups
     ]
 
-    verdicts_out.parent.mkdir(parents=True, exist_ok=True)
-    with verdicts_out.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=VERDICTS_FIELDS, delimiter="\t", lineterminator="\n")
-        writer.writeheader()
-        for r in verdicts_rows:
-            writer.writerow(r)
-
+    _write_verdicts(verdicts_out, verdicts_rows)
     return verdicts_rows
 
 
@@ -635,9 +631,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     run_cmd.add_argument("--eval-tasks", type=Path, default=Path("tools/eval-tasks.json"), help="eval tasks JSON")
     run_cmd.add_argument("--out", type=Path, default=Path("verdicts.tsv"), help="output verdicts TSV")
     run_cmd.add_argument("--trials-out", type=Path, default=Path("trials.jsonl"), help="output trials JSONL")
-    run_cmd.add_argument("--model", default=DEFAULT_MODEL, help="model name for answering tasks")
-    run_cmd.add_argument("--judge-model", default=DEFAULT_JUDGE_MODEL, help="model name for rubric judging")
-    run_cmd.add_argument("--base-url", default=DEFAULT_BASE_URL, help="Ollama base URL")
+    run_cmd.add_argument("--model", default=DEFAULT_MODEL, help="model name for answering tasks (PERITIA_LLM_MODEL)")
+    run_cmd.add_argument("--judge-model", default=DEFAULT_JUDGE_MODEL, help="model name for rubric judging (PERITIA_LLM_JUDGE_MODEL)")
+    run_cmd.add_argument("--base-url", default=DEFAULT_BASE_URL, help="OpenAI-compatible base URL (PERITIA_LLM_BASE_URL)")
     run_cmd.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="request timeout in seconds")
     run_cmd.add_argument("-k", "--k", type=int, default=DEFAULT_K, help="trials per task")
     run_cmd.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE, help="temperature for generation")
@@ -646,7 +642,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     sum_cmd = commands.add_parser("summary", help="summarise verdicts TSV")
     sum_cmd.add_argument("--verdicts", type=Path, default=Path("verdicts.tsv"), help="verdicts TSV file")
 
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.command == "run":
+        if not args.base_url:
+            parser.error("missing --base-url (or set PERITIA_LLM_BASE_URL)")
+        if not args.model:
+            parser.error("missing --model (or set PERITIA_LLM_MODEL)")
+        if not args.judge_model:
+            parser.error("missing --judge-model (or set PERITIA_LLM_JUDGE_MODEL)")
+    return args
 
 
 def main(argv: list[str]) -> int:

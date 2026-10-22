@@ -16,9 +16,9 @@ import csv
 import hashlib
 import json
 import math
+import os
 import sys
 import urllib.error
-import urllib.request
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,6 +29,7 @@ if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
 from check_skills import front_matter_or_empty  # noqa: E402
+from llm_client import LLMClient  # noqa: E402
 
 MAX_CANDIDATES = 200_000
 MAX_EXISTING_SKILLS = 5_000
@@ -39,8 +40,9 @@ MAX_DESC_CHARS = 600
 MAX_SKILL_CHARS = 8192
 ATTEMPTS = 2
 DEFAULT_K = 5
-DEFAULT_EMBED_MODEL = "hf.co/unsloth/embeddinggemma-2-GGUF:Q8_0"
-DEFAULT_JUDGE_MODEL = "qwen2.5:7b"
+DEFAULT_EMBED_MODEL = os.environ.get("PERITIA_LLM_EMBED_MODEL")
+DEFAULT_JUDGE_MODEL = os.environ.get("PERITIA_LLM_JUDGE_MODEL")
+DEFAULT_BASE_URL = os.environ.get("PERITIA_LLM_BASE_URL")
 
 OVERLAP_FIELDS = ["a", "b", "cosine", "rank", "name_match", "same_use", "reason", "model"]
 GROUPS_FIELDS = ["group_id", "members", "edges", "has_existing"]
@@ -537,46 +539,25 @@ def summary(
     return "\n".join(lines)
 
 
-class OllamaClient:
-    """The only network boundary: /api/embed and /api/chat calls."""
+class OverlapJudge:
+    """Thin wrapper around LLMClient for embeddings and overlap judging."""
 
-    def __init__(self, base_url: str, embed_model: str, judge_model: str, timeout: float = 300.0) -> None:
-        self.base_url = base_url.rstrip("/")
+    def __init__(self, client: LLMClient, embed_model: str, judge_model: str) -> None:
+        self.client = client
         self.embed_model = embed_model
         self.judge_model = judge_model
-        self.timeout = timeout
 
     def embed(self, texts: list[str]) -> list[list[float]]:
-        body = {"model": self.embed_model, "input": texts}
-        request = urllib.request.Request(
-            self.base_url + "/api/embed",
-            data=json.dumps(body).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(request, timeout=self.timeout) as response:  # noqa: S310 - local URL from the operator
-            reply = json.loads(response.read())
-        return reply["embeddings"]
+        return self.client.embed(self.embed_model, texts)
 
     def judge(self, prompt: str) -> Any:
-        body = {
-            "model": self.judge_model,
-            "stream": False,
-            "think": False,
-            "messages": [
-                {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            "format": judge_schema(),
-            "options": {"temperature": 0, "seed": 1},
-        }
-        request = urllib.request.Request(
-            self.base_url + "/api/chat",
-            data=json.dumps(body).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+        messages = [
+            {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ]
+        return self.client.chat_json(
+            self.judge_model, messages, schema=judge_schema(), schema_name="skill_overlap"
         )
-        with urllib.request.urlopen(request, timeout=self.timeout) as response:  # noqa: S310 - local URL from the operator
-            reply = json.loads(response.read())
-        return json.loads(reply["message"]["content"])
 
 
 def _judge_pairs(
@@ -666,10 +647,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     run_cmd.add_argument("--out", type=Path, default=Path("overlap.tsv"), help="output overlap TSV")
     run_cmd.add_argument("--groups", type=Path, default=Path("groups.tsv"), help="output groups TSV")
     run_cmd.add_argument("--cache", type=Path, default=None, help="JSON cache file for embeddings")
-    run_cmd.add_argument("--embed-model", default=DEFAULT_EMBED_MODEL, help="Ollama embedding model name")
-    run_cmd.add_argument("--judge-model", default=DEFAULT_JUDGE_MODEL, help="Ollama chat model name for judging")
-    run_cmd.add_argument("--base-url", default="http://127.0.0.1:11434", help="Ollama base URL")
-    run_cmd.add_argument("--timeout", type=float, default=300.0, help="Ollama request timeout in seconds")
+    run_cmd.add_argument("--embed-model", default=DEFAULT_EMBED_MODEL,
+                         help="embedding model name (PERITIA_LLM_EMBED_MODEL)")
+    run_cmd.add_argument("--judge-model", default=DEFAULT_JUDGE_MODEL,
+                         help="chat model name for judging (PERITIA_LLM_JUDGE_MODEL)")
+    run_cmd.add_argument("--base-url", default=DEFAULT_BASE_URL,
+                         help="OpenAI-compatible base URL (PERITIA_LLM_BASE_URL)")
+    run_cmd.add_argument("--timeout", type=float, default=300.0, help="request timeout in seconds")
     run_cmd.add_argument("-k", "--k", type=int, default=DEFAULT_K, help="number of nearest neighbours")
     run_cmd.add_argument("--limit", type=int, default=None, help="limit number of candidates processed")
 
@@ -679,7 +663,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     sum_cmd.add_argument("--candidates", type=Path, default=Path("candidates.tsv"), help="candidates TSV file")
     sum_cmd.add_argument("--skills-dir", type=Path, default=Path("skills"), help="existing skills folder")
 
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.command == "run":
+        if not args.base_url:
+            parser.error("missing --base-url (or set PERITIA_LLM_BASE_URL)")
+        if not args.embed_model:
+            parser.error("missing --embed-model (or set PERITIA_LLM_EMBED_MODEL)")
+        if not args.judge_model:
+            parser.error("missing --judge-model (or set PERITIA_LLM_JUDGE_MODEL)")
+    return args
 
 
 def main(argv: list[str]) -> int:
@@ -687,15 +679,16 @@ def main(argv: list[str]) -> int:
     if args.command == "summary":
         print(summary(args.overlap, args.groups, args.candidates, skills_dir=args.skills_dir))
         return 0
-    client = OllamaClient(args.base_url, args.embed_model, args.judge_model, args.timeout)
+    client = LLMClient(args.base_url, args.timeout, api_key=os.environ.get("PERITIA_LLM_API_KEY"))
+    judge = OverlapJudge(client, args.embed_model, args.judge_model)
     run(
         candidates_tsv=args.candidates,
         checkouts=args.checkouts,
         skills_dir=args.skills_dir,
         overlap_out=args.out,
         groups_out=args.groups,
-        embed_fn=client.embed,
-        judge_fn=client.judge,
+        embed_fn=judge.embed,
+        judge_fn=judge.judge,
         judge_model=args.judge_model,
         cache_path=args.cache,
         k=args.k,

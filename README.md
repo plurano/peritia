@@ -79,9 +79,22 @@ inventory of public `SKILL.md` files from the repositories in
 metadata (never skill contents), and fails closed after writing any rows it
 could read. This is census data only; it does not classify or adopt skills.
 
+Model stages query any server that speaks the OpenAI-compatible chat
+completions and embeddings API, configured via command-line flags or
+environment variables:
+
+| Variable | Description |
+| --- | --- |
+| `PERITIA_LLM_BASE_URL` | base URL ending in `/v1` |
+| `PERITIA_LLM_API_KEY` | bearer token for authorization (optional) |
+| `PERITIA_LLM_MODEL` | model name for classification and task execution |
+| `PERITIA_LLM_JUDGE_MODEL` | model name for overlap and rubric judging |
+| `PERITIA_LLM_EMBED_MODEL` | model name for embeddings |
+
 `python3 tools/classify.py run --census census.tsv --checkouts <folder> --out
 classified.tsv --model <name>` labels each unique skill of a census on two axes,
-what it does and which domain it serves, with a model served by a local Ollama.
+what it does and which domain it serves, with a model served by any server that
+speaks the OpenAI-compatible chat completions and embeddings API.
 `<folder>` holds one checkout per source, named `<owner>__<name>`, at the census
 pin. The answer is constrained to the label lists by a JSON schema and checked
 again; a skill whose answer fails twice is written with status `error`, never
@@ -113,10 +126,8 @@ copies, per licence class, and per domain among candidates.
 --out overlap.tsv --groups groups.tsv --judge-model <name>` finds, for every
 adoption candidate, skills it may overlap among other candidates and skills
 already in `skills/`. It ranks the k nearest neighbours by cosine similarity
-using embeddings from a local model (defaulting to
-`hf.co/unsloth/embeddinggemma-2-GGUF:Q8_0`) plus any item with the same
-normalised name, and lets a local chat model judge per pair whether they serve
-the same use. Embeddings are cached per blob id, and an interrupted run resumes
+using embeddings from an embedding model plus any item with the same normalised
+name, and lets a chat model judge per pair whether they serve the same use. Embeddings are cached per blob id, and an interrupted run resumes
 without asking previously judged pairs again; failed judgements are recorded as
 unjudged, never guessed. Connected components over matching pairs are grouped in
 `groups.tsv`, identifying overlap-free candidates and groups containing an
