@@ -2,7 +2,10 @@
 -include .config/praetor/engine.mk
 # Praetor ships one binary under two names; resolve whichever is installed.
 PRAETORCTL ?= $(shell command -v praetorctl 2>/dev/null || command -v standardsctl 2>/dev/null || echo praetorctl)
-.PHONY: all verify-all compile-context compile-context-verify caveman-sources audit build test
+VENV ?= .venv
+BIN = $(VENV)/bin
+PYTHON ?= python3
+.PHONY: all verify-all compile-context compile-context-verify caveman-sources audit build test tools
 
 all: build
 
@@ -20,21 +23,29 @@ caveman-sources:
 audit:
 	@$(PRAETORCTL) audit
 
+tools:
+	@hash=$$(sha256sum requirements/tools.txt | cut -d ' ' -f 1); \
+	if [ "$$(cat $(VENV)/.stamp 2>/dev/null)" != "$$hash" ]; then \
+		if [ ! -x $(BIN)/python ]; then $(PYTHON) -m venv $(VENV); fi && \
+		$(BIN)/python -m pip install --quiet --disable-pip-version-check --require-hashes -r requirements/tools.txt && \
+		printf '%s\n' "$$hash" > $(VENV)/.stamp; \
+	fi
+
 # The library's own checks: every skill directory is complete (tools/check_skills.py) and every file
 # carries a licence (REUSE). The selftest plants one defect per rule and must see each refused.
-test: build
-	@python3 -B tools/check_skills.py selftest
+test: tools build
+	@$(BIN)/python -B tools/check_skills.py selftest
 	@python3 -B tools/install_user_skills.py selftest
-	@python3 -B tools/test_census.py
-	@python3 -B tools/test_classify.py
-	@python3 -B tools/test_candidates.py
-	@python3 -B tools/test_overlap.py
-	@python3 -B tools/test_judge_groups.py
-	@python3 -B tools/test_adopt_skills.py
+	@$(BIN)/python -B tools/test_census.py
+	@$(BIN)/python -B tools/test_classify.py
+	@$(BIN)/python -B tools/test_candidates.py
+	@$(BIN)/python -B tools/test_overlap.py
+	@$(BIN)/python -B tools/test_judge_groups.py
+	@$(BIN)/python -B tools/test_adopt_skills.py
 	@reuse lint
 
-build:
-	@python3 -B tools/check_skills.py
+build: tools
+	@$(BIN)/python -B tools/check_skills.py
 
 # BEGIN praetor documentation gate
 .PHONY: docs-lint docs-figures

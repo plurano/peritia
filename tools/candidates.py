@@ -24,7 +24,7 @@ _TOOLS_DIR = Path(__file__).resolve().parent
 if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
-from check_skills import FIELD, FRONT  # noqa: E402
+from check_skills import front_matter_or_empty  # noqa: E402
 from classify import DOMAINS, FUNCTIONS  # noqa: E402
 
 CORE_FUNCTIONS = frozenset({
@@ -174,18 +174,6 @@ def identify_licence_text(text: str) -> str:
         if cleaned in SPDX_LOOKUP:
             return SPDX_LOOKUP[cleaned]
     return "unknown"
-
-
-def parse_frontmatter(text: str) -> dict[str, str]:
-    match = FRONT.match(text)
-    if not match:
-        return {}
-    meta: dict[str, str] = {}
-    for i, m in enumerate(FIELD.finditer(match.group(1))):
-        if i >= 100:
-            break
-        meta[m.group("key")] = m.group("value").strip().strip("'\"")
-    return meta
 
 
 def normalise_licence(raw: str) -> tuple[str, str, bool]:
@@ -374,7 +362,7 @@ def _resolve_aggregator_licence(
     tracer: UpstreamTracer,
 ) -> LicenceResolution:
     text = skill_path.read_text(encoding="utf-8", errors="replace")
-    meta = parse_frontmatter(text)
+    meta = front_matter_or_empty(text)
 
     # 3a. source_type self -> census repository licence, evidence repository:self
     if meta.get("source_type", "").strip().lower() == "self":
@@ -431,7 +419,7 @@ def _resolve_non_aggregator_licence(
         return LicenceResolution(folder_spdx, "folder")
 
     text = skill_path.read_text(encoding="utf-8", errors="replace")
-    meta = parse_frontmatter(text)
+    meta = front_matter_or_empty(text)
     fm_raw = meta.get("license") or meta.get("licence")
     if fm_raw is not None and fm_raw.strip() != "":
         fm_lic, _, fm_known = normalise_licence(fm_raw)

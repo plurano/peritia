@@ -33,9 +33,10 @@ if str(_TOOLS_DIR) not in sys.path:
 from classify import FUNCTIONS  # noqa: E402
 from census import load_sources  # noqa: E402
 from candidates import AGGREGATOR_UPSTREAM_KEYS, parse_github_repo  # noqa: E402
+from check_skills import front_matter_or_empty  # noqa: E402
 from overlap import (  # noqa: E402
     Item, cosine_similarity, load_cache, load_candidates, load_existing_skills,
-    normalize_name, parse_frontmatter,
+    normalize_name,
 )
 
 DEFAULT_MODEL = "qwen2.5:7b"
@@ -475,7 +476,7 @@ def _run_single_group(
     """Evaluates a single group across tasks, recording new trials and returning a verdict row."""
     group_id, members = g["group_id"], g["members"]
     texts = {m: get_skill_text(m, checkouts, skills_dir) for m in members}
-    metadata = {m: parse_frontmatter(text) for m, text in texts.items()}
+    metadata = {m: front_matter_or_empty(text) for m, text in texts.items()}
     members, copies = collapse_copies(members, items, metadata, embeddings, ranks)
     primary = primary_class(members, member_funcs)
     group_tasks = eval_tasks.get(primary, [])

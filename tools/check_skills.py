@@ -12,6 +12,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import yaml
+
 try:
     from install_user_skills import read_install_set
 except ImportError:
@@ -30,6 +32,36 @@ def fields(text):
     return {m.group("key"): m.group("value").strip() for m in FIELD.finditer(text)}
 
 
+def front_matter(text: str) -> dict[str, str]:
+    """Parse YAML front matter bounded at 100 fields, returning string mapping."""
+    match = FRONT.match(text.replace("\r\n", "\n"))
+    if not match:
+        return {}
+    try:
+        data = yaml.safe_load(match.group(1))
+    except yaml.YAMLError as exc:
+        raise ValueError(str(exc)) from exc
+    if not isinstance(data, dict):
+        raise ValueError("expected a mapping")
+    meta: dict[str, str] = {}
+    for i, (k, v) in enumerate(data.items()):
+        if i >= 100:
+            break
+        if isinstance(v, str):
+            meta[str(k)] = v.strip()
+        elif not isinstance(v, (list, dict, type(None))):
+            meta[str(k)] = str(v)
+    return meta
+
+
+def front_matter_or_empty(text: str) -> dict[str, str]:
+    """front_matter for readers that skip an unparsable skill: invalid YAML reads as no fields."""
+    try:
+        return front_matter(text)
+    except ValueError:
+        return {}
+
+
 def skill_problems(skill):
     """Problems of one skill directory, each naming the file and the rule."""
     out = []
@@ -37,11 +69,14 @@ def skill_problems(skill):
     if not md.is_file():
         return [f"{skill.name}: SKILL.md missing"]
     text = md.read_text(encoding="utf-8")
-    front = FRONT.match(text)
-    meta = fields(front.group(1)) if front else {}
+    try:
+        meta = front_matter(text)
+    except ValueError as exc:
+        out.append(f"{skill.name}/SKILL.md: front matter is not valid YAML: {exc}")
+        meta = {}
     if meta.get("name") != skill.name:
         out.append(f"{skill.name}/SKILL.md: front matter name must be {skill.name!r}")
-    if not meta.get("description"):
+    if not meta.get("description", "").strip():
         out.append(f"{skill.name}/SKILL.md: front matter needs a description")
     for n, line in enumerate(text.splitlines(), 1):
         if FETCH.search(line):
@@ -184,20 +219,33 @@ def selftest():
         (root / "install-set.txt").write_text("good\nunknown-skill\n", encoding="utf-8")
         assert check(root) == 1, "an unknown skill in install-set.txt is refused"
         (root / "install-set.txt").unlink()
-        cases = {
-            "wrong-name": (good_md.format(n="other"), good_origin, True, "front matter name"),
-            "no-origin": (good_md.format(n="no-origin"), None, True, "ORIGIN.md missing"),
-            "short-pin": (good_md.format(n="short-pin"), good_origin.replace("a" * 40, "abc1234"), True, "full 40-hex"),
-            "no-licence": (good_md.format(n="no-licence"), good_origin, False, "upstream LICENSE"),
-            "installs": (good_md.format(n="installs") + "\n    uv pip install numpy==2.5.3\n", good_origin, True, "installs or fetches"),
-        }
-        for name, (md, origin, licence, want) in cases.items():
-            planted = Path(tmp) / name
-            write(planted, name, md, origin, licence)
-            problems = skill_problems(planted / "skills" / name)
-            assert any(want in p for p in problems), (name, problems)
-    print(f"selftest ok: 2 clean skills pass, {len(cases)} planted defects refused, install-set validated")
+        _selftest_cases(Path(tmp), good_md, good_origin)
     return 0
+
+
+def _selftest_cases(tmp, good_md, good_origin):
+    folded_md = "---\nname: folded\ndescription: >\n  Use when checking\n  a claim.\n---\n\n# folded\n"
+    planted_folded = tmp / "folded"
+    write(planted_folded, "folded", folded_md, good_origin)
+    parsed = front_matter(folded_md)
+    assert parsed["description"] == "Use when checking a claim.", parsed
+    assert skill_problems(planted_folded / "skills" / "folded") == []
+
+    cases = {
+        "wrong-name": (good_md.format(n="other"), good_origin, True, "front matter name"),
+        "no-origin": (good_md.format(n="no-origin"), None, True, "ORIGIN.md missing"),
+        "short-pin": (good_md.format(n="short-pin"), good_origin.replace("a" * 40, "abc1234"), True, "full 40-hex"),
+        "no-licence": (good_md.format(n="no-licence"), good_origin, False, "upstream LICENSE"),
+        "installs": (good_md.format(n="installs") + "\n    uv pip install numpy==2.5.3\n", good_origin, True, "installs or fetches"),
+        "empty-desc": ("---\nname: empty-desc\ndescription: >\n---\n\n# x\n", good_origin, True, "needs a description"),
+        "bad-yaml": ("---\nname: [\n---\n\n# x\n", good_origin, True, "not valid YAML"),
+    }
+    for name, (md, origin, licence, want) in cases.items():
+        planted = tmp / name
+        write(planted, name, md, origin, licence)
+        problems = skill_problems(planted / "skills" / name)
+        assert any(want in p for p in problems), (name, problems)
+    print(f"selftest ok: 2 clean skills pass, {len(cases)} planted defects refused, install-set validated")
 
 
 if __name__ == "__main__":

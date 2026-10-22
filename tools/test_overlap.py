@@ -512,6 +512,26 @@ class OverlapEmbeddingAndCacheTests(unittest.TestCase):
             # Description bounded to 600 characters
             self.assertEqual(len(candidates[0].description), overlap.MAX_DESC_CHARS)
 
+    def test_block_scalar_reaches_item_description(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            skills_dir = Path(tmpdir) / "skills"
+            skill_folder = skills_dir / "my-skill"
+            skill_folder.mkdir(parents=True)
+            skill_md = (
+                "---\n"
+                "name: my-skill\n"
+                "description: >\n"
+                "  First line of description\n"
+                "  second line of description.\n"
+                "---\n\n"
+                "# my-skill\n"
+            )
+            (skill_folder / "SKILL.md").write_text(skill_md, encoding="utf-8")
+            items = overlap.load_existing_skills(skills_dir)
+            self.assertEqual(len(items), 1)
+            self.assertEqual(items[0].skill_name, "my-skill")
+            self.assertEqual(items[0].description, "First line of description second line of description.")
+
 
 class OverlapSummaryTests(unittest.TestCase):
     def test_summary_reports_all_five_metrics(self):
