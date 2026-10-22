@@ -33,10 +33,11 @@
         "tools/figures/mkdocs_hook.py",
         "tools/figures/astro.mjs",
         "tools/figures/serve.mjs",
+        "tools/figures/eslint.figures.mjs",
         "tools/figures/README.md",
         ".devcontainer/devcontainer.json",
         ".devcontainer/Dockerfile.praetor",
-        ".github/workflows/reuse.yml"
+        ".config/reuse/requirements.txt"
       ],
       "enabled": false
     }

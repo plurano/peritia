@@ -48,7 +48,7 @@
             "context": "Documentation Governance"
           },
           {
-            "context": "REUSE lint"
+            "context": "Licence / REUSE lint"
           }
         ],
         "strict_required_status_checks_policy": true
