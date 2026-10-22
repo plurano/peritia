@@ -28,7 +28,7 @@ _TOOLS_DIR = Path(__file__).resolve().parent
 if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
-from check_skills import FIELD, FRONT  # noqa: E402
+from check_skills import front_matter_or_empty  # noqa: E402
 
 MAX_CANDIDATES = 200_000
 MAX_EXISTING_SKILLS = 5_000
@@ -63,19 +63,6 @@ def git_blob_id(data: bytes) -> str:
 def normalize_name(name: str) -> str:
     """Normalises skill name: lower case, - and _ equal."""
     return name.lower().replace("_", "-")
-
-
-def parse_frontmatter(text: str) -> dict[str, str]:
-    """Parse front-matter fields using check_skills FRONT and FIELD patterns."""
-    match = FRONT.match(text)
-    if not match:
-        return {}
-    meta: dict[str, str] = {}
-    for i, m in enumerate(FIELD.finditer(match.group(1))):
-        if i >= 100:
-            break
-        meta[m.group("key")] = m.group("value").strip().strip("'\"")
-    return meta
 
 
 @dataclass(frozen=True)
@@ -129,7 +116,7 @@ def load_candidates(candidates_tsv: Path, checkouts: Path) -> list[Item]:
             except OSError:
                 continue
 
-            meta = parse_frontmatter(content)
+            meta = front_matter_or_empty(content)
             name = meta.get("name") or skill_name
             desc = meta.get("description", "")[:MAX_DESC_CHARS]
             item_id = f"{source}:{path_str}"
@@ -153,7 +140,7 @@ def load_existing_skills(skills_dir: Path) -> list[Item]:
             continue
         blob_id = git_blob_id(raw_bytes)
         content = raw_bytes.decode("utf-8", errors="replace")[:MAX_SKILL_CHARS].replace("\r\n", "\n")
-        meta = parse_frontmatter(content)
+        meta = front_matter_or_empty(content)
         name = meta.get("name") or p.name
         desc = meta.get("description", "")[:MAX_DESC_CHARS]
         item_id = f"skills/{p.name}"

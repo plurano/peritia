@@ -30,7 +30,8 @@ import judge_groups
 from candidates import LICENSE_FILENAMES, MAX_ROWS, find_folder_licence_file, normalize_name
 from census import LiveReader, SourceReadError
 from judge_groups import collapse_copies, get_skill_text, is_existing_skill, load_sources
-from overlap import Item, git_blob_id, load_cache, parse_frontmatter
+from check_skills import front_matter_or_empty
+from overlap import Item, git_blob_id, load_cache
 
 MAX_FILES = 200
 MAX_BYTES = 2 * 1024 * 1024
@@ -684,7 +685,7 @@ def resolve_copies(group_rows, checkouts, root, pins, all_candidates, cache, sou
     metadata: dict[str, dict[str, str]] = {}
     for m in all_members:
         text = get_member_skill_text(m, checkouts, root / 'skills', pins)
-        meta = parse_frontmatter(text)
+        meta = front_matter_or_empty(text)
         metadata[m] = meta
         if is_existing_skill(m):
             rel = m[len('skills/'):].strip('/')
