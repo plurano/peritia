@@ -22,6 +22,12 @@ name: Installer
 permissions:
   contents: read
 
+env:
+  # This workflow builds no engine; the Git hooks read the declaration
+  # so local commits are judged by the engine the repository was
+  # adopted with.
+  PRAETOR_REF: "d9cb68ca1ea1b2f18eee354e54596696c875a04d"
+
 jobs:
   selftest:
     name: Installer selftest (${{ matrix.os }})
