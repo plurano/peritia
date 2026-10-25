@@ -6,6 +6,12 @@
   "extends": [
     "github>plurano/horistes"
   ],
+  "pip-compile": {
+    "description": "The tool locks follow their .in sources: Renovate replays the uv pip compile command in each lock header, which states its release age as a duration (--exclude-newer=P3D) so the replay stays valid.",
+    "managerFilePatterns": [
+      "/^requirements/[^/]+\\.txt$/"
+    ]
+  },
   "packageRules": [
     {
       "description": "praetor-managed files: praetorctl adopt ships their updates and praetorctl audit locks them byte for byte",
