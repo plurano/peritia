@@ -704,6 +704,127 @@ class AdoptionTests(unittest.TestCase):
         self.assertIn('name changed from demo to demo-owner', (skill / 'ORIGIN.md').read_text())
         self.assertEqual(check_skills.check(self.root), 0)
 
+    def test_checkout_without_git_is_refused(self):
+        checkout = self.checkouts / 'owner__nogit'
+        checkout.mkdir()
+        (checkout / 'SKILL.md').write_text(MD.format(name='nogit'), encoding='utf-8')
+        (checkout / 'LICENSE').write_text(LICENCE, encoding='utf-8')
+        self.candidate(name='nogit', folder='', source='owner/nogit', pin='4' * 40)
+        rows, _ = self.invoke(apply=True)
+        self.assertEqual(rows[0]['verdict'], 'refused', rows)
+        self.assertEqual(rows[0]['reason'], 'missing-git-checkout')
+        self.assertFalse((self.root / 'skills/nogit').exists())
+
+    def test_whitespace_arbiter_omits_a_file_the_normalizer_changes_beyond_whitespace(self):
+        """Ruling peritia-code-review-skill-markdown-refinement-0013: a file whose text changes beyond whitespace
+        (fence tags aside) stays out and ORIGIN.md lists it; the other files stay normalized."""
+        pin = self.source({
+            'pack/demo/SKILL.md': MD.format(name='demo'),
+            'pack/demo/LICENSE': LICENCE,
+            'pack/demo/reference/guide.md': '# Guide\n\nIntro paragraph.\n',
+            'pack/demo/reference/keep.md': '# Keep\n\nStays as is.\n',
+        })
+        self.candidate(pin=pin)
+        shutil.copytree(REPO / 'tools/markdownlint', self.root / 'tools/markdownlint')
+        fake = self.root / 'tools/markdownlint/normalize.mjs'
+        fake.write_text(
+            'import fs from "node:fs";\n'
+            'const out = {};\n'
+            'for (const f of process.argv.slice(2)) {\n'
+            '  if (f.endsWith("guide.md")) {\n'
+            '    fs.writeFileSync(f, fs.readFileSync(f, "utf8").replace("Intro", "Introduction"));\n'
+            '    out[f] = ["MD022"];\n'
+            '  }\n'
+            '}\n'
+            'process.stdout.write(JSON.stringify(out));\n',
+            encoding='utf-8')
+        rows, _ = self.invoke(apply=True, gate=adopt.markdown_gate)
+        self.assertEqual(rows[0]['verdict'], 'adopted', rows)
+        skill = self.root / 'skills/demo'
+        self.assertFalse((skill / 'reference/guide.md').exists())
+        self.assertTrue((skill / 'reference/keep.md').is_file())
+        origin = (skill / 'ORIGIN.md').read_text(encoding='utf-8')
+        self.assertIn('omitted files the whitespace normalizer would change beyond whitespace (reference/guide.md)', origin)
+
+    def test_markdown_normalizer_fixes_supporting_files_and_records_rules_and_fails_closed(self):
+        unnormalized_ref = (
+            '# Reference\n'
+            '## Tight Heading\n'
+            'Intro paragraph:\n'
+            '- item one\n'
+            '```python\n'
+            'x = 1\n'
+            '```\n'
+            'After fence.\n\n'
+            '| Header One | Header Two |\n'
+            '|---|---|\n'
+            '| 1 | 2 |'
+        )
+        pin = self.source({
+            'pack/demo/SKILL.md': MD.format(name='demo'),
+            'pack/demo/LICENSE': LICENCE,
+            'pack/demo/reference/guide.md': unnormalized_ref,
+        })
+        self.candidate(pin=pin)
+        shutil.copytree(REPO / 'tools/markdownlint', self.root / 'tools/markdownlint')
+        rows, _ = self.invoke(apply=True, gate=adopt.markdown_gate)
+        self.assertEqual(rows[0]['verdict'], 'adopted', rows)
+        skill = self.root / 'skills/demo'
+        self.assertTrue((skill / 'reference/guide.md').is_file())
+        origin = (skill / 'ORIGIN.md').read_text(encoding='utf-8')
+        self.assertIn(
+            'normalized Markdown whitespace (reference/guide.md (MD022, MD031, MD032, MD047, MD060))',
+            origin,
+        )
+        fenced_upstream = self.base / 'fenced-upstream.md'
+        fenced_text, _ = adopt.rewrite_fences(unnormalized_ref)
+        fenced_upstream.write_text(fenced_text, encoding='utf-8')
+        diff_proc = subprocess.run(
+            ['git', 'diff', '--no-index', '-w', '--ignore-blank-lines',
+             str(fenced_upstream), str(skill / 'reference/guide.md')],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(diff_proc.returncode, 0, diff_proc.stdout.decode('utf-8', errors='replace'))
+        self.assertEqual(diff_proc.stdout, b'')
+        # Fail-closed when normalizer script is broken or absent
+        shutil.rmtree(skill)
+        (self.root / 'tools/markdownlint/normalize.mjs').unlink()
+        rows_fail, _ = self.invoke(apply=True, gate=adopt.markdown_gate)
+        self.assertEqual(rows_fail[0]['verdict'], 'refused', rows_fail)
+        self.assertEqual(rows_fail[0]['reason'], 'markdown-normalize')
+        self.assertFalse(skill.exists())
+
+    def test_root_skill_omits_furniture_workbench_and_gate_refused_files(self):
+        files = {
+            'SKILL.md': MD.format(name='root-skill'),
+            'LICENSE': LICENCE,
+            'README.md': '# Repo readme\n',
+            'index.html': '<html></html>\n',
+            '.gitignore': '*.pyc\n',
+            '.hive/PROTOCOL.md': '# Hive\n',
+            'reference/good.md': '# Good\n\nValid reference text.\n',
+            'reference/bad.md': '#BadHeading\n',
+        }
+        pin = self.source(files, source='owner/root-skill')
+        self.candidate(name='root-skill', folder='', source='owner/root-skill', pin=pin)
+        shutil.copytree(REPO / 'tools/markdownlint', self.root / 'tools/markdownlint')
+        rows, _ = self.invoke(apply=True, gate=adopt.markdown_gate)
+        self.assertEqual(rows[0]['verdict'], 'adopted', rows)
+        skill = self.root / 'skills/root-skill'
+        self.assertTrue((skill / 'SKILL.md').is_file())
+        self.assertTrue((skill / 'reference/good.md').is_file())
+        self.assertFalse((skill / 'README.md').exists())
+        self.assertFalse((skill / 'index.html').exists())
+        self.assertFalse((skill / '.gitignore').exists())
+        self.assertFalse((skill / '.hive').exists())
+        self.assertFalse((skill / 'reference/bad.md').exists())
+        origin = (skill / 'ORIGIN.md').read_text(encoding='utf-8')
+        self.assertIn('path: .', origin)
+        self.assertIn('omitted repository furniture (.gitignore, README.md, index.html)', origin)
+        self.assertIn('omitted agent workbench files (.hive/PROTOCOL.md)', origin)
+        self.assertIn('omitted files refused by markdown gate (reference/bad.md (MD018))', origin)
+        self.assertEqual(check_skills.check(self.root), 0)
+
 
 if __name__ == '__main__':
     unittest.main()

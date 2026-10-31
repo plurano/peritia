@@ -68,6 +68,19 @@ class CheckSkillsIndexTests(unittest.TestCase):
         problems = check_skills.index_problems(self.root)
         self.assertTrue(any("duplicate row for alpha" in p for p in problems), problems)
 
+    def test_workbench_and_agent_control_files_refused(self):
+        alpha = self.root / "skills" / "alpha"
+        (alpha / ".hive").mkdir()
+        (alpha / ".hive" / "PROTOCOL.md").write_text("# Protocol\n", encoding="utf-8")
+        problems = check_skills.skill_problems(alpha)
+        self.assertTrue(any("alpha/.hive/PROTOCOL.md" in p for p in problems), problems)
+        (alpha / ".hive" / "PROTOCOL.md").unlink()
+        (alpha / ".hive").rmdir()
+        self.assertEqual(check_skills.skill_problems(alpha), [])
+
+        (alpha / "notes.md").write_text("Prose mentioning .hive and PROTOCOL.md stays valid.\n", encoding="utf-8")
+        self.assertEqual(check_skills.skill_problems(alpha), [])
+
 
 if __name__ == "__main__":
     unittest.main()

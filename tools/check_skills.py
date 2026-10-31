@@ -20,6 +20,11 @@ except ImportError:
     from tools.install_user_skills import read_install_set
 
 MAX_SKILLS = 5000  # bounds the directories read (HISS-02)
+MAX_SKILL_ENTRIES = 1000  # bounds the entries walked in one skill (HISS-02)
+AGENT_CONTROL_FILES = frozenset({
+    "protocol.md", "agents.md", "claude.md", "gemini.md",
+    ".cursorrules", ".windsurfrules", "copilot-instructions.md",
+})
 FRONT = re.compile(r"\A---\n(.*?)\n---\n", re.S)
 FIELD = re.compile(r"^(?P<key>[a-z_]+):\s*(?P<value>.+)$", re.M)
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
@@ -62,6 +67,20 @@ def front_matter_or_empty(text: str) -> dict[str, str]:
         return {}
 
 
+def _workbench_problems(skill: Path) -> list[str]:
+    entries: list[Path] = []
+    for i, entry in enumerate(skill.rglob("*")):
+        if i >= MAX_SKILL_ENTRIES:
+            return [f"{skill.name}: more than {MAX_SKILL_ENTRIES} entries"]
+        entries.append(entry)
+    out: list[str] = []
+    for entry in sorted(entries):
+        if entry.name.startswith(".") or (entry.is_file() and entry.name.lower() in AGENT_CONTROL_FILES):
+            rel = entry.relative_to(skill).as_posix()
+            out.append(f"{skill.name}/{rel}: agent workbench or agent-control content is not allowed")
+    return out
+
+
 def skill_problems(skill):
     """Problems of one skill directory, each naming the file and the rule."""
     out = []
@@ -81,6 +100,7 @@ def skill_problems(skill):
     for n, line in enumerate(text.splitlines(), 1):
         if FETCH.search(line):
             out.append(f"{skill.name}/SKILL.md:{n}: installs or fetches code at run time")
+    out.extend(_workbench_problems(skill))
     if not origin.is_file():
         return out + [f"{skill.name}: ORIGIN.md missing"]
     rec = fields(origin.read_text(encoding="utf-8"))
@@ -245,7 +265,27 @@ def _selftest_cases(tmp, good_md, good_origin):
         write(planted, name, md, origin, licence)
         problems = skill_problems(planted / "skills" / name)
         assert any(want in p for p in problems), (name, problems)
-    print(f"selftest ok: 2 clean skills pass, {len(cases)} planted defects refused, install-set validated")
+    _selftest_workbench(tmp, good_md, good_origin)
+    print(f"selftest ok: 2 clean skills pass, {len(cases) + 1} planted defects refused, install-set validated")
+
+
+def _selftest_workbench(tmp, good_md, good_origin):
+    hive_root = tmp / "hive-protocol"
+    write(hive_root, "hive-protocol", good_md.format(n="hive-protocol"), good_origin)
+    hive_skill = hive_root / "skills" / "hive-protocol"
+    (hive_skill / ".hive").mkdir()
+    (hive_skill / ".hive" / "PROTOCOL.md").write_text("# Protocol\n", encoding="utf-8")
+    problems = skill_problems(hive_skill)
+    assert any(".hive/PROTOCOL.md" in p for p in problems), problems
+    (hive_skill / ".hive" / "PROTOCOL.md").unlink()
+    (hive_skill / ".hive").rmdir()
+    assert skill_problems(hive_skill) == []
+
+    prose_root = tmp / "hive-prose"
+    prose_md = good_md.format(n="hive-prose") + "\nNever copy a .hive workbench folder.\n"
+    write(prose_root, "hive-prose", prose_md, good_origin)
+    (prose_root / "skills" / "hive-prose" / "notes.md").write_text("Mentions .hive in prose.\n", encoding="utf-8")
+    assert skill_problems(prose_root / "skills" / "hive-prose") == []
 
 
 if __name__ == "__main__":
