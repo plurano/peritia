@@ -250,36 +250,17 @@ def copy_blobs(checkout, entries, destination, allow_fetch=False):
 def rewrite_fences(content: str) -> tuple[str, bool]:
     lines = content.splitlines(keepends=True)
     out = []
-    in_fence = False
-    fence_char = None
-    fence_len = 0
+    open_fence = None
     changed = False
-
-    fence_re = re.compile(r'^([ \t]*)(`{3,}|~{3,})([^\n\r]*)([\r\n]*)$')
-
     for line in lines:
-        m = fence_re.match(line)
-        if not in_fence:
-            if m:
-                indent, fence, rest, newline = m.groups()
-                info = rest.strip()
-                in_fence = True
-                fence_char = fence[0]
-                fence_len = len(fence)
-                if not info:
-                    out.append(f'{indent}{fence}text{newline}')
-                    changed = True
-                    continue
-            out.append(line)
-        else:
-            if m:
-                indent, fence, rest, newline = m.groups()
-                info = rest.strip()
-                if not info and fence[0] == fence_char and len(fence) >= fence_len:
-                    in_fence = False
-                    fence_char = None
-                    fence_len = 0
-            out.append(line)
+        prev_fence = open_fence
+        open_fence, match = check_skills.step_fence(line, open_fence)
+        if prev_fence is None and match is not None and not match.group(3).strip():
+            indent, fence, _, newline = match.groups()
+            out.append(f'{indent}{fence}text{newline}')
+            changed = True
+            continue
+        out.append(line)
     return ''.join(out), changed
 
 

@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
 # SPDX-License-Identifier: EUPL-1.2
-# threads: PRRT_kwDOVLPOVM6yVs7Q
+# threads: PRRT_kwDOVLPOVM6yVs7Q, PRRT_kwDOVLPOVM6yWCLj
 --- a/reference/typescript.md
 +++ b/reference/typescript.md
-@@ -947,14 +947,14 @@ function processFile() {
+@@ -947,14 +947,19 @@ function processFile() {
  ```typescript
  // ✅ AsyncDisposable 用于异步资源（TS 5.2+）
  class DatabaseConnection implements AsyncDisposable {
@@ -16,7 +16,12 @@
  
    async [Symbol.asyncDispose]() {
 -    await this.db.close();
-+    await this.db?.close();
++    const db = this.db;
++    if (!db) return;
++    this.db = null;
++    await new Promise<void>((resolve, reject) => {
++      db.close((err) => (err ? reject(err) : resolve()));
++    });
    }
  }
  

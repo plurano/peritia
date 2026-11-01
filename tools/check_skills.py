@@ -28,7 +28,7 @@ AGENT_CONTROL_FILES = frozenset({
 FRONT = re.compile(r"\A---\n(.*?)\n---\n", re.S)
 FIELD = re.compile(r"^(?P<key>[a-z_]+):\s*(?P<value>.+)$", re.M)
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
-FENCE = re.compile(r"^[ \t]*(`{3,}|~{3,})")
+FENCE = re.compile(r"^([ \t]*)(`{3,}|~{3,})([^\n\r]*)([\r\n]*)\Z")
 INLINE_CODE = re.compile(r"`[^`]*`")
 MD_LINK = re.compile(r"(?<!!)\[[^\]]+\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
 CHECKED_LINK_SUFFIXES = (".md", ".markdown", ".mdx", ".py", ".sh", ".mjs", ".js", ".ts")
@@ -85,15 +85,27 @@ def _workbench_problems(skill: Path) -> list[str]:
     return out
 
 
+def step_fence(line: str, open_fence: str | None) -> tuple[str | None, re.Match[str] | None]:
+    """Advance code-fence state across one line (character, length, bare closing line)."""
+    match = FENCE.match(line)
+    if match is None:
+        return open_fence, None
+    marker, info = match.group(2), match.group(3).strip()
+    if open_fence is None:
+        return marker, match
+    if not info and marker[0] == open_fence[0] and len(marker) >= len(open_fence):
+        return None, match
+    return open_fence, match
+
+
 def _skill_md_link_problems(skill: Path, text: str) -> list[str]:
     out: list[str] = []
-    in_fence = False
+    open_fence: str | None = None
     skill_root = skill.resolve()
     for lineno, line in enumerate(text.splitlines()[:MAX_SKILL_ENTRIES * 10], 1):
-        if FENCE.match(line):
-            in_fence = not in_fence
-            continue
-        if in_fence:
+        prev_fence = open_fence
+        open_fence, _ = step_fence(line, open_fence)
+        if prev_fence is not None or open_fence is not None:
             continue
         stripped = INLINE_CODE.sub("", line)
         for match in MD_LINK.finditer(stripped):
@@ -289,12 +301,22 @@ def _selftest_cases(tmp, good_md, good_origin):
         "empty-desc": ("---\nname: empty-desc\ndescription: >\n---\n\n# x\n", good_origin, True, "needs a description"),
         "bad-yaml": ("---\nname: [\n---\n\n# x\n", good_origin, True, "not valid YAML"),
         "dangling-link": (good_md.format(n="dangling-link") + "\nSee [Guide](reference/missing.md).\n", good_origin, True, "links to missing file reference/missing.md"),
+        "tilde-fence-link": (
+            good_md.format(n="tilde-fence-link")
+            + "\n~~~\n```\n[Inside](reference/inside-tilde.md)\n~~~\nSee [After](reference/after-tilde.md).\n",
+            good_origin, True, "links to missing file reference/after-tilde.md",
+        ),
+        "quad-fence-link": (
+            good_md.format(n="quad-fence-link")
+            + "\n````markdown\n```python\n[Inside](reference/inside-quad.md)\n````\nSee [After](reference/after-quad.md).\n",
+            good_origin, True, "links to missing file reference/after-quad.md",
+        ),
     }
     for name, (md, origin, licence, want) in cases.items():
         planted = tmp / name
         write(planted, name, md, origin, licence)
         problems = skill_problems(planted / "skills" / name)
-        assert any(want in p for p in problems), (name, problems)
+        assert any(want in p for p in problems) and not any("inside-" in p for p in problems), (name, problems)
     _selftest_workbench(tmp, good_md, good_origin)
     print(f"selftest ok: 2 clean skills pass, {len(cases) + 1} planted defects refused, install-set validated")
 

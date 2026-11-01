@@ -92,6 +92,30 @@ class CheckSkillsIndexTests(unittest.TestCase):
         self.assertTrue(any("links to missing file reference/missing.md" in p for p in problems), problems)
         self.assertFalse(any("notes.md" in p for p in problems), problems)
 
+    def test_planted_tilde_fence_containing_backtick_fence(self):
+        alpha = self.root / "skills" / "alpha"
+        (alpha / "SKILL.md").write_text(
+            MD.format(name="alpha")
+            + "\n~~~\n```\n[Inside](reference/inside-tilde.md)\n~~~\n"
+            + "See [After](reference/after-tilde.md).\n",
+            encoding="utf-8",
+        )
+        problems = check_skills.skill_problems(alpha)
+        self.assertFalse(any("inside-tilde.md" in p for p in problems), problems)
+        self.assertTrue(any("links to missing file reference/after-tilde.md" in p for p in problems), problems)
+
+    def test_planted_quad_fence_containing_triple_python_fence(self):
+        alpha = self.root / "skills" / "alpha"
+        (alpha / "SKILL.md").write_text(
+            MD.format(name="alpha")
+            + "\n````markdown\n```python\n[Inside](reference/inside-quad.md)\n````\n"
+            + "See [After](reference/after-quad.md).\n",
+            encoding="utf-8",
+        )
+        problems = check_skills.skill_problems(alpha)
+        self.assertFalse(any("inside-quad.md" in p for p in problems), problems)
+        self.assertTrue(any("links to missing file reference/after-quad.md" in p for p in problems), problems)
+
 
 if __name__ == "__main__":
     unittest.main()
