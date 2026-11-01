@@ -22,3 +22,25 @@ engines:
       # and 'unsafe-eval' as patterns a reviewer refuses (5 findings on pull request 27); the
       # guide runs nothing. Verdict: FACT peritia-decided-codacy-trial-verdict-27-xss-eval.
       - "skills/code-review-skill/reference/cross-cutting/xss-prevention.md"
+  opengrep:
+    exclude_paths:
+      # javascript path traversal (non-literal fs filename): a pattern rule that fires on every
+      # variable path. normalize.mjs resolves each path and refuses anything outside the root
+      # (exit 2); test_normalize.mjs proves both sides and runs in make test (17 findings on
+      # pull request 27). Verdict: FACT peritia-decided-codacy-trial-verdict-27-path-traversal.
+      - "tools/markdownlint/normalize.mjs"
+      - "tools/markdownlint/test_normalize.mjs"
+      # python dangerous subprocess use: the adoption tests start node and git with a fixed
+      # argument list, by full path from shutil.which, on test input (2 findings).
+      # Verdict: FACT peritia-decided-codacy-trial-verdict-27-test-subprocess.
+      - "tools/test_adopt_skills.py"
+  bandit:
+    exclude_paths:
+      # B603 subprocess without shell: same calls as the opengrep entry above (2 findings).
+      # Verdict: FACT peritia-decided-codacy-trial-verdict-27-test-subprocess.
+      - "tools/test_adopt_skills.py"
+  prospector:
+    exclude_paths:
+      # Prospector's bandit plugin repeats the B603 finding above (2 findings); Ruff still lints
+      # this file. Verdict: FACT peritia-decided-codacy-trial-verdict-27-test-subprocess.
+      - "tools/test_adopt_skills.py"

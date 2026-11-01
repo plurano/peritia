@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 PR Analyzer - Analyze PR complexity and suggest review approach.
 
@@ -9,13 +8,12 @@ Usage:
     git diff main...HEAD | python pr-analyzer.py
 """
 
-import os
-import sys
-import re
 import argparse
+import os
+import re
+import sys
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import List, Dict
 
 RISK_NO_TESTS = "NO_TEST_CHANGES"
 
@@ -37,12 +35,12 @@ class PRAnalysis:
     total_files: int
     total_additions: int
     total_deletions: int
-    files: List[FileStats]
+    files: list[FileStats]
     complexity_score: float
     size_category: str
     estimated_review_time: int
-    risk_factors: List[str]
-    suggestions: List[str]
+    risk_factors: list[str]
+    suggestions: list[str]
 
 
 def detect_language(filename: str) -> str:
@@ -162,13 +160,10 @@ def is_config_file(filename: str) -> bool:
         return True
 
     # Files under a config/ directory
-    if re.search(r'(?:^|/)config/', filename):
-        return True
-
-    return False
+    return bool(re.search(r'(?:^|/)config/', filename))
 
 
-def parse_diff(diff_content: str) -> List[FileStats]:
+def parse_diff(diff_content: str) -> list[FileStats]:
     """Parse git diff output and extract file statistics."""
     files = []
     current_file = None
@@ -207,7 +202,7 @@ def parse_diff(diff_content: str) -> List[FileStats]:
     return files
 
 
-def calculate_complexity(files: List[FileStats]) -> float:
+def calculate_complexity(files: list[FileStats]) -> float:
     """Calculate complexity score (0-1 scale)."""
     if not files:
         return 0.0
@@ -225,7 +220,7 @@ def calculate_complexity(files: List[FileStats]) -> float:
     non_test_ratio = 1 - (test_lines / max(total_changes, 1))
 
     # Factor for language diversity
-    languages = set(f.language for f in files if f.language != 'unknown')
+    languages = {f.language for f in files if f.language != 'unknown'}
     lang_factor = min(len(languages) / 5, 1.0)
 
     complexity = (
@@ -252,7 +247,7 @@ def categorize_size(total_changes: int) -> str:
         return "XL (Extra Large) - Consider splitting"
 
 
-def estimate_review_time(files: List[FileStats], complexity: float) -> int:
+def estimate_review_time(files: list[FileStats], complexity: float) -> int:
     """Estimate review time in minutes."""
     total_changes = sum(f.additions + f.deletions for f in files)
 
@@ -266,7 +261,7 @@ def estimate_review_time(files: List[FileStats], complexity: float) -> int:
     return max(5, min(120, int(adjusted_time)))
 
 
-def identify_risk_factors(files: List[FileStats]) -> List[str]:
+def identify_risk_factors(files: list[FileStats]) -> list[str]:
     """Identify potential risk factors in the PR."""
     risks = []
 
@@ -303,7 +298,7 @@ def identify_risk_factors(files: List[FileStats]) -> List[str]:
     return risks
 
 
-def generate_suggestions(files: List[FileStats], complexity: float, risks: List[str]) -> List[str]:
+def generate_suggestions(files: list[FileStats], complexity: float, risks: list[str]) -> list[str]:
     """Generate review suggestions."""
     suggestions = []
 
@@ -320,7 +315,7 @@ def generate_suggestions(files: List[FileStats], complexity: float, risks: List[
         suggestions.append("Request test additions before approval")
 
     # Language-specific suggestions
-    languages = set(f.language for f in files)
+    languages = {f.language for f in files}
     if 'TypeScript' in languages or 'TypeScript/React' in languages:
         suggestions.append("Check for proper type usage (avoid 'any')")
     if 'Rust' in languages:
@@ -389,7 +384,7 @@ def print_analysis(analysis: PRAnalysis, show_files: bool = False):
     if show_files:
         print("\n📁 FILES:")
         # Group by language
-        by_lang: Dict[str, List[FileStats]] = defaultdict(list)
+        by_lang: dict[str, list[FileStats]] = defaultdict(list)
         for f in analysis.files:
             by_lang[f.language].append(f)
 
