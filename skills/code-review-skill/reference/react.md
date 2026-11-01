@@ -360,24 +360,22 @@ function SlowLike({ postId, likes }) {
 }
 
 // ✅ useOptimistic 即时反馈，失败自动回滚
-import { startTransition, useOptimistic, useState } from 'react';
+import { startTransition, useActionState, useOptimistic } from 'react';
 
-function FastLike({ postId, likes }) {
-  const [likeCount, setLikeCount] = useState(likes);
+function FastLike({ postId, likes }) {  // 父组件渲染 <FastLike key={postId} ... />，让新文章从各自点赞数开始
+  const [likeCount, likeAction] = useActionState(async (currentCount) => {
+    try { return await likePost(postId); }  // likePost 返回服务端最新的点赞数
+    catch { return currentCount; }  // 保持原计数；React 自动回滚丢弃乐观值
+  }, likes);
   const [optimisticLikes, addOptimisticLike] = useOptimistic(
     likeCount,
-    (currentLikes, increment: number) => currentLikes + increment
+    (current, increment: number) => current + increment
   );
 
   const handleLike = () => {
-    startTransition(async () => {
-      addOptimisticLike(1);  // 立即更新 UI
-      try {
-        const newCount = await likePost(postId);  // 后台同步，返回服务端最新的点赞数
-        startTransition(() => setLikeCount(newCount));
-      } catch {
-        // React 自动回滚到 likeCount 原值
-      }
+    startTransition(() => {
+      addOptimisticLike(1);
+      likeAction();
     });
   };
 

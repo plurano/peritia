@@ -947,5 +947,37 @@ class AdoptionTests(unittest.TestCase):
         self.assertFalse((self.root / 'skills/demo').exists())
 
 
+class RewriteFencesTests(unittest.TestCase):
+    def test_top_level_four_space_backticks_unchanged(self):
+        text = "    ```\n    code\n    ```\n"
+        new_text, changed = adopt.rewrite_fences(text)
+        self.assertFalse(changed)
+        self.assertEqual(new_text, text)
+
+    def test_nested_list_four_space_fence_rewritten(self):
+        text = "* item\n    ```\n    code\n    ```\n"
+        new_text, changed = adopt.rewrite_fences(text)
+        self.assertTrue(changed)
+        self.assertEqual(new_text, "* item\n    ```text\n    code\n    ```\n")
+
+    def test_tilde_fence_rewritten(self):
+        text = "~~~\ncode\n~~~\n"
+        new_text, changed = adopt.rewrite_fences(text)
+        self.assertTrue(changed)
+        self.assertEqual(new_text, "~~~text\ncode\n~~~\n")
+
+    def test_unclosed_fence_rewritten(self):
+        text = "```\nunclosed code\n"
+        new_text, changed = adopt.rewrite_fences(text)
+        self.assertTrue(changed)
+        self.assertEqual(new_text, "```text\nunclosed code\n")
+
+    def test_fence_with_info_unchanged(self):
+        text = "```python\nprint('hello')\n```\n"
+        new_text, changed = adopt.rewrite_fences(text)
+        self.assertFalse(changed)
+        self.assertEqual(new_text, text)
+
+
 if __name__ == '__main__':
     unittest.main()

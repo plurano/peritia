@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
 # SPDX-License-Identifier: EUPL-1.2
-# threads: PRRT_kwDOVLPOVM6yVpT-, PRRT_kwDOVLPOVM6yVs7I, PRRT_kwDOVLPOVM6yWCLh
+# threads: PRRT_kwDOVLPOVM6yVpT-, PRRT_kwDOVLPOVM6yVs7I, PRRT_kwDOVLPOVM6yWCLh, PRRT_kwDOVLPOVM6yWQob
 --- a/reference/svelte.md
 +++ b/reference/svelte.md
 @@ -422,10 +422,12 @@ import { fail, redirect } from '@sveltejs/kit';
@@ -17,14 +17,18 @@
  
      await locals.db.users.delete(id);
      throw redirect(303, '/users');
-@@ -923,9 +925,14 @@ export async function load() {
+@@ -923,9 +925,18 @@ export async function load() {
  
  // ✅ 私有环境变量只在 server load 中使用
  // src/routes/admin/+page.server.js (server-only)
 -export async function load({ locals }) {
++import { error } from '@sveltejs/kit';
 +import { SECRET_API_KEY } from '$env/static/private';
 +
-+export async function load({ fetch }) {
++export async function load({ fetch, locals }) {
++  // locals.user is set by the app's handle hook
++  if (!locals.user?.isAdmin) error(403, 'Forbidden');
++
    // secrets stay on server
 -  const data = await fetch(process.env.SECRET_API_KEY + '/admin');
 +  const res = await fetch('https://api.example.com/admin', {

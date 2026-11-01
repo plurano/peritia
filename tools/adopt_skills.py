@@ -249,19 +249,21 @@ def copy_blobs(checkout, entries, destination, allow_fetch=False):
 
 def rewrite_fences(content: str) -> tuple[str, bool]:
     lines = content.splitlines(keepends=True)
-    out = []
-    open_fence = None
+    tokens = check_skills.COMMONMARK.parse(content)
     changed = False
-    for line in lines:
-        prev_fence = open_fence
-        open_fence, match = check_skills.step_fence(line, open_fence)
-        if prev_fence is None and match is not None and not match.group(3).strip():
-            indent, fence, _, newline = match.groups()
-            out.append(f'{indent}{fence}text{newline}')
-            changed = True
-            continue
-        out.append(line)
-    return ''.join(out), changed
+    for token in tokens:
+        if token.type == 'fence' and not token.info.strip() and token.map:
+            idx = token.map[0]
+            line = lines[idx]
+            pos = line.find(token.markup)
+            if pos != -1:
+                indent = line[:pos]
+                newline = '\r\n' if line.endswith('\r\n') else ('\n' if line.endswith('\n') else '')
+                new_line = f'{indent}{token.markup}text{newline}'
+                if new_line != line:
+                    lines[idx] = new_line
+                    changed = True
+    return ''.join(lines), changed
 
 
 def rewrite_skill_fences(skill: Path) -> set[str]:

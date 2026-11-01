@@ -925,9 +925,13 @@ export async function load() {
 
 // ✅ 私有环境变量只在 server load 中使用
 // src/routes/admin/+page.server.js (server-only)
+import { error } from '@sveltejs/kit';
 import { SECRET_API_KEY } from '$env/static/private';
 
-export async function load({ fetch }) {
+export async function load({ fetch, locals }) {
+  // locals.user is set by the app's handle hook
+  if (!locals.user?.isAdmin) error(403, 'Forbidden');
+
   // secrets stay on server
   const res = await fetch('https://api.example.com/admin', {
     headers: { Authorization: `Bearer ${SECRET_API_KEY}` },

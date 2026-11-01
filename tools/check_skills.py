@@ -12,6 +12,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+from markdown_it import MarkdownIt
 import yaml
 
 try:
@@ -19,6 +20,7 @@ try:
 except ImportError:
     from tools.install_user_skills import read_install_set
 
+COMMONMARK = MarkdownIt("commonmark")
 MAX_SKILLS = 5000  # bounds the directories read (HISS-02)
 MAX_SKILL_ENTRIES = 1000  # bounds the entries walked in one skill (HISS-02)
 AGENT_CONTROL_FILES = frozenset({
@@ -28,7 +30,6 @@ AGENT_CONTROL_FILES = frozenset({
 FRONT = re.compile(r"\A---\n(.*?)\n---\n", re.S)
 FIELD = re.compile(r"^(?P<key>[a-z_]+):\s*(?P<value>.+)$", re.M)
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
-FENCE = re.compile(r"^([ \t]*)(`{3,}|~{3,})([^\n\r]*)([\r\n]*)\Z")
 INLINE_CODE = re.compile(r"`[^`]*`")
 MD_LINK = re.compile(r"(?<!!)\[[^\]]+\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
 CHECKED_LINK_SUFFIXES = (".md", ".markdown", ".mdx", ".py", ".sh", ".mjs", ".js", ".ts")
@@ -85,27 +86,17 @@ def _workbench_problems(skill: Path) -> list[str]:
     return out
 
 
-def step_fence(line: str, open_fence: str | None) -> tuple[str | None, re.Match[str] | None]:
-    """Advance code-fence state across one line (character, length, bare closing line)."""
-    match = FENCE.match(line)
-    if match is None:
-        return open_fence, None
-    marker, info = match.group(2), match.group(3).strip()
-    if open_fence is None:
-        return marker, match
-    if not info and marker[0] == open_fence[0] and len(marker) >= len(open_fence):
-        return None, match
-    return open_fence, match
-
-
 def _skill_md_link_problems(skill: Path, text: str) -> list[str]:
     out: list[str] = []
-    open_fence: str | None = None
     skill_root = skill.resolve()
+    tokens = COMMONMARK.parse(text)
+    skipped: set[int] = set()
+    for token in tokens:
+        if token.type in ("fence", "code_block") and token.map:
+            skipped.update(range(token.map[0], token.map[1]))
+
     for lineno, line in enumerate(text.splitlines()[:MAX_SKILL_ENTRIES * 10], 1):
-        prev_fence = open_fence
-        open_fence, _ = step_fence(line, open_fence)
-        if prev_fence is not None or open_fence is not None:
+        if (lineno - 1) in skipped:
             continue
         stripped = INLINE_CODE.sub("", line)
         for match in MD_LINK.finditer(stripped):
@@ -310,6 +301,11 @@ def _selftest_cases(tmp, good_md, good_origin):
             good_md.format(n="quad-fence-link")
             + "\n````markdown\n```python\n[Inside](reference/inside-quad.md)\n````\nSee [After](reference/after-quad.md).\n",
             good_origin, True, "links to missing file reference/after-quad.md",
+        ),
+        "indented-backtick-link": (
+            good_md.format(n="indented-backtick-link")
+            + "\n    ```\n[After](reference/after-indented.md)\n",
+            good_origin, True, "links to missing file reference/after-indented.md",
         ),
     }
     for name, (md, origin, licence, want) in cases.items():
