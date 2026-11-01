@@ -276,16 +276,21 @@ def _selftest_workbench(tmp, good_md, good_origin):
     (hive_skill / ".hive").mkdir()
     (hive_skill / ".hive" / "PROTOCOL.md").write_text("# Protocol\n", encoding="utf-8")
     problems = skill_problems(hive_skill)
-    assert any(".hive/PROTOCOL.md" in p for p in problems), problems
+    if not any(".hive/PROTOCOL.md" in p for p in problems):
+        raise AssertionError(f"planted .hive/PROTOCOL.md not refused: {problems}")
     (hive_skill / ".hive" / "PROTOCOL.md").unlink()
     (hive_skill / ".hive").rmdir()
-    assert skill_problems(hive_skill) == []
+    left = skill_problems(hive_skill)
+    if left:
+        raise AssertionError(f"skill without .hive still refused: {left}")
 
     prose_root = tmp / "hive-prose"
     prose_md = good_md.format(n="hive-prose") + "\nNever copy a .hive workbench folder.\n"
     write(prose_root, "hive-prose", prose_md, good_origin)
     (prose_root / "skills" / "hive-prose" / "notes.md").write_text("Mentions .hive in prose.\n", encoding="utf-8")
-    assert skill_problems(prose_root / "skills" / "hive-prose") == []
+    prose = skill_problems(prose_root / "skills" / "hive-prose")
+    if prose:
+        raise AssertionError(f"prose naming .hive refused: {prose}")
 
 
 if __name__ == "__main__":

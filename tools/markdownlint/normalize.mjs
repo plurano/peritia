@@ -125,6 +125,25 @@ function configurationParsers(temporary) {
   ];
 }
 
+// Refuses an input that is absolute, climbs with "..", or resolves outside the folder it is run from (the staged
+// skill), before any install, read or write.
+function checkedInput(file, root) {
+  if (typeof file !== "string" || file === "" || path.isAbsolute(file) || file.split(/[\\/]+/).includes("..")) {
+    fail(`refusing Markdown input outside the skill folder: ${file}`);
+  }
+  let resolved;
+  try {
+    resolved = fs.realpathSync(path.resolve(root, file));
+  } catch {
+    fail(`refusing Markdown input that does not resolve: ${file}`);
+  }
+  const relative = path.relative(fs.realpathSync(root), resolved);
+  if (relative === "" || relative.startsWith("..") || path.isAbsolute(relative)) {
+    fail(`refusing Markdown input outside the skill folder: ${file}`);
+  }
+  return file;
+}
+
 function readLintSource(file) {
   let descriptor;
   try {
@@ -185,6 +204,9 @@ async function main() {
   }
   if (files.length > MAX_FILES) {
     fail(`normalize batch has ${files.length} files; maximum is ${MAX_FILES}`);
+  }
+  for (let index = 0; index < files.length; index += 1) {
+    checkedInput(files[index], process.cwd());
   }
   const toolDir = path.dirname(fileURLToPath(import.meta.url));
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "praetor-markdownlint-normalize-"));

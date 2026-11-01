@@ -715,6 +715,22 @@ class AdoptionTests(unittest.TestCase):
         self.assertEqual(rows[0]['reason'], 'missing-git-checkout')
         self.assertFalse((self.root / 'skills/nogit').exists())
 
+    def test_normalizer_refuses_inputs_outside_the_skill_folder(self):
+        """An absolute path, a .. segment or a link out of the folder is refused before any install or write."""
+        folder = self.base / 'norm-inputs'
+        folder.mkdir()
+        (folder / 'ok.md').write_text('# Ok\n', encoding='utf-8')
+        outside = self.base / 'outside.md'
+        outside.write_text('# Outside\n', encoding='utf-8')
+        (folder / 'link.md').symlink_to(outside)
+        script = REPO / 'tools/markdownlint/normalize.mjs'
+        for bad in (str(outside), '../outside.md', 'link.md'):
+            proc = subprocess.run(['node', str(script), bad], cwd=folder, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, check=False, timeout=60)
+            self.assertNotEqual(proc.returncode, 0, bad)
+            self.assertIn(b'refusing Markdown input', proc.stderr, (bad, proc.stderr[:300]))
+        self.assertEqual(outside.read_text(encoding='utf-8'), '# Outside\n')
+
     def test_whitespace_arbiter_omits_a_file_the_normalizer_changes_beyond_whitespace(self):
         """Ruling peritia-code-review-skill-markdown-refinement-0013: a file whose text changes beyond whitespace
         (fence tags aside) stays out and ORIGIN.md lists it; the other files stay normalized."""
@@ -782,7 +798,7 @@ class AdoptionTests(unittest.TestCase):
         diff_proc = subprocess.run(
             ['git', 'diff', '--no-index', '-w', '--ignore-blank-lines',
              str(fenced_upstream), str(skill / 'reference/guide.md')],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
         )
         self.assertEqual(diff_proc.returncode, 0, diff_proc.stdout.decode('utf-8', errors='replace'))
         self.assertEqual(diff_proc.stdout, b'')
