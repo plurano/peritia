@@ -841,6 +841,111 @@ class AdoptionTests(unittest.TestCase):
         self.assertIn('omitted files refused by markdown gate (reference/bad.md (MD018))', origin)
         self.assertEqual(check_skills.check(self.root), 0)
 
+    def test_arbiter_planted_listed_patch_passes(self):
+        pin = self.source({
+            'pack/demo/SKILL.md': MD.format(name='demo'),
+            'pack/demo/LICENSE': LICENCE,
+            'pack/demo/reference/guide.md': '# Guide\n## Tight\nOld line.\n',
+        })
+        self.candidate(pin=pin)
+        shutil.copytree(REPO / 'tools/markdownlint', self.root / 'tools/markdownlint')
+        patch_file = self.root / 'tools/skill-patches/demo/reference/guide.md.patch'
+        patch_file.parent.mkdir(parents=True, exist_ok=True)
+        patch_file.write_text(
+            '# threads: PRRT_test1, PRRT_test2\n'
+            '--- a/reference/guide.md\n'
+            '+++ b/reference/guide.md\n'
+            '@@ -3,3 +3,3 @@\n'
+            ' ## Tight\n'
+            ' \n'
+            '-Old line.\n'
+            '+New line.\n',
+            encoding='utf-8',
+        )
+        rows, _ = self.invoke(apply=True, gate=adopt.markdown_gate)
+        self.assertEqual(rows[0]['verdict'], 'adopted', rows)
+        skill = self.root / 'skills/demo'
+        self.assertEqual((skill / 'reference/guide.md').read_text(encoding='utf-8'), '# Guide\n\n## Tight\n\nNew line.\n')
+        origin = (skill / 'ORIGIN.md').read_text(encoding='utf-8')
+        self.assertIn('applied review patches (reference/guide.md (PRRT_test1, PRRT_test2))', origin)
+
+    def test_arbiter_planted_unlisted_edit_is_refused(self):
+        pin = self.source({
+            'pack/demo/SKILL.md': MD.format(name='demo'),
+            'pack/demo/LICENSE': LICENCE,
+            'pack/demo/reference/listed.md': '# Listed\n\nOld text.\n',
+            'pack/demo/reference/unlisted.md': '# Unlisted\n\nOriginal text.\n',
+        })
+        self.candidate(pin=pin)
+        shutil.copytree(REPO / 'tools/markdownlint', self.root / 'tools/markdownlint')
+        patch_file = self.root / 'tools/skill-patches/demo/reference/listed.md.patch'
+        patch_file.parent.mkdir(parents=True, exist_ok=True)
+        patch_file.write_text(
+            '# threads: PRRT_listed\n'
+            '--- a/reference/listed.md\n'
+            '+++ b/reference/listed.md\n'
+            '@@ -1,3 +1,3 @@\n'
+            ' # Listed\n'
+            ' \n'
+            '-Old text.\n'
+            '+Patched text.\n',
+            encoding='utf-8',
+        )
+        fake = self.root / 'tools/markdownlint/normalize.mjs'
+        fake.write_text(
+            'import fs from "node:fs";\n'
+            'const out = {};\n'
+            'for (const f of process.argv.slice(2)) {\n'
+            '  if (f.endsWith("unlisted.md")) {\n'
+            '    fs.writeFileSync(f, fs.readFileSync(f, "utf8").replace("Original", "Tampered"));\n'
+            '    out[f] = ["MD022"];\n'
+            '  }\n'
+            '}\n'
+            'process.stdout.write(JSON.stringify(out));\n',
+            encoding='utf-8',
+        )
+        rows, _ = self.invoke(apply=True, gate=adopt.markdown_gate)
+        self.assertEqual(rows[0]['verdict'], 'adopted', rows)
+        skill = self.root / 'skills/demo'
+        self.assertTrue((skill / 'reference/listed.md').is_file())
+        self.assertEqual((skill / 'reference/listed.md').read_text(encoding='utf-8'), '# Listed\n\nPatched text.\n')
+        self.assertFalse((skill / 'reference/unlisted.md').exists())
+        # Direct arbiter check: even a file with a patch is dropped if an extra unlisted edit is present.
+        (skill / 'reference/listed.md').write_text('# Listed\n\nPatched text plus unlisted edit.\n', encoding='utf-8')
+        dropped = adopt.whitespace_arbiter(
+            skill,
+            {'reference/listed.md': '# Listed\n\nOld text.\n'},
+            patch_dir=self.root / 'tools/skill-patches/demo',
+        )
+        self.assertEqual(dropped, ['reference/listed.md'])
+        self.assertFalse((skill / 'reference/listed.md').exists())
+
+    def test_arbiter_planted_unapplicable_patch_fails_adoption(self):
+        pin = self.source({
+            'pack/demo/SKILL.md': MD.format(name='demo'),
+            'pack/demo/LICENSE': LICENCE,
+            'pack/demo/reference/guide.md': '# Guide\n\nUpstream bumped this line.\n',
+        })
+        self.candidate(pin=pin)
+        shutil.copytree(REPO / 'tools/markdownlint', self.root / 'tools/markdownlint')
+        patch_file = self.root / 'tools/skill-patches/demo/reference/guide.md.patch'
+        patch_file.parent.mkdir(parents=True, exist_ok=True)
+        patch_file.write_text(
+            '# threads: PRRT_stale\n'
+            '--- a/reference/guide.md\n'
+            '+++ b/reference/guide.md\n'
+            '@@ -1,3 +1,3 @@\n'
+            ' # Guide\n'
+            ' \n'
+            '-Old line that no longer exists.\n'
+            '+Patched line.\n',
+            encoding='utf-8',
+        )
+        rows, _ = self.invoke(apply=True, gate=adopt.markdown_gate)
+        self.assertEqual(rows[0]['verdict'], 'refused', rows)
+        self.assertIn('reference/guide.md', rows[0]['reason'])
+        self.assertFalse((self.root / 'skills/demo').exists())
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -28,6 +28,10 @@ AGENT_CONTROL_FILES = frozenset({
 FRONT = re.compile(r"\A---\n(.*?)\n---\n", re.S)
 FIELD = re.compile(r"^(?P<key>[a-z_]+):\s*(?P<value>.+)$", re.M)
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
+FENCE = re.compile(r"^[ \t]*(`{3,}|~{3,})")
+INLINE_CODE = re.compile(r"`[^`]*`")
+MD_LINK = re.compile(r"(?<!!)\[[^\]]+\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
+CHECKED_LINK_SUFFIXES = (".md", ".markdown", ".mdx", ".py", ".sh", ".mjs", ".js", ".ts")
 # run-time installs and remote code: a skill must use the tools the project already pins
 FETCH = re.compile(r"\b(?:pip install|uv pip install|uvx |npx |npm install|pnpm add|yarn add|go install|cargo install|"
                    r"curl[^\n|]*\|\s*(?:ba)?sh|wget[^\n|]*\|\s*(?:ba)?sh)")
@@ -81,6 +85,30 @@ def _workbench_problems(skill: Path) -> list[str]:
     return out
 
 
+def _skill_md_link_problems(skill: Path, text: str) -> list[str]:
+    out: list[str] = []
+    in_fence = False
+    skill_root = skill.resolve()
+    for lineno, line in enumerate(text.splitlines()[:MAX_SKILL_ENTRIES * 10], 1):
+        if FENCE.match(line):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        stripped = INLINE_CODE.sub("", line)
+        for match in MD_LINK.finditer(stripped):
+            target = match.group(1).strip("<>")
+            path_part = target.split("#", 1)[0].split("?", 1)[0]
+            if not path_part or ":" in path_part or path_part.startswith(("/", "../")):
+                continue
+            if not path_part.lower().endswith(CHECKED_LINK_SUFFIXES):
+                continue
+            resolved = (skill / path_part).resolve()
+            if not resolved.is_file() or not resolved.is_relative_to(skill_root):
+                out.append(f"{skill.name}/SKILL.md:{lineno}: links to missing file {path_part}")
+    return out
+
+
 def skill_problems(skill):
     """Problems of one skill directory, each naming the file and the rule."""
     out = []
@@ -100,6 +128,7 @@ def skill_problems(skill):
     for n, line in enumerate(text.splitlines(), 1):
         if FETCH.search(line):
             out.append(f"{skill.name}/SKILL.md:{n}: installs or fetches code at run time")
+    out.extend(_skill_md_link_problems(skill, text))
     out.extend(_workbench_problems(skill))
     if not origin.is_file():
         return out + [f"{skill.name}: ORIGIN.md missing"]
@@ -259,6 +288,7 @@ def _selftest_cases(tmp, good_md, good_origin):
         "installs": (good_md.format(n="installs") + "\n    uv pip install numpy==2.5.3\n", good_origin, True, "installs or fetches"),
         "empty-desc": ("---\nname: empty-desc\ndescription: >\n---\n\n# x\n", good_origin, True, "needs a description"),
         "bad-yaml": ("---\nname: [\n---\n\n# x\n", good_origin, True, "not valid YAML"),
+        "dangling-link": (good_md.format(n="dangling-link") + "\nSee [Guide](reference/missing.md).\n", good_origin, True, "links to missing file reference/missing.md"),
     }
     for name, (md, origin, licence, want) in cases.items():
         planted = tmp / name

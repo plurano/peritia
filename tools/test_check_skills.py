@@ -81,6 +81,17 @@ class CheckSkillsIndexTests(unittest.TestCase):
         (alpha / "notes.md").write_text("Prose mentioning .hive and PROTOCOL.md stays valid.\n", encoding="utf-8")
         self.assertEqual(check_skills.skill_problems(alpha), [])
 
+    def test_dangling_skill_md_link_refused(self):
+        alpha = self.root / "skills" / "alpha"
+        (alpha / "SKILL.md").write_text(
+            MD.format(name="alpha") + "\nSee [Guide](reference/missing.md) and [Present](notes.md).\n",
+            encoding="utf-8",
+        )
+        (alpha / "notes.md").write_text("# Present\n", encoding="utf-8")
+        problems = check_skills.skill_problems(alpha)
+        self.assertTrue(any("links to missing file reference/missing.md" in p for p in problems), problems)
+        self.assertFalse(any("notes.md" in p for p in problems), problems)
+
 
 if __name__ == "__main__":
     unittest.main()
