@@ -15,6 +15,7 @@ allowed-tools:
   - Glob
   - Bash
   - WebFetch
+author: awesome-skills
 ---
 
 # Code Review Skill

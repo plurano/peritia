@@ -312,7 +312,8 @@ def _selftest_cases(tmp, good_md, good_origin):
         planted = tmp / name
         write(planted, name, md, origin, licence)
         problems = skill_problems(planted / "skills" / name)
-        assert any(want in p for p in problems) and not any("inside-" in p for p in problems), (name, problems)
+        if not (any(want in p for p in problems) and not any("inside-" in p for p in problems)):
+            raise AssertionError((name, problems))
     _selftest_workbench(tmp, good_md, good_origin)
     print(f"selftest ok: 2 clean skills pass, {len(cases) + 1} planted defects refused, install-set validated")
 

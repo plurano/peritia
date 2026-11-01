@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
+from dataclasses import dataclass
 import io
 import json
 import os
@@ -51,7 +52,7 @@ HISS_FINDING = re.compile(
     r'^\s*\[(?P<rule>[^\]]+)\]\s+(?P<path>\S+?):\d+',
     re.M
 )
-THREAD_HEADER = re.compile(r'^#?\s*threads:\s*(.+)\Z', re.I)
+THREAD_HEADER = re.compile(r'^#?\s*threads:\s*(.+)\Z', re.IGNORECASE)
 THREAD_ID = re.compile(r'^[A-Za-z0-9_-]+\Z')
 
 
@@ -131,7 +132,7 @@ def safe_path(raw):
 
 def is_licence_name(name: str) -> bool:
     return (name in LICENSE_FILENAMES or
-            bool(re.fullmatch(r'(LICEN[SC]E|COPYING)(?:\.[A-Za-z0-9_-]+)?', name, re.I)))
+            bool(re.fullmatch(r'(LICEN[SC]E|COPYING)(?:\.[A-Za-z0-9_-]+)?', name, re.IGNORECASE)))
 
 
 def checkout_for(checkouts, row, pin):
@@ -628,15 +629,22 @@ def build_notes(skill: Path, filter_notes: list[str], normalized: dict[str, list
     return '; '.join(notes)
 
 
-def run_gates(root, staging, skill, row, folder, pin, state, gate, hiss_gate):
+@dataclass(frozen=True)
+class GateOptions:
+    """Configured gate callbacks for staged skill validation."""
+    gate: object = None
+    hiss_gate: object = None
+
+
+def run_gates(root, staging, skill, row, folder, pin, state, gates: GateOptions):
     filter_notes, normalized, lic_note, fenced_files, patched = state
     dropped_md, dropped_hiss = {}, {}
     for step in range(8):
         try:
-            if gate:
-                gate(root, staging, skill)
-            if hiss_gate:
-                hiss_gate(root, staging, skill)
+            if gates.gate:
+                gates.gate(root, staging, skill)
+            if gates.hiss_gate:
+                gates.hiss_gate(root, staging, skill)
             break
         except Refused as error:
             msg = str(error)
@@ -967,7 +975,7 @@ def evaluate(row, grouped, order, pins, checkouts, root, staging, occupied, appl
         pin = pins[row['source']]
         skill, year, folder, state = stage_one(
             row, pin, checkouts, root, staging, occupied, apply, reader)
-        run_gates(root, staging, skill, row, folder, pin, state, gate, hiss_gate)
+        run_gates(root, staging, skill, row, folder, pin, state, GateOptions(gate=gate, hiss_gate=hiss_gate))
         # A future gate fixer must preserve the checker contract too.
         problems = check_skills.skill_problems(skill)
         if problems:

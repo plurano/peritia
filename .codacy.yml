@@ -1,0 +1,24 @@
+---
+# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
+# SPDX-License-Identifier: EUPL-1.2
+# Codacy reads this file from the default branch for every analysis, and a pull request's
+# changes to it apply to that pull request's analysis too
+# (https://docs.codacy.com/repositories-configure/codacy-configuration-file/, read 2026-11-01).
+# Once it exists, ignored-files settings in the Codacy UI no longer apply: every exclusion
+# lives here, one narrow pattern per judged false positive, each naming its verdict.
+engines:
+  markdownlint:
+    exclude_paths:
+      # MD024 (no duplicate headings): this repository lints Markdown with
+      # tools/markdownlint/markdownlint-cli2.yaml, where MD024 is siblings_only: true, so a
+      # heading repeated under a different parent is the declared style. The adopted reference
+      # guides repeat section names such as checklists and examples under each topic (28
+      # findings on pull request 27). The repository's own Markdown gate still lints these files.
+      # Verdict: FACT peritia-decided-codacy-trial-verdict-27-md024.
+      - "skills/*/reference/**"
+  agentlinter:
+    exclude_paths:
+      # skill-safety dangerous-commands: the XSS prevention guide names eval(), new Function()
+      # and 'unsafe-eval' as patterns a reviewer refuses (5 findings on pull request 27); the
+      # guide runs nothing. Verdict: FACT peritia-decided-codacy-trial-verdict-27-xss-eval.
+      - "skills/code-review-skill/reference/cross-cutting/xss-prevention.md"

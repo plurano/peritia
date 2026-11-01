@@ -1,9 +1,15 @@
 # SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
 # SPDX-License-Identifier: EUPL-1.2
-# threads: PRRT_kwDOVLPOVM6yVpUJ
+# threads: PRRT_kwDOVLPOVM6yVpUJ, PRRT_kwDOVLPOVM6yVpUI
 --- a/SKILL.md
 +++ b/SKILL.md
-@@ -113,7 +113,7 @@ Before diving into code, understand:
+@@ -15,4 +15,5 @@ allowed-tools:
+   - Glob
+   - Bash
+   - WebFetch
++author: awesome-skills
+ ---
+@@ -113,7 +114,7 @@ Before diving into code, understand:
  ### Phase 2: High-Level Review (5-10 minutes)
  
  1. **Architecture & Design** - Does the solution fit the problem?
@@ -12,7 +18,7 @@
     - Check: SOLID principles, coupling/cohesion, anti-patterns
  2. **Performance Assessment** - Are there performance concerns?
     - For performance-critical code, consult [Performance Review Guide](reference/performance-review-guide.md)
-@@ -145,7 +145,7 @@ For each file, check:
+@@ -145,7 +146,7 @@ For each file, check:
  
  ### Technique 1: The Checklist Method
  
@@ -21,7 +27,7 @@
  
  ### Technique 2: The Question Approach
  
-@@ -193,7 +193,7 @@ Use labels to indicate priority:
+@@ -193,7 +194,7 @@ Use labels to indicate priority:
  | **React** | [React Guide](reference/react.md) | Hooks, useEffect, React 19 Actions, RSC, Suspense, TanStack Query v5 |
  | **Vue 3** | [Vue Guide](reference/vue.md) | Composition API, 响应性系统, Props/Emits, Watchers, Composables |
  | **Angular 17+** | [Angular Guide](reference/angular.md) | Signals, Standalone, RxJS, Zoneless, 模板优化, 测试, 路由守卫, HttpInterceptor |
@@ -30,7 +36,7 @@
  | **TypeScript** | [TypeScript Guide](reference/typescript.md) | 类型安全, async/await, 不可变性, 测试, 模块解析, TS 5.x |
  | **Python** | [Python Guide](reference/python.md) | 可变默认参数, 异常处理, 类属性 |
  | **Django / DRF** | [Django Guide](reference/django.md) | 安全审查, N+1 查询, Serializer 反模式, ViewSet, 异步视图 |
-@@ -204,7 +204,7 @@ Use labels to indicate priority:
+@@ -204,7 +205,7 @@ Use labels to indicate priority:
  | **Ruby / Rails** | [Ruby Guide](reference/ruby.md) | Ruby semantics, Rails 8, Active Record, Active Job, security, testing |
  | **C# / .NET** | [C# Guide](reference/csharp.md) | C# 12 特性, 异步编程, EF Core 性能, ASP.NET Core, LINQ |
  | **Go** | [Go Guide](reference/go.md) | 错误处理, goroutine/channel, context, 接口设计 |
@@ -39,10 +45,10 @@
  | **Swift / SwiftUI** | [Swift Guide](reference/swift.md) | Optionals, Swift Concurrency, Sendable/actors, SwiftUI property wrappers, value vs reference types, API design |
  | **Dart / Flutter** | [Dart Guide](reference/dart.md) | Widget rebuilds, const constructors, null safety, isolates, async in build, Riverpod/Bloc, platform channels, keys, disposal |
  | **NestJS** | [NestJS Guide](reference/nestjs.md) | 依赖注入, 分层架构, DTO 验证, Guard/Interceptor, 循环依赖 |
-@@ -221,19 +221,19 @@ Language-agnostic patterns applicable to all code reviews:
+@@ -221,19 +222,19 @@ Language-agnostic patterns applicable to all code reviews:
  
  | Topic | Reference File | Key Topics |
- | ------- | ---------------- | ------------ |
+ |-------|----------------|------------|
 -| **Architecture Review** | [Architecture Review Guide](reference/architecture-review-guide.md) | SOLID, anti-patterns, coupling/cohesion, dependency direction |
 +| **Architecture Review** | [Architecture Review Guide](https://github.com/awesome-skills/code-review-skill/blob/4850184dfd7765ea7b3c5c4e9b6cf8e0815ee7cb/reference/architecture-review-guide.md) | SOLID, anti-patterns, coupling/cohesion, dependency direction |
  | **Performance Review** | [Performance Review Guide](reference/performance-review-guide.md) | Web Vitals, N+1, algorithm complexity, memory leaks, caching |

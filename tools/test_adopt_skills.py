@@ -724,9 +724,12 @@ class AdoptionTests(unittest.TestCase):
         outside.write_text('# Outside\n', encoding='utf-8')
         (folder / 'link.md').symlink_to(outside)
         script = REPO / 'tools/markdownlint/normalize.mjs'
+        node_bin = shutil.which('node')
+        if not node_bin:
+            self.fail('node executable not found on PATH')
         for bad in (str(outside), '../outside.md', 'link.md'):
-            proc = subprocess.run(['node', str(script), bad], cwd=folder, stdout=subprocess.PIPE,
-                                  stderr=subprocess.PIPE, check=False, timeout=60)
+            proc = subprocess.run([node_bin, str(script), bad], cwd=folder, capture_output=True,
+                                  check=False, timeout=60)
             self.assertNotEqual(proc.returncode, 0, bad)
             self.assertIn(b'refusing Markdown input', proc.stderr, (bad, proc.stderr[:300]))
         self.assertEqual(outside.read_text(encoding='utf-8'), '# Outside\n')
@@ -795,10 +798,13 @@ class AdoptionTests(unittest.TestCase):
         fenced_upstream = self.base / 'fenced-upstream.md'
         fenced_text, _ = adopt.rewrite_fences(unnormalized_ref)
         fenced_upstream.write_text(fenced_text, encoding='utf-8')
+        git_bin = shutil.which('git')
+        if not git_bin:
+            self.fail('git executable not found on PATH')
         diff_proc = subprocess.run(
-            ['git', 'diff', '--no-index', '-w', '--ignore-blank-lines',
+            [git_bin, 'diff', '--no-index', '-w', '--ignore-blank-lines',
              str(fenced_upstream), str(skill / 'reference/guide.md')],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+            capture_output=True, check=False,
         )
         self.assertEqual(diff_proc.returncode, 0, diff_proc.stdout.decode('utf-8', errors='replace'))
         self.assertEqual(diff_proc.stdout, b'')
