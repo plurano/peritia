@@ -40,7 +40,7 @@ bgpt-paper-search	K-Dense-AI/scientific-agent-skills
 brain-to-docs	sickn33/agentic-awesome-skills	docs-writing;planning-fleet-mgmt	other	126
 brand-voice	affaan-m/ecc			
 brendangregg-use-tsa	thecsdoctor/brendangregg-use-tsa-skill			
-brooks-review	hyhmrright/brooks-lint			
+brooks-review	hyhmrright/brooks-lint			106
 browser-extension-launch	sickn33/agentic-awesome-skills			
 business-continuity	sickn33/agentic-awesome-skills			
 buywhere-product-catalog	sickn33/agentic-awesome-skills			
@@ -48,6 +48,7 @@ carrier-relationship-management	affaan-m/ecc	research;planning-fleet-mgmt	other	
 cellprofiler	K-Dense-AI/scientific-agent-skills			
 change-impact	affaan-m/ecc			
 cisco-ios-patterns	affaan-m/ecc	review-audit	kubernetes-hosts-networking	47
+code-review-skill	awesome-skills/code-review-skill	review-audit	other	106
 codebase-recon	yujiachen-y/codebase-recon-skill			
 codex-subagent	sickn33/agentic-awesome-skills	coding;review-audit;testing	other	110
 compile-knowledge	sickn33/agentic-awesome-skills	docs-writing;research	other	48

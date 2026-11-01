@@ -1,0 +1,16 @@
+# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
+# SPDX-License-Identifier: EUPL-1.2
+# threads: PRRT_kwDOVLPOVM6yVs7X
+--- a/reference/zig.md
++++ b/reference/zig.md
+@@ -35,7 +35,9 @@ fn readNamesBad() ![][]const u8 {
+ 
+ // ✅ Good: caller chooses allocator and owns the returned memory.
+ fn readNames(allocator: std.mem.Allocator) ![][]const u8 {
+-    return try allocator.alloc([]const u8, 10);
++    const names = try allocator.alloc([]const u8, 10);
++    @memset(names, "");
++    return names;
+ }
+ ```
+ 

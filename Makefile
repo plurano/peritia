@@ -35,6 +35,7 @@ tools:
 # carries a licence (REUSE). The selftest plants one defect per rule and must see each refused.
 test: tools build
 	@$(BIN)/python -B tools/check_skills.py selftest
+	@node --test tools/markdownlint/test_normalize.mjs
 	@python3 -B tools/install_user_skills.py selftest
 	@$(BIN)/python -B tools/test_census.py
 	@$(BIN)/python -B tools/test_classify.py

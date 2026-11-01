@@ -68,6 +68,97 @@ class CheckSkillsIndexTests(unittest.TestCase):
         problems = check_skills.index_problems(self.root)
         self.assertTrue(any("duplicate row for alpha" in p for p in problems), problems)
 
+    def test_workbench_and_agent_control_files_refused(self):
+        alpha = self.root / "skills" / "alpha"
+        (alpha / ".hive").mkdir()
+        (alpha / ".hive" / "PROTOCOL.md").write_text("# Protocol\n", encoding="utf-8")
+        problems = check_skills.skill_problems(alpha)
+        self.assertTrue(any("alpha/.hive/PROTOCOL.md" in p for p in problems), problems)
+        (alpha / ".hive" / "PROTOCOL.md").unlink()
+        (alpha / ".hive").rmdir()
+        self.assertEqual(check_skills.skill_problems(alpha), [])
+
+        (alpha / "notes.md").write_text("Prose mentioning .hive and PROTOCOL.md stays valid.\n", encoding="utf-8")
+        self.assertEqual(check_skills.skill_problems(alpha), [])
+
+    def test_dangling_skill_md_link_refused(self):
+        alpha = self.root / "skills" / "alpha"
+        (alpha / "SKILL.md").write_text(
+            MD.format(name="alpha") + "\nSee [Guide](reference/missing.md) and [Present](notes.md).\n",
+            encoding="utf-8",
+        )
+        (alpha / "notes.md").write_text("# Present\n", encoding="utf-8")
+        problems = check_skills.skill_problems(alpha)
+        self.assertTrue(any("links to missing file reference/missing.md" in p for p in problems), problems)
+        self.assertFalse(any("notes.md" in p for p in problems), problems)
+
+    def test_planted_tilde_fence_containing_backtick_fence(self):
+        alpha = self.root / "skills" / "alpha"
+        (alpha / "SKILL.md").write_text(
+            MD.format(name="alpha")
+            + "\n~~~\n```\n[Inside](reference/inside-tilde.md)\n~~~\n"
+            + "See [After](reference/after-tilde.md).\n",
+            encoding="utf-8",
+        )
+        problems = check_skills.skill_problems(alpha)
+        self.assertFalse(any("inside-tilde.md" in p for p in problems), problems)
+        self.assertTrue(any("links to missing file reference/after-tilde.md" in p for p in problems), problems)
+
+    def test_planted_quad_fence_containing_triple_python_fence(self):
+        alpha = self.root / "skills" / "alpha"
+        (alpha / "SKILL.md").write_text(
+            MD.format(name="alpha")
+            + "\n````markdown\n```python\n[Inside](reference/inside-quad.md)\n````\n"
+            + "See [After](reference/after-quad.md).\n",
+            encoding="utf-8",
+        )
+        problems = check_skills.skill_problems(alpha)
+        self.assertFalse(any("inside-quad.md" in p for p in problems), problems)
+        self.assertTrue(any("links to missing file reference/after-quad.md" in p for p in problems), problems)
+
+    def test_top_level_four_space_backticks_is_no_fence_and_link_after_checked(self):
+        alpha = self.root / "skills" / "alpha"
+        (alpha / "SKILL.md").write_text(
+            MD.format(name="alpha")
+            + "\n    ```\n[Missing](reference/missing.md)\n",
+            encoding="utf-8",
+        )
+        problems = check_skills.skill_problems(alpha)
+        self.assertTrue(any("links to missing file reference/missing.md" in p for p in problems), problems)
+
+    def test_nested_list_four_space_fence_skips_link_inside(self):
+        alpha = self.root / "skills" / "alpha"
+        (alpha / "SKILL.md").write_text(
+            MD.format(name="alpha")
+            + "\n* item\n    ```\n    [Inside](reference/inside.md)\n    ```\nSee [After](reference/after.md).\n",
+            encoding="utf-8",
+        )
+        problems = check_skills.skill_problems(alpha)
+        self.assertFalse(any("inside.md" in p for p in problems), problems)
+        self.assertTrue(any("links to missing file reference/after.md" in p for p in problems), problems)
+
+    def test_tilde_fence_skips_link_inside(self):
+        alpha = self.root / "skills" / "alpha"
+        (alpha / "SKILL.md").write_text(
+            MD.format(name="alpha")
+            + "\n~~~\n[Inside](reference/inside.md)\n~~~\nSee [After](reference/after.md).\n",
+            encoding="utf-8",
+        )
+        problems = check_skills.skill_problems(alpha)
+        self.assertFalse(any("inside.md" in p for p in problems), problems)
+        self.assertTrue(any("links to missing file reference/after.md" in p for p in problems), problems)
+
+    def test_unclosed_fence_runs_to_end_and_skips_links(self):
+        alpha = self.root / "skills" / "alpha"
+        (alpha / "SKILL.md").write_text(
+            MD.format(name="alpha")
+            + "\n```\n[Inside](reference/inside.md)\n[Still Inside](reference/still-inside.md)\n",
+            encoding="utf-8",
+        )
+        problems = check_skills.skill_problems(alpha)
+        self.assertFalse(any("inside.md" in p for p in problems), problems)
+        self.assertFalse(any("still-inside.md" in p for p in problems), problems)
+
 
 if __name__ == "__main__":
     unittest.main()

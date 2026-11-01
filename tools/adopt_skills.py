@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
+from dataclasses import dataclass
 import io
 import json
 import os
@@ -51,6 +52,8 @@ HISS_FINDING = re.compile(
     r'^\s*\[(?P<rule>[^\]]+)\]\s+(?P<path>\S+?):\d+',
     re.M
 )
+THREAD_HEADER = re.compile(r'^#?\s*threads:\s*(.+)\Z', re.IGNORECASE)
+THREAD_ID = re.compile(r'^[A-Za-z0-9_-]+\Z')
 
 
 class Refused(ValueError):
@@ -127,6 +130,11 @@ def safe_path(raw):
     return path
 
 
+def is_licence_name(name: str) -> bool:
+    return (name in LICENSE_FILENAMES or
+            bool(re.fullmatch(r'(LICEN[SC]E|COPYING)(?:\.[A-Za-z0-9_-]+)?', name, re.IGNORECASE)))
+
+
 def checkout_for(checkouts, row, pin):
     source = row['source']
     if not REPOSITORY.fullmatch(source):
@@ -137,6 +145,8 @@ def checkout_for(checkouts, row, pin):
     checkout = checkouts / source.replace('/', '__')
     if checkout.is_symlink() or checkout.resolve().parent != checkouts.resolve():
         raise Refused('checkout-outside-folder')
+    if not (checkout / '.git').exists():
+        raise Refused('missing-git-checkout')
     if git(checkout, 'rev-parse', 'HEAD').decode().strip() != pin:
         raise Refused('checkout-pin-mismatch')
     if git(checkout, 'status', '--porcelain', '--untracked-files=all'):
@@ -162,6 +172,28 @@ def tree_files(checkout, pin, folder, recursive=True):
     return entries
 
 
+def filter_entries(entries, folder):
+    root_skill = str(folder) == '.'
+    kept, furniture, workbench = [], [], []
+    for entry in entries[:MAX_ROWS]:
+        path = entry[0]
+        if root_skill and len(path.parts) == 1:
+            if path.name == 'SKILL.md' or is_licence_name(path.name):
+                kept.append(entry)
+            else:
+                furniture.append(str(path))
+        elif any(part.startswith('.') for part in path.parts) or path.name.lower() in check_skills.AGENT_CONTROL_FILES:
+            workbench.append(str(path))
+        else:
+            kept.append(entry)
+    notes = []
+    if furniture:
+        notes.append(f"omitted repository furniture ({', '.join(sorted(furniture))})")
+    if workbench and root_skill:
+        notes.append(f"omitted agent workbench files ({', '.join(sorted(workbench))})")
+    return kept, notes
+
+
 def validate_files(entries, allow_missing=False):
     if len(entries) > MAX_FILES:
         raise Refused('file-limit: more than 200 files')
@@ -181,8 +213,10 @@ def validate_files(entries, allow_missing=False):
 
 
 def expand_sparse(checkout, path, *, file=False):
+    if git(checkout, 'config', '--default', 'false', '--get', 'core.sparseCheckout').strip() != b'true':
+        return
     # Cone mode already includes root files; non-cone mode needs a literal pattern.
-    cone = git(checkout, 'config', '--get', 'core.sparseCheckoutCone').strip() == b'true'
+    cone = git(checkout, 'config', '--default', 'false', '--get', 'core.sparseCheckoutCone').strip() == b'true'
     if cone:
         git(checkout, 'sparse-checkout', 'add', '--', '.' if file else str(path), allow_fetch=True)
     else:
@@ -216,50 +250,33 @@ def copy_blobs(checkout, entries, destination, allow_fetch=False):
 
 def rewrite_fences(content: str) -> tuple[str, bool]:
     lines = content.splitlines(keepends=True)
-    out = []
-    in_fence = False
-    fence_char = None
-    fence_len = 0
+    tokens = check_skills.COMMONMARK.parse(content)
     changed = False
-
-    fence_re = re.compile(r'^([ \t]*)(`{3,}|~{3,})([^\n\r]*)([\r\n]*)$')
-
-    for line in lines:
-        m = fence_re.match(line)
-        if not in_fence:
-            if m:
-                indent, fence, rest, newline = m.groups()
-                info = rest.strip()
-                in_fence = True
-                fence_char = fence[0]
-                fence_len = len(fence)
-                if not info:
-                    out.append(f'{indent}{fence}text{newline}')
+    for token in tokens:
+        if token.type == 'fence' and not token.info.strip() and token.map:
+            idx = token.map[0]
+            line = lines[idx]
+            pos = line.find(token.markup)
+            if pos != -1:
+                indent = line[:pos]
+                newline = '\r\n' if line.endswith('\r\n') else ('\n' if line.endswith('\n') else '')
+                new_line = f'{indent}{token.markup}text{newline}'
+                if new_line != line:
+                    lines[idx] = new_line
                     changed = True
-                    continue
-            out.append(line)
-        else:
-            if m:
-                indent, fence, rest, newline = m.groups()
-                info = rest.strip()
-                if not info and fence[0] == fence_char and len(fence) >= fence_len:
-                    in_fence = False
-                    fence_char = None
-                    fence_len = 0
-            out.append(line)
-    return ''.join(out), changed
+    return ''.join(lines), changed
 
 
-def rewrite_skill_fences(skill: Path) -> bool:
-    any_changed = False
-    for path in sorted(skill.rglob('*')):
+def rewrite_skill_fences(skill: Path) -> set[str]:
+    changed_files: set[str] = set()
+    for path in sorted(skill.rglob('*'))[:MAX_ROWS]:
         if path.is_file() and path.name != 'ORIGIN.md' and path.suffix.lower() in MARKDOWN_EXTENSIONS:
             text = path.read_text(encoding='utf-8')
             new_text, changed = rewrite_fences(text)
             if changed:
                 path.write_text(new_text, encoding='utf-8')
-                any_changed = True
-    return any_changed
+                changed_files.add(path.relative_to(skill).as_posix())
+    return changed_files
 
 
 default_reader = LiveReader().gh_json
@@ -435,24 +452,232 @@ def hiss_gate(root, staging, skill):
         raise Refused('hiss')
 
 
-def stage_one(row, pin, checkouts, staging, occupied, apply, reader):
+def drop_file(skill: Path, rel: str) -> None:
+    """Remove one staged file and the folders it leaves empty, bounded."""
+    target = skill / rel
+    target.unlink()
+    parent = target.parent
+    for _ in range(16):
+        if parent == skill or not parent.is_dir() or any(parent.iterdir()):
+            break
+        parent.rmdir()
+        parent = parent.parent
+
+
+def patch_threads(patch_text: str, rel: str) -> list[str]:
+    """Review thread ids named in the header lines before a patch's first diff line; a patch without any
+    is refused, so every content edit stays tied to the finding it answers."""
+    threads: list[str] = []
+    for line in patch_text.splitlines()[:MAX_ROWS]:
+        if line.startswith('--- '):
+            break
+        m = THREAD_HEADER.match(line.strip())
+        if m:
+            threads.extend(t.strip() for t in m.group(1).split(',')[:64] if t.strip())
+    if not threads or not all(THREAD_ID.fullmatch(t) for t in threads):
+        raise Refused(f'patch: {rel}')
+    return threads
+
+
+def apply_patch_text(text: str, patch_text: str, rel: str) -> tuple[str, list[str]]:
+    """Apply one unified diff to text with git apply (exact context, no fuzz) in a scratch folder and
+    return the result and the patch's thread ids; a patch that does not apply is refused by name."""
+    threads = patch_threads(patch_text, rel)
+    with tempfile.TemporaryDirectory(prefix='adopt-patch-') as tmp:
+        target = Path(tmp) / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding='utf-8')
+        try:
+            command(['git', 'apply', '--whitespace=nowarn', '-'], cwd=tmp, data=patch_text.encode('utf-8'))
+            return target.read_text(encoding='utf-8'), threads
+        except (Refused, OSError, UnicodeDecodeError, subprocess.SubprocessError) as error:
+            raise Refused(f'patch: {rel}') from error
+
+
+def apply_skill_patches(skill: Path, patch_dir: Path | None) -> dict[str, list[str]]:
+    if patch_dir is None or not patch_dir.exists():
+        return {}
+    if patch_dir.is_symlink() or not patch_dir.is_dir():
+        raise Refused(f'patch: {skill.name}')
+    patched: dict[str, list[str]] = {}
+    for entry in sorted(patch_dir.rglob('*'))[:MAX_ROWS]:
+        rel_entry = entry.relative_to(patch_dir).as_posix()
+        if entry.is_symlink():
+            raise Refused(f'patch: {rel_entry}')
+        if entry.is_dir():
+            continue
+        if not rel_entry.endswith('.patch'):
+            raise Refused(f'patch: {rel_entry}')
+        rel = str(safe_path(rel_entry.removesuffix('.patch')))
+        target = skill / rel
+        if not target.is_file():
+            raise Refused(f'patch: {rel}')
+        try:
+            src_text = target.read_text(encoding='utf-8')
+            patch_text = entry.read_text(encoding='utf-8')
+        except (OSError, UnicodeDecodeError) as error:
+            raise Refused(f'patch: {rel}') from error
+        new_text, threads = apply_patch_text(src_text, patch_text, rel)
+        target.write_text(new_text, encoding='utf-8')
+        patched[rel] = threads
+    return patched
+
+
+def _allowed_by_patch(rel: str, pin_text: str, norm_text: str, after: str, patch_dir: Path | None) -> bool:
+    if patch_dir is None or ''.join(pin_text.split()) != ''.join(norm_text.split()):
+        return False
+    patch_file = patch_dir / f'{rel}.patch'
+    if patch_file.is_symlink() or not patch_file.is_file():
+        return False
+    try:
+        expected, _ = apply_patch_text(norm_text, patch_file.read_text(encoding='utf-8'), rel)
+    except (OSError, UnicodeDecodeError, Refused):
+        return False
+    return after == expected
+
+
+def whitespace_arbiter(skill: Path, before: dict[str, str], patch_dir: Path | None = None,
+                       normalized_pin: dict[str, str] | None = None) -> list[str]:
+    """Files the normalizer changed beyond whitespace (ruling peritia-code-review-skill-markdown-refinement-0013): each is
+    dropped unless a listed patch in patch_dir exists and the file equals normalized-pin plus that patch."""
+    dropped = []
+    norm_map = normalized_pin if normalized_pin is not None else before
+    for rel, text in sorted(before.items())[:MAX_FILES]:
+        target = skill / rel
+        after = target.read_text(encoding='utf-8') if target.is_file() else ''
+        if ''.join(text.split()) == ''.join(after.split()):
+            continue
+        if _allowed_by_patch(rel, text, norm_map.get(rel, text), after, patch_dir):
+            continue
+        drop_file(skill, rel)
+        dropped.append(rel)
+    return dropped
+
+
+def normalize_skill_markdown(root: Path, skill: Path) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+    tool_dir = root / 'tools/markdownlint' if root is not None else Path(__file__).resolve().parent / 'markdownlint'
+    if not tool_dir.exists():
+        tool_dir = Path(__file__).resolve().parent / 'markdownlint'
+    script = tool_dir / 'normalize.mjs'
+    if not script.is_file():
+        raise Refused('markdown-normalize')
+    patch_dir = (root / 'tools/skill-patches' / skill.name) if root is not None else None
+    files = [
+        path.relative_to(skill).as_posix()
+        for path in sorted(skill.rglob('*'))[:MAX_ROWS]
+        if path.is_file() and path.name != 'ORIGIN.md' and path.suffix.lower() in MARKDOWN_EXTENSIONS
+    ]
+    if len(files) > MAX_FILES:
+        raise Refused('file-limit: more than 200 files')
+    if not files:
+        patched = apply_skill_patches(skill, patch_dir)
+        return {}, patched
+    before = {rel: (skill / rel).read_text(encoding='utf-8') for rel in files}
+    try:
+        raw = command(['node', str(script), *files], cwd=skill, timeout=TIMEOUT)
+        parsed = json.loads(raw.decode('utf-8'))
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        raise Refused('markdown-normalize') from error
+    if not isinstance(parsed, dict):
+        raise Refused('markdown-normalize')
+    normalized = {str(k): [str(r) for r in v] for k, v in parsed.items() if isinstance(v, list) and v}
+    normalized_pin = {rel: (skill / rel).read_text(encoding='utf-8') for rel in files}
+    patched = apply_skill_patches(skill, patch_dir)
+    for rel in whitespace_arbiter(skill, before, patch_dir=patch_dir, normalized_pin=normalized_pin):
+        normalized[rel] = ['changed beyond whitespace, omitted']
+    return normalized, patched
+
+
+def drop_gate_refused(skill: Path, message: str, dropped: dict[str, str]) -> bool:
+    pairs = re.findall(r'([A-Za-z0-9_,\s-]+) in (\S+)', message)
+    if not pairs:
+        return False
+    for rules, relpath in pairs[:MAX_FILES]:
+        rel = relpath.rstrip(';')
+        if rel == 'SKILL.md':
+            return False
+        if not (skill / rel).is_file():
+            return False
+        drop_file(skill, rel)
+        dropped[rel] = rules.strip()
+    return True
+
+
+def build_notes(skill: Path, filter_notes: list[str], normalized: dict[str, list[str]],
+                dropped_md: dict[str, str], dropped_hiss: dict[str, str], lic_note: str,
+                patched: dict[str, list[str]] | None = None) -> str:
+    notes = list(filter_notes)
+    active_norm = {rel: rules for rel, rules in sorted(normalized.items()) if (skill / rel).is_file()}
+    beyond = sorted(rel for rel, rules in normalized.items() if rules == ['changed beyond whitespace, omitted'])
+    if beyond:
+        notes.append(f"omitted files the whitespace normalizer would change beyond whitespace ({', '.join(beyond)})")
+    if active_norm:
+        items = ', '.join(f"{rel} ({', '.join(rules)})" for rel, rules in active_norm.items())
+        notes.append(f'normalized Markdown whitespace ({items})')
+    active_patched = {rel: threads for rel, threads in sorted((patched or {}).items()) if (skill / rel).is_file()}
+    if active_patched:
+        items = ', '.join(f"{rel} ({', '.join(threads)})" for rel, threads in active_patched.items())
+        notes.append(f'applied review patches ({items})')
+    if dropped_md:
+        items = ', '.join(f'{f} ({r})' for f, r in sorted(dropped_md.items()))
+        notes.append(f'omitted files refused by markdown gate ({items})')
+    if dropped_hiss:
+        items = ', '.join(f'{f} ({r})' for f, r in sorted(dropped_hiss.items()))
+        notes.append(f'omitted files refused by HISS gate ({items})')
+    if lic_note:
+        notes.append(lic_note)
+    return '; '.join(notes)
+
+
+@dataclass(frozen=True)
+class GateOptions:
+    """Configured gate callbacks for staged skill validation."""
+    gate: object = None
+    hiss_gate: object = None
+
+
+def run_gates(root, staging, skill, row, folder, pin, state, gates: GateOptions):
+    filter_notes, normalized, lic_note, fenced_files, patched = state
+    dropped_md, dropped_hiss = {}, {}
+    for step in range(8):
+        try:
+            if gates.gate:
+                gates.gate(root, staging, skill)
+            if gates.hiss_gate:
+                gates.hiss_gate(root, staging, skill)
+            break
+        except Refused as error:
+            msg = str(error)
+            target_map = dropped_md if msg.startswith('markdown:') else dropped_hiss
+            if str(folder) != '.' or step == 7 or not drop_gate_refused(skill, msg, target_map):
+                raise
+            note = build_notes(skill, filter_notes, normalized, dropped_md, dropped_hiss, lic_note, patched=patched)
+            fence_changed = any((skill / rel).is_file() for rel in fenced_files)
+            attribution(skill, row, folder, pin, note, fence_changed=fence_changed)
+            git(staging, 'add', '-A', '--', 'skills')
+
+
+def stage_one(row, pin, checkouts, root, staging, occupied, apply, reader):
     checkout, folder = checkout_for(checkouts, row, pin)
     name = choose_name(row, occupied)
     if apply:
         expand_sparse(checkout, folder)
-    entries = tree_files(checkout, pin, folder)
+    raw_entries = tree_files(checkout, pin, folder)
+    entries, filter_notes = filter_entries(raw_entries, folder)
     validate_files(entries, allow_missing=not apply)
     skill = staging / 'skills' / name
     skill.mkdir(parents=True)
     copy_blobs(checkout, entries, skill, allow_fetch=not apply)
-    fence_changed = rewrite_skill_fences(skill)
-    note = licence_text(row, checkout, pin, skill, apply, reader)
-    attribution(skill, row, folder, pin, note, fence_changed=fence_changed)
+    fenced_files = rewrite_skill_fences(skill)
+    normalized, patched = normalize_skill_markdown(root, skill)
+    lic_note = licence_text(row, checkout, pin, skill, apply, reader)
+    note = build_notes(skill, filter_notes, normalized, {}, {}, lic_note, patched=patched)
+    attribution(skill, row, folder, pin, note, fence_changed=bool(fenced_files))
     problems = check_skills.skill_problems(skill)
     if problems:
         raise Refused('skill-check: ' + '; '.join(problems))
     year = git(checkout, 'show', '-s', '--format=%cs', pin).decode().strip()[:4]
-    return skill, year
+    return skill, year, folder, (filter_notes, normalized, lic_note, fenced_files, patched)
 
 
 def initial_metadata(root):
@@ -463,10 +688,13 @@ def initial_metadata(root):
 
 
 def add_metadata(reuse, credits, row, name, year):
-    annotation = ('\n[[annotations]]\n' + f'path = ["skills/{name}/**"]\n'
+    path_line = f'path = ["skills/{name}/**"]\n'
+    annotation = ('\n[[annotations]]\n' + path_line +
                   'precedence = "override"\n' +
                   f'SPDX-FileCopyrightText = {json.dumps(year + " " + row["source"].split("/")[0] + " and contributors")}\n' +
                   f'SPDX-License-Identifier = {json.dumps(row["licence"])}\n')
+    if path_line not in reuse:
+        reuse = reuse + annotation
     url = f'https://github.com/{row["source"]}'
     lines = credits.splitlines()
     found = False
@@ -480,7 +708,7 @@ def add_metadata(reuse, credits, row, name, year):
             break
     if not found:
         lines.append(f'| <{url}> | {row["licence"]} | `{name}` |')
-    return reuse + annotation, '\n'.join(lines) + '\n'
+    return reuse, '\n'.join(lines) + '\n'
 
 
 def report_text(rows):
@@ -744,11 +972,10 @@ def evaluate(row, grouped, order, pins, checkouts, root, staging, occupied, appl
                     return result, None, ''
         if len(occupied) >= check_skills.MAX_SKILLS:
             raise Refused('skill-count-limit')
-        skill, year = stage_one(row, pins[row['source']], checkouts, staging, occupied, apply, reader)
-        if gate:
-            gate(root, staging, skill)
-        if hiss_gate:
-            hiss_gate(root, staging, skill)
+        pin = pins[row['source']]
+        skill, year, folder, state = stage_one(
+            row, pin, checkouts, root, staging, occupied, apply, reader)
+        run_gates(root, staging, skill, row, folder, pin, state, GateOptions(gate=gate, hiss_gate=hiss_gate))
         # A future gate fixer must preserve the checker contract too.
         problems = check_skills.skill_problems(skill)
         if problems:

@@ -1668,3 +1668,9 @@ path = ["skills/sshepherd/**"]
 precedence = "override"
 SPDX-FileCopyrightText = "2026 sickn33 and contributors"
 SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["skills/code-review-skill/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 awesome-skills and contributors"
+SPDX-License-Identifier = "MIT"

@@ -12,6 +12,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+from markdown_it import MarkdownIt
 import yaml
 
 try:
@@ -19,10 +20,19 @@ try:
 except ImportError:
     from tools.install_user_skills import read_install_set
 
+COMMONMARK = MarkdownIt("commonmark")
 MAX_SKILLS = 5000  # bounds the directories read (HISS-02)
+MAX_SKILL_ENTRIES = 1000  # bounds the entries walked in one skill (HISS-02)
+AGENT_CONTROL_FILES = frozenset({
+    "protocol.md", "agents.md", "claude.md", "gemini.md",
+    ".cursorrules", ".windsurfrules", "copilot-instructions.md",
+})
 FRONT = re.compile(r"\A---\n(.*?)\n---\n", re.S)
 FIELD = re.compile(r"^(?P<key>[a-z_]+):\s*(?P<value>.+)$", re.M)
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
+INLINE_CODE = re.compile(r"`[^`]*`")
+MD_LINK = re.compile(r"(?<!!)\[[^\]]+\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
+CHECKED_LINK_SUFFIXES = (".md", ".markdown", ".mdx", ".py", ".sh", ".mjs", ".js", ".ts")
 # run-time installs and remote code: a skill must use the tools the project already pins
 FETCH = re.compile(r"\b(?:pip install|uv pip install|uvx |npx |npm install|pnpm add|yarn add|go install|cargo install|"
                    r"curl[^\n|]*\|\s*(?:ba)?sh|wget[^\n|]*\|\s*(?:ba)?sh)")
@@ -62,6 +72,46 @@ def front_matter_or_empty(text: str) -> dict[str, str]:
         return {}
 
 
+def _workbench_problems(skill: Path) -> list[str]:
+    entries: list[Path] = []
+    for i, entry in enumerate(skill.rglob("*")):
+        if i >= MAX_SKILL_ENTRIES:
+            return [f"{skill.name}: more than {MAX_SKILL_ENTRIES} entries"]
+        entries.append(entry)
+    out: list[str] = []
+    for entry in sorted(entries):
+        if entry.name.startswith(".") or (entry.is_file() and entry.name.lower() in AGENT_CONTROL_FILES):
+            rel = entry.relative_to(skill).as_posix()
+            out.append(f"{skill.name}/{rel}: agent workbench or agent-control content is not allowed")
+    return out
+
+
+def _skill_md_link_problems(skill: Path, text: str) -> list[str]:
+    out: list[str] = []
+    skill_root = skill.resolve()
+    tokens = COMMONMARK.parse(text)
+    skipped: set[int] = set()
+    for token in tokens:
+        if token.type in ("fence", "code_block") and token.map:
+            skipped.update(range(token.map[0], token.map[1]))
+
+    for lineno, line in enumerate(text.splitlines()[:MAX_SKILL_ENTRIES * 10], 1):
+        if (lineno - 1) in skipped:
+            continue
+        stripped = INLINE_CODE.sub("", line)
+        for match in MD_LINK.finditer(stripped):
+            target = match.group(1).strip("<>")
+            path_part = target.split("#", 1)[0].split("?", 1)[0]
+            if not path_part or ":" in path_part or path_part.startswith(("/", "../")):
+                continue
+            if not path_part.lower().endswith(CHECKED_LINK_SUFFIXES):
+                continue
+            resolved = (skill / path_part).resolve()
+            if not resolved.is_file() or not resolved.is_relative_to(skill_root):
+                out.append(f"{skill.name}/SKILL.md:{lineno}: links to missing file {path_part}")
+    return out
+
+
 def skill_problems(skill):
     """Problems of one skill directory, each naming the file and the rule."""
     out = []
@@ -81,6 +131,8 @@ def skill_problems(skill):
     for n, line in enumerate(text.splitlines(), 1):
         if FETCH.search(line):
             out.append(f"{skill.name}/SKILL.md:{n}: installs or fetches code at run time")
+    out.extend(_skill_md_link_problems(skill, text))
+    out.extend(_workbench_problems(skill))
     if not origin.is_file():
         return out + [f"{skill.name}: ORIGIN.md missing"]
     rec = fields(origin.read_text(encoding="utf-8"))
@@ -239,13 +291,55 @@ def _selftest_cases(tmp, good_md, good_origin):
         "installs": (good_md.format(n="installs") + "\n    uv pip install numpy==2.5.3\n", good_origin, True, "installs or fetches"),
         "empty-desc": ("---\nname: empty-desc\ndescription: >\n---\n\n# x\n", good_origin, True, "needs a description"),
         "bad-yaml": ("---\nname: [\n---\n\n# x\n", good_origin, True, "not valid YAML"),
+        "dangling-link": (good_md.format(n="dangling-link") + "\nSee [Guide](reference/missing.md).\n", good_origin, True, "links to missing file reference/missing.md"),
+        "tilde-fence-link": (
+            good_md.format(n="tilde-fence-link")
+            + "\n~~~\n```\n[Inside](reference/inside-tilde.md)\n~~~\nSee [After](reference/after-tilde.md).\n",
+            good_origin, True, "links to missing file reference/after-tilde.md",
+        ),
+        "quad-fence-link": (
+            good_md.format(n="quad-fence-link")
+            + "\n````markdown\n```python\n[Inside](reference/inside-quad.md)\n````\nSee [After](reference/after-quad.md).\n",
+            good_origin, True, "links to missing file reference/after-quad.md",
+        ),
+        "indented-backtick-link": (
+            good_md.format(n="indented-backtick-link")
+            + "\n    ```\n[After](reference/after-indented.md)\n",
+            good_origin, True, "links to missing file reference/after-indented.md",
+        ),
     }
     for name, (md, origin, licence, want) in cases.items():
         planted = tmp / name
         write(planted, name, md, origin, licence)
         problems = skill_problems(planted / "skills" / name)
-        assert any(want in p for p in problems), (name, problems)
-    print(f"selftest ok: 2 clean skills pass, {len(cases)} planted defects refused, install-set validated")
+        if not (any(want in p for p in problems) and not any("inside-" in p for p in problems)):
+            raise AssertionError((name, problems))
+    _selftest_workbench(tmp, good_md, good_origin)
+    print(f"selftest ok: 2 clean skills pass, {len(cases) + 1} planted defects refused, install-set validated")
+
+
+def _selftest_workbench(tmp, good_md, good_origin):
+    hive_root = tmp / "hive-protocol"
+    write(hive_root, "hive-protocol", good_md.format(n="hive-protocol"), good_origin)
+    hive_skill = hive_root / "skills" / "hive-protocol"
+    (hive_skill / ".hive").mkdir()
+    (hive_skill / ".hive" / "PROTOCOL.md").write_text("# Protocol\n", encoding="utf-8")
+    problems = skill_problems(hive_skill)
+    if not any(".hive/PROTOCOL.md" in p for p in problems):
+        raise AssertionError(f"planted .hive/PROTOCOL.md not refused: {problems}")
+    (hive_skill / ".hive" / "PROTOCOL.md").unlink()
+    (hive_skill / ".hive").rmdir()
+    left = skill_problems(hive_skill)
+    if left:
+        raise AssertionError(f"skill without .hive still refused: {left}")
+
+    prose_root = tmp / "hive-prose"
+    prose_md = good_md.format(n="hive-prose") + "\nNever copy a .hive workbench folder.\n"
+    write(prose_root, "hive-prose", prose_md, good_origin)
+    (prose_root / "skills" / "hive-prose" / "notes.md").write_text("Mentions .hive in prose.\n", encoding="utf-8")
+    prose = skill_problems(prose_root / "skills" / "hive-prose")
+    if prose:
+        raise AssertionError(f"prose naming .hive refused: {prose}")
 
 
 if __name__ == "__main__":
