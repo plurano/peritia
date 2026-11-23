@@ -50,6 +50,7 @@ MAX_REPORTED_ERRORS = 16  # bounds the schema errors read from one document (HIS
 DONE = "done"
 BLOCKED = "blocked"
 EVIDENCE_PREFIX = ".slot/out/evidence/"
+_FLEET_QUESTION_ID_PREFIX = re.compile(r"^[a-z0-9][a-z0-9._]*-[a-z0-9._-]*: ")
 
 
 class ContractError(ValueError):
@@ -390,9 +391,9 @@ def _missing_reasons(method: Method, receipt: Receipt) -> list[str]:
 
 
 def _question_body(question: str) -> str:
-    """Strip the kind and an immediately following fleet ID when present."""
+    """Strip the kind and an optional hyphenated fleet ID, preserving input labels."""
     text = question.partition(" ")[2]
-    return re.sub(r"^\S+: ", "", text, count=1)
+    return _FLEET_QUESTION_ID_PREFIX.sub("", text, count=1)
 
 
 def _claim_reasons(method: Method, receipt: Receipt) -> list[str]:

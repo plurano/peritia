@@ -491,10 +491,15 @@ class ReceiptTest(unittest.TestCase):
                 self._refused(document, "no question asks for missing input 'initial_soc'")
 
     def test_question_asks_for_the_missing_input_by_name(self) -> None:
-        """A sentence-final period and Epitrop lines without a fleet ID both work."""
+        """Questions can name the missing input in a sentence or as a leading label."""
         document = _blocked()
-        lines = ("DECISION cell-soc: supply initial_soc.", "ASK which initial_soc did the cycler log",
-                 "ASK which initial_soc: use the cycler log")
+        lines = (
+            "DECISION cell-soc: supply initial_soc.",
+            "ASK which initial_soc did the cycler log",
+            "ASK which initial_soc: use the cycler log",
+            "ASK initial_soc: which value did the cycler log",
+            "DECISION epitrop-unit-1-port: supply initial_soc",
+        )
         for line in lines:
             with self.subTest(line=line):
                 document["result"]["questions"] = [line]
