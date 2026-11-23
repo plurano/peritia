@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
 # SPDX-License-Identifier: EUPL-1.2
 """Typed reader for the Peritia method contract in contracts/method.schema.json.
@@ -238,7 +237,7 @@ def _checked_evidence(entries: Sequence[dict]) -> tuple[Evidence, ...]:
             raise ContractError(f"result: evidence {path!r} is not a clean relative path")
         if not path.startswith(EVIDENCE_PREFIX):
             raise ContractError(f"result: evidence {path!r} is not under {EVIDENCE_PREFIX}")
-        if type(lines) is not int:
+        if isinstance(lines, bool) or not isinstance(lines, int):
             raise ContractError(f"result: evidence {path!r} lines {lines} is not an integer")
         evidence.append(Evidence(path, item["sha256"], lines))
     return tuple(evidence)
