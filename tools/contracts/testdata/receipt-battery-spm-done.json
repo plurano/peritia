@@ -1,0 +1,29 @@
+{
+  "method": "battery-spm-constant-current",
+  "result": {
+    "unit": "peritia:battery-spm-reference",
+    "outcome": "done",
+    "head": "0123456789abcdef0123456789abcdef01234567",
+    "summary": "Ran the Chen2020 reference protocol and its convergence check.",
+    "evidence": [
+      {
+        "path": ".slot/out/evidence/protocol.json",
+        "sha256": "f4192386c7bf9ce3a388bf076a1a54767cc8c5b0b662f053b5dbb6e2273aad39",
+        "lines": 1
+      },
+      {
+        "path": ".slot/out/evidence/convergence.log",
+        "sha256": "eee1c630b939e0c9dac6cccee5dc6ec599a2fa494e45ec599264c24fd1f31771",
+        "lines": 3
+      }
+    ]
+  },
+  "inputs": [
+    { "name": "initial_soc", "value": 0.8, "unit": "1", "evidence": ".slot/out/evidence/protocol.json" },
+    { "name": "temperature", "value": 298.15, "unit": "K", "evidence": ".slot/out/evidence/protocol.json" },
+    { "name": "c_rate", "value": 0.5, "unit": "/h", "evidence": ".slot/out/evidence/protocol.json" },
+    { "name": "step_duration", "value": 600, "unit": "s", "evidence": ".slot/out/evidence/protocol.json" }
+  ],
+  "missing": [],
+  "verifier": { "outcome": "pass", "evidence": ".slot/out/evidence/convergence.log" }
+}

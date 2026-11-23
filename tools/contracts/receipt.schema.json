@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/plurano/peritia/tools/contracts/receipt.schema.json",
+  "title": "Peritia method receipt",
+  "description": "A method receipt binds one run of a method to an Epitrop slot result, which it carries unchanged. tools/method_contract.py adds the checks a schema cannot express.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["method", "result", "inputs", "missing", "verifier"],
+  "properties": {
+    "method": { "$ref": "https://github.com/plurano/peritia/tools/contracts/method.schema.json#/$defs/id" },
+    "result": {
+      "description": "The Epitrop slot result of the run, unchanged.",
+      "$ref": "https://github.com/tekmora/epitrop/internal/slot/result.schema.json"
+    },
+    "inputs": {
+      "description": "The values the run used, each with the evidence entry it was read from.",
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "value", "unit", "evidence"],
+        "properties": {
+          "name": { "$ref": "https://github.com/plurano/peritia/tools/contracts/method.schema.json#/$defs/name" },
+          "value": { "type": "number" },
+          "unit": { "$ref": "https://github.com/plurano/peritia/tools/contracts/method.schema.json#/$defs/unit" },
+          "evidence": { "$ref": "https://github.com/plurano/peritia/tools/contracts/method.schema.json#/$defs/evidence_path" }
+        }
+      }
+    },
+    "missing": {
+      "description": "Inputs the run did not have. A missing value is asked for, never assumed.",
+      "type": "array",
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": { "$ref": "https://github.com/plurano/peritia/tools/contracts/method.schema.json#/$defs/name" }
+    },
+    "verifier": {
+      "description": "What the method's verifier said about this run. A verifier that ran names its log.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["outcome"],
+      "properties": {
+        "outcome": { "enum": ["pass", "fail", "not-run"] },
+        "evidence": { "$ref": "https://github.com/plurano/peritia/tools/contracts/method.schema.json#/$defs/evidence_path" }
+      },
+      "if": { "properties": { "outcome": { "enum": ["pass", "fail"] } } },
+      "then": { "required": ["evidence"] }
+    }
+  }
+}

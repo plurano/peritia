@@ -1,17 +1,24 @@
 # SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
 # SPDX-License-Identifier: EUPL-1.2
-"""Typed reader for the Peritia method contract in contracts/method.schema.json.
+"""Typed reader for the Peritia method and receipt contracts in tools/contracts/.
 
 A method definition states what one executable method computes, from which inputs in which units,
 under which model, with which exact tool version, where its result holds and how it is checked. A
-run's result is the Epitrop slot result, whose shape is Epitrop's own schema, vendored at the commit
-contracts/epitrop/vendor.json pins from https://github.com/tekmora/epitrop (EUPL-1.2).
+receipt binds one run of that method to the Epitrop slot result of that run and carries it unchanged.
+The result's shape is Epitrop's own schema, vendored at the commit contracts/epitrop/vendor.json pins
+from https://github.com/tekmora/epitrop (EUPL-1.2).
 
 The schemas decide shape. This module adds what a schema cannot state: each input is declared once,
-and a validity bound names a declared input and has min at most max. For results it mirrors Epitrop's
-done-needs-head rule, the checks on evidence path text, and the integer representation of evidence
-line counts. Epitrop's workspace policy covers the run's unit id, the 64 KiB result-file cap,
-symlinks, and evidence file checks.
+a validity bound names a declared input and has finite ends with min at most max, and input names a
+receipt refers to must be declared. For results it mirrors Epitrop's done-needs-head rule, the checks
+on evidence path text, and the integer representation of evidence line counts. Epitrop's workspace
+policy covers the run's unit id, the 64 KiB result-file cap, symlinks, and evidence file checks.
+A receipt claims done only with every required input, every value inside the validity domain and a
+passing verifier. A required input the run did not have makes it blocked, with a question naming it.
+The receipt reader checks that the result satisfies its document-level evidence rules and lists each
+cited path. It cannot prove that a cited file contains the stated input value or verifier outcome, or
+that an unlisted optional input was unused. Follow-up work will bind each input value and the verifier
+outcome to an evidence digest.
 Documents are parsed as strict UTF-8 JSON with finite numbers and unique keys.
 """
 from __future__ import annotations
@@ -21,6 +28,7 @@ import itertools
 import json
 import math
 import posixpath
+import re
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,12 +41,15 @@ from regress import Regex, RegressError
 
 CONTRACTS_DIR = Path(__file__).resolve().parent / "contracts"
 METHOD_SCHEMA_PATH = CONTRACTS_DIR / "method.schema.json"
+RECEIPT_SCHEMA_PATH = CONTRACTS_DIR / "receipt.schema.json"
 EPITROP_DIR = CONTRACTS_DIR / "epitrop"
 EPITROP_RESULT_SCHEMA_PATH = EPITROP_DIR / "result.schema.json"
 MAX_DOCUMENT_BYTES = 1 << 20  # a contract document is small; refuse anything larger
 MAX_REPORTED_ERRORS = 16  # bounds the schema errors read from one document (HISS-02)
 DONE = "done"
+BLOCKED = "blocked"
 EVIDENCE_PREFIX = ".slot/out/evidence/"
+_FLEET_QUESTION_ID_PREFIX = re.compile(r"^[a-z0-9][a-z0-9._]*-[a-z0-9._-]*: ")
 
 
 class ContractError(ValueError):
@@ -57,7 +68,12 @@ class Input:
 
 @dataclass(frozen=True)
 class Bound:
-    """Where a method's result holds for one input, in that input's unit, both ends inclusive."""
+    """Where a method's result holds for one input, in its unit, with inclusive ends.
+
+    Comparisons use IEEE 754 binary64 for decimal and exponent JSON tokens (RFC 8259,
+    section 6) and integers for integer tokens. For example, 0.80000000000000001 reads
+    as 0.8 and meets a 0.8 point bound.
+    """
 
     input: str
     min: float | None
@@ -110,6 +126,28 @@ class SlotResult:
     summary: str
     evidence: tuple[Evidence, ...]
     questions: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class InputValue:
+    """One value a run used, with the evidence entry it was read from."""
+
+    name: str
+    value: float
+    unit: str
+    evidence: str
+
+
+@dataclass(frozen=True)
+class Receipt:
+    """A typed method receipt: the run's slot result, its inputs and what its verifier said."""
+
+    method: str
+    result: SlotResult
+    inputs: tuple[InputValue, ...]
+    missing: tuple[str, ...]
+    verifier_outcome: str
+    verifier_evidence: str
 
 
 def _refuse_constant(name: str) -> float:
@@ -184,10 +222,10 @@ _ContractValidator = validators.extend(Draft202012Validator, validators={"patter
 
 @functools.cache
 def _validators() -> dict[str, Validator]:
-    """Compile the method and Epitrop result validators once, refusing a broken schema."""
+    """Compile the method, receipt and Epitrop result validators once, refusing a broken schema."""
     schemas = {}
     resources = []
-    for path in (METHOD_SCHEMA_PATH, EPITROP_RESULT_SCHEMA_PATH):
+    for path in (METHOD_SCHEMA_PATH, RECEIPT_SCHEMA_PATH, EPITROP_RESULT_SCHEMA_PATH):
         schema = read_document(path)
         if not isinstance(schema, dict):
             raise ContractError(f"{path}: not a JSON object")
@@ -203,15 +241,27 @@ def _validators() -> dict[str, Validator]:
     registry = Registry().with_resources(resources)
     return {
         "method": _ContractValidator(schemas[METHOD_SCHEMA_PATH], registry=registry),
+        "receipt": _ContractValidator(schemas[RECEIPT_SCHEMA_PATH], registry=registry),
         "result": _ContractValidator(schemas[EPITROP_RESULT_SCHEMA_PATH], registry=registry),
     }
+
+
+def _schema_reason(kind: str, document: object, error: ValidationError) -> str:
+    """Use the receipt's finite-number diagnostic when the schema refuses a boolean value."""
+    if kind == "receipt" and isinstance(error.instance, bool) and isinstance(document, dict):
+        match tuple(error.absolute_path):
+            case ("inputs", index, "value"):
+                name = document["inputs"][index].get("name")
+                if isinstance(name, str):
+                    return f"{error.json_path}: input {name!r} = {error.instance} is not a finite number"
+    return f"{error.json_path}: {error.message}"
 
 
 def _checked(kind: str, document: object) -> dict:
     """Return document once it passes the kind's schema; else raise ContractError naming each error."""
     try:
         errors = itertools.islice(_validators()[kind].iter_errors(document), MAX_REPORTED_ERRORS)
-        reasons = [f"{error.json_path}: {error.message}" for error in errors]
+        reasons = [_schema_reason(kind, document, error) for error in errors]
     except RecursionError as err:
         raise ContractError(f"{kind}: nested too deep") from err
     except (RegressError, UnicodeError) as err:
@@ -303,3 +353,95 @@ def result_from_document(document: object) -> SlotResult:
         evidence=_checked_evidence(checked.get("evidence", ())),
         questions=tuple(checked.get("questions", ())),
     )
+
+
+def _input_reasons(method: Method, inputs: tuple[InputValue, ...], evidence: set[str]) -> list[str]:
+    """Return why the receipt's input values do not fit the method's declared inputs."""
+    reasons = []
+    names = [value.name for value in inputs]
+    if len(set(names)) != len(names):
+        reasons.append("an input value is given twice")
+    for value in inputs:
+        declared = method.input(value.name)
+        if declared is None:
+            reasons.append(f"input {value.name!r} is not declared by method {method.id}")
+        elif value.unit != declared.unit:
+            reasons.append(f"input {value.name!r} is in {value.unit}, the method reads {declared.unit}")
+        if isinstance(value.value, float) and not math.isfinite(value.value):
+            reasons.append(f"input {value.name!r} = {value.value} is not a finite number")
+        if value.evidence not in evidence:
+            reasons.append(f"input {value.name!r} cites {value.evidence!r}, which the result does not list")
+    return reasons
+
+
+def _missing_reasons(method: Method, receipt: Receipt) -> list[str]:
+    """Return why the receipt's missing list does not account for the method's required inputs."""
+    reasons = []
+    supplied = {value.name for value in receipt.inputs}
+    for name in receipt.missing:
+        if method.input(name) is None:
+            reasons.append(f"missing input {name!r} is not declared by method {method.id}")
+        if name in supplied:
+            reasons.append(f"input {name!r} is both given and missing")
+    for item in method.inputs:
+        if item.required and item.name not in supplied and item.name not in receipt.missing:
+            reasons.append(f"required input {item.name!r} is neither given nor listed as missing")
+    return reasons
+
+
+def _question_body(question: str) -> str:
+    """Strip the kind and an optional hyphenated fleet ID, preserving input labels."""
+    text = question.partition(" ")[2]
+    return _FLEET_QUESTION_ID_PREFIX.sub("", text, count=1)
+
+
+def _claim_reasons(method: Method, receipt: Receipt) -> list[str]:
+    """Return why the receipt's outcome is not backed by its inputs and verifier."""
+    reasons = []
+    absent = [name for name in receipt.missing if (declared := method.input(name)) is not None and declared.required]
+    if absent and receipt.result.outcome != BLOCKED:
+        reasons.append(f"required inputs {absent} are missing, so the outcome must be blocked")
+    for name in absent:
+        asked = re.compile(rf"(?<![\w.]){re.escape(name)}(?!\w|\.\w)")
+        if not any(asked.search(_question_body(question)) for question in receipt.result.questions):
+            reasons.append(f"no question asks for missing input {name!r}")
+    if receipt.result.outcome != DONE:
+        return reasons
+    if receipt.verifier_outcome != "pass":
+        reasons.append(f"outcome done needs a passing verifier, it is {receipt.verifier_outcome}")
+    for value in receipt.inputs:
+        bound = next((item for item in method.validity_domain if item.input == value.name), None)
+        if bound is not None and not bound.holds(value.value):
+            reasons.append(f"input {value.name!r} = {value.value} lies outside the validity domain")
+    return reasons
+
+
+def receipt_from_document(document: object, method: Method) -> Receipt:
+    """Return the typed receipt a document states for method, or raise ContractError.
+
+    The reader enforces the result's document-level evidence rules and checks that every cited
+    path is listed in the result. It cannot prove that a cited file holds the stated input value
+    or verifier outcome, or that an unlisted optional input was unused. Follow-up work will bind
+    each input value and the verifier outcome to an evidence digest.
+    """
+    document = _checked("receipt", document)
+    result = result_from_document(document["result"])
+    verifier = document["verifier"]
+    receipt = Receipt(
+        method=document["method"],
+        result=result,
+        inputs=tuple(InputValue(**item) for item in document["inputs"]),
+        missing=tuple(document["missing"]),
+        verifier_outcome=verifier["outcome"],
+        verifier_evidence=verifier.get("evidence", ""),
+    )
+    evidence = {entry.path for entry in result.evidence}
+    reasons = [] if receipt.method == method.id else [f"receipt is for method {receipt.method}, not {method.id}"]
+    reasons += _input_reasons(method, receipt.inputs, evidence)
+    if receipt.verifier_evidence and receipt.verifier_evidence not in evidence:
+        reasons.append(f"verifier cites {receipt.verifier_evidence!r}, which the result does not list")
+    reasons += _missing_reasons(method, receipt)
+    reasons += _claim_reasons(method, receipt)
+    if reasons:
+        raise ContractError(f"receipt for {method.id}: " + "; ".join(reasons))
+    return receipt
