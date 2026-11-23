@@ -95,12 +95,12 @@
           "required": ["command", "acceptance"],
           "properties": {
             "command": {
-              "description": "The argument list, first item the program.",
+              "description": "The argument list starts with a non-empty program. Each item is at most 4096 characters.",
               "type": "array",
               "minItems": 1,
               "maxItems": 64,
-              "prefixItems": [{ "type": "string", "minLength": 1 }],
-              "items": { "type": "string" }
+              "prefixItems": [{ "type": "string", "minLength": 1, "maxLength": 4096 }],
+              "items": { "type": "string", "maxLength": 4096 }
             },
             "acceptance": { "$ref": "#/$defs/text" }
           }
