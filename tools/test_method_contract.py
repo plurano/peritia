@@ -56,7 +56,8 @@ def _done_document() -> dict:
 def _load(name: str) -> dict:
     """Return a fresh copy of one battery fixture document."""
     document = mc.read_document(TESTDATA / name)
-    assert isinstance(document, dict)
+    if not isinstance(document, dict):
+        raise AssertionError(f"battery fixture {name} must contain an object")
     return copy.deepcopy(document)
 
 
@@ -203,9 +204,8 @@ class MethodDefinitionTest(unittest.TestCase):
         validator.validate(_load("method-battery-spm.json"))
         for document, reason in ((None, "is not of type 'object'"), ({}, "'id' is a required property"),
                                  ({"owner": "x"}, "'owner' was unexpected")):
-            with self.subTest(document=document):
-                with self.assertRaisesRegex(ValidationError, reason):
-                    validator.validate(document)
+            with self.subTest(document=document), self.assertRaisesRegex(ValidationError, reason):
+                validator.validate(document)
 
     def test_patterns_refuse_a_trailing_newline(self) -> None:
         """Version, unit and input name accept clean text and report the path of a final newline."""
@@ -348,7 +348,7 @@ class SchemaTest(unittest.TestCase):
     def test_schema_failure_names_the_file(self) -> None:
         """Invalid schema syntax and missing IDs raise ContractError with the schema path."""
         schema = mc.read_document(mc.METHOD_SCHEMA_PATH)
-        assert isinstance(schema, dict)
+        self.assertIsInstance(schema, dict)
         invalid = dict(schema, type="invalid")
         missing_id = dict(schema)
         del missing_id["$id"]
