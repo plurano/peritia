@@ -274,6 +274,20 @@ class MethodDefinitionTest(unittest.TestCase):
                 with self.assertRaisesRegex(mc.ContractError, re.escape(path) + r": .* should be non-empty"):
                     mc.method_from_document(document)
 
+    def test_command_item_length_boundary(self) -> None:
+        """The program and later arguments allow 4096 characters and reject 4097."""
+        document = _load("method-battery-spm.json")
+        for index in range(2):
+            with self.subTest(index=index):
+                command = ["program", "argument"]
+                document["verifier"]["command"] = command
+                command[index] = "x" * 4096
+                self.assertEqual(mc.method_from_document(document).verifier_command, tuple(command))
+                command[index] += "x"
+                path = re.escape(f"$.verifier.command[{index}]")
+                with self.assertRaisesRegex(mc.ContractError, path + r": .* is too long"):
+                    mc.method_from_document(document)
+
     def test_refuses_schema_breaks(self) -> None:
         """Unknown fields and result classes, bounds with no end and missing inputs are refused."""
         breaks = {
