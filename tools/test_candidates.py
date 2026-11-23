@@ -126,13 +126,24 @@ class CandidatesTests(unittest.TestCase):
             folder = Path(tmp)
             checkouts = folder / "checkouts"
             write_skill(checkouts, "solo/repo", "skills/s4/SKILL.md", "---\nname: s4\n---\nbody\n")
-            census_p = write_census(folder, [{"source": "solo/repo", "path": "skills/s4/SKILL.md", "skill_name": "s4", "blob_id": "b4", "repository_license": "0BSD"}])
             class_p = write_classified(folder, [{"blob_id": "b4", "source": "solo/repo", "path": "skills/s4/SKILL.md", "skill_name": "s4", "functions": "testing", "domains": "reverse-engineering", "status": "ok"}])
             out = folder / "out.tsv"
-            res = candidates.run(census_p, class_p, checkouts, out, [], FakeGitHubReader())
-            row = res[0]
-            self.assertEqual((row.licence, row.licence_class, row.licence_evidence, row.verdict),
-                             ("0BSD", "permissive", "repository", "candidate"))
+            cases = (
+                ("0BSD", "permissive", "candidate", ""),
+                ("LGPL-3.0-only", "weak", "candidate", ""),
+                ("LGPL-3.0?", "weak", "refused", "licence:LGPL-3.0? evidence:repository"),
+            )
+            for spdx, licence_class, verdict, reason in cases:
+                with self.subTest(spdx=spdx):
+                    census_p = write_census(folder, [{
+                        "source": "solo/repo", "path": "skills/s4/SKILL.md", "skill_name": "s4",
+                        "blob_id": "b4", "repository_license": spdx,
+                    }])
+                    row, = candidates.run(census_p, class_p, checkouts, out, [], FakeGitHubReader())
+                    self.assertEqual(
+                        (row.licence, row.licence_class, row.licence_evidence, row.verdict, row.reason),
+                        (spdx, licence_class, "repository", verdict, reason),
+                    )
 
     def test_licence_path_weak(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

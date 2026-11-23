@@ -466,7 +466,8 @@ def decide_row(
         verdict, reason = "refused", filter_reason
     elif lic_res.verdict is not None:
         verdict, reason = lic_res.verdict, lic_res.reason
-    elif lic_cls in licence_policy.CANDIDATE_LICENCE_CLASSES:
+    elif (spdx := licence_policy.candidate_licence_id(licence)) is not None:
+        licence, lic_cls = spdx, licence_class(spdx)
         verdict, reason = "candidate", ""
     elif lic_cls == "strong":
         verdict, reason = "report", f"licence:{licence} strong copyleft: a person decides"

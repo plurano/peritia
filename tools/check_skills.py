@@ -16,8 +16,8 @@ import tempfile
 import unittest
 from collections import Counter
 from contextlib import redirect_stdout
-from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from dataclasses import dataclass, field
+from datetime import UTC, date, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from unittest.mock import patch
@@ -65,7 +65,7 @@ def fields(text):
 
 
 class _UniqueKeyLoader(yaml.SafeLoader):
-    """Load validation front matter with unique keys at every mapping level."""
+    """Load validation YAML with unique keys at every mapping level."""
 
     def _require_unique_keys(self, node):
         """Check keys before merge expansion and again on the effective mapping."""
@@ -90,6 +90,17 @@ class _UniqueKeyLoader(yaml.SafeLoader):
         return super().construct_mapping(node, deep=deep)
 
 
+def _load_yaml(text: str, loader: type[yaml.SafeLoader], *, error_prefix: str = "") -> object:
+    """Parse with a safe loader and produce a single-line error when prefixed."""
+    try:
+        return yaml.load(text, Loader=loader)
+    except (yaml.YAMLError, RecursionError) as exc:
+        message = str(exc)
+        if error_prefix:
+            message = error_prefix + " ".join(message.split())
+        raise ValueError(message) from exc
+
+
 @dataclass(frozen=True)
 class _LicenceException:
     """Identify the reviewed bytes and expiry for one skill licence."""
@@ -102,11 +113,12 @@ class _LicenceException:
 
 @dataclass
 class _LicenceScan:
-    """Track register entries left to check and the number of accepted pins."""
+    """Track pending register entries and counts of verified licences and pins."""
 
     pending: dict[str, _LicenceException]
     today: date
     pinned: int = 0
+    verified: Counter[str] = field(default_factory=Counter)
 
 
 def _exception_fields(entry: object) -> dict[str, str]:
@@ -180,10 +192,7 @@ def _read_licence_exceptions(root: Path) -> dict[str, _LicenceException]:
         text = read_utf8(root / LICENCE_EXCEPTIONS_FILE, MAX_LICENCE_BYTES, refuse_links=True)
     except FileNotFoundError:
         return {}
-    try:
-        data = yaml.load(text, Loader=_UniqueKeyLoader)
-    except (yaml.YAMLError, RecursionError) as exc:
-        raise ValueError(f"invalid YAML: {' '.join(str(exc).split())}") from exc
+    data = _load_yaml(text, _UniqueKeyLoader, error_prefix="invalid YAML: ")
     if not isinstance(data, dict) or data.keys() != {"exceptions"}:
         raise ValueError("expected a mapping with exactly the key exceptions")
     entries = data["exceptions"]
@@ -208,10 +217,7 @@ def _load_front_matter(text: str, loader: type[yaml.SafeLoader]) -> dict:
     match = FRONT.match(text.replace("\r\n", "\n"))
     if not match:
         return {}
-    try:
-        data = yaml.load(match.group(1), Loader=loader)
-    except (yaml.YAMLError, RecursionError) as exc:
-        raise ValueError(str(exc)) from exc
+    data = _load_yaml(match.group(1), loader)
     if not isinstance(data, dict):
         raise ValueError("expected a mapping")
     return data
@@ -354,7 +360,7 @@ def _licence_text_problem(skill: Path, template_dir: Path, spdx: str,
 
 
 def _licence_problem(skill: Path, declared: str, meta: dict, template_dir: Path,
-                     verified: Counter[str] | None, scan: _LicenceScan | None) -> str | None:
+                     scan: _LicenceScan | None) -> str | None:
     """Report the first licence problem or record the verified SPDX ID."""
     relative_path = f"skills/{skill.name}/LICENSE"
     entry = scan.pending.pop(relative_path, None) if scan is not None else None
@@ -366,14 +372,13 @@ def _licence_problem(skill: Path, declared: str, meta: dict, template_dir: Path,
         return f"{skill.name}/SKILL.md: {front_problem}"
     if problem := _licence_text_problem(skill, template_dir, spdx, scan, entry):
         return problem
-    if verified is not None:
-        verified[spdx] += 1
+    if scan is not None:
+        scan.verified[spdx] += 1
     return None
 
 
 def skill_problems(
-    skill: Path, *, template_dir: Path | None = None, verified: Counter[str] | None = None,
-    licence_scan: _LicenceScan | None = None,
+    skill: Path, *, template_dir: Path | None = None, licence_scan: _LicenceScan | None = None,
 ) -> list[str]:
     """Problems of one skill directory, each naming the file and the rule."""
     out = []
@@ -410,7 +415,7 @@ def skill_problems(
     if declared := rec.get("licence"):
         if template_dir is None:
             template_dir = skill.parent.parent / "LICENSES"
-        if problem := _licence_problem(skill, declared, meta, template_dir, verified, licence_scan):
+        if problem := _licence_problem(skill, declared, meta, template_dir, licence_scan):
             out.append(problem)
     return out
 
@@ -467,9 +472,8 @@ def index_problems(root, skills=None):
 
 def check(root: Path, *, today: date | None = None) -> int:
     """Check the skill tree and report verified licence counts."""
-    verified: Counter[str] = Counter()
     skills = []
-    scan = _LicenceScan({}, datetime.now(timezone.utc).date() if today is None else today)
+    scan = _LicenceScan({}, datetime.now(UTC).date() if today is None else today)
     try:
         scan.pending = _read_licence_exceptions(root)
     except (TypeError, ValueError) as exc:
@@ -478,14 +482,14 @@ def check(root: Path, *, today: date | None = None) -> int:
         skills_dir = root / "skills"
         if skills_dir.is_dir():
             skills = sorted(p for p in skills_dir.iterdir() if p.is_dir())[:MAX_SKILLS]
-        problems = [p for s in skills for p in skill_problems(s, verified=verified, licence_scan=scan)]
+        problems = [p for s in skills for p in skill_problems(s, licence_scan=scan)]
         problems.extend(f"{path}: no applicable skill licence; remove the exception" for path in sorted(scan.pending))
         problems.extend(check_install_set(root))
         problems.extend(index_problems(root, skills))
     for p in problems:
         print(f"[FAIL] {p}")
-    if verified:
-        print("verified licences: " + ", ".join(f"{spdx}={count}" for spdx, count in sorted(verified.items())))
+    if scan.verified:
+        print("verified licences: " + ", ".join(f"{spdx}={count}" for spdx, count in sorted(scan.verified.items())))
     print(f"pinned licence texts: {scan.pinned}")
     print(f"skills: {len(skills)} checked, {len(problems)} problems")
     return 1 if problems else 0
@@ -900,7 +904,7 @@ class _LicenceRegressionTests(unittest.TestCase):
     def _check_licence_exceptions(self, *messages, today=date(2027, 3, 23)):
         """Expect either one refusal with the given details or one accepted pin."""
         output = io.StringIO()
-        now = datetime(today.year, today.month, today.day, tzinfo=timezone.utc)
+        now = datetime(today.year, today.month, today.day, tzinfo=UTC)
         with (patch.object(sys.modules[__name__], "datetime", create=True) as clock,
               redirect_stdout(output)):
             clock.now.return_value = now
