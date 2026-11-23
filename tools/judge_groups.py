@@ -26,17 +26,16 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable
 
-_TOOLS_DIR = Path(__file__).resolve().parent
-if str(_TOOLS_DIR) not in sys.path:
-    sys.path.insert(0, str(_TOOLS_DIR))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from classify import FUNCTIONS  # noqa: E402
-from census import load_sources  # noqa: E402
-from candidates import AGGREGATOR_UPSTREAM_KEYS, parse_github_repo  # noqa: E402
-from check_skills import front_matter_or_empty  # noqa: E402
-from llm_client import LLMClient  # noqa: E402
-from overlap import (  # noqa: E402
-    Item, cosine_similarity, load_cache, load_candidates, load_existing_skills,
+from classify import FUNCTIONS, latest_classifications
+from census import load_sources
+from candidates import AGGREGATOR_UPSTREAM_KEYS, parse_github_repo
+from check_skills import front_matter_or_empty
+from input_identity import canonical_json, fingerprint, provider_id, text_sha256
+from llm_client import LLMClient
+from overlap import (
+    Item, cosine_similarity, load_candidates, load_embeddings, load_existing_skills,
     normalize_name,
 )
 
@@ -48,10 +47,13 @@ DEFAULT_BASE_URL = os.environ.get("PERITIA_LLM_BASE_URL")
 DEFAULT_TIMEOUT = 300.0
 MAX_SKILL_CHARS = 6000
 ATTEMPTS = 2
+GRADER_FLAGS = re.IGNORECASE
+GRADER_VERSION = f"regex-search-v1:{GRADER_FLAGS.name}"
+TRIAL_RECORD_VERSION = 2
 
 VERDICTS_FIELDS = ["group_id", "verdict", "decided_by", "kept", "dropped", "scores", "model", "judge_model",
                    "copies", "primary_class"]
-DEFAULT_SOURCES = _TOOLS_DIR / "census-sources.json"
+DEFAULT_SOURCES = Path(__file__).resolve().with_name("census-sources.json")
 
 JUDGE_SYSTEM_PROMPT = (
     "You evaluate an AI assistant's response to an engineering task according to a rubric.\n"
@@ -158,7 +160,7 @@ class Task:
 
 
 def load_eval_tasks(eval_tasks_path: Path) -> dict[str, list[Task]]:
-    """Loads eval tasks grouped by function class and validates regex compilation."""
+    """Load eval tasks by function class and validate their regex syntax."""
     with eval_tasks_path.open(encoding="utf-8") as f:
         data = json.load(f)
     version = data.get("version")
@@ -170,9 +172,9 @@ def load_eval_tasks(eval_tasks_path: Path) -> dict[str, list[Task]]:
         parsed_tasks = []
         for t in tasks_list:
             for pat in t.get("must_match", []):
-                re.compile(pat, re.IGNORECASE)
+                re.compile(pat, GRADER_FLAGS)
             for pat in t.get("must_not_match", []):
-                re.compile(pat, re.IGNORECASE)
+                re.compile(pat, GRADER_FLAGS)
             parsed_tasks.append(
                 Task(
                     id=t["id"],
@@ -186,43 +188,45 @@ def load_eval_tasks(eval_tasks_path: Path) -> dict[str, list[Task]]:
     return result
 
 
+def _function_rows(candidates_tsv: Path | None, classified_tsv: Path | None):
+    """Yield candidate labels followed by the latest classification per blob."""
+    if candidates_tsv is not None and candidates_tsv.exists():
+        with candidates_tsv.open(newline="", encoding="utf-8") as handle:
+            yield from csv.DictReader(handle, delimiter="\t")
+    if classified_tsv is not None and classified_tsv.exists():
+        yield from latest_classifications(classified_tsv).values()
+
+
 def load_member_functions(
     candidates_tsv: Path | None = None,
     classified_tsv: Path | None = None,
 ) -> dict[str, set[str]]:
-    """Maps skill identifiers/paths to set of assigned function labels."""
+    """Map skill identifiers and paths to assigned function labels."""
     mapping: dict[str, set[str]] = defaultdict(set)
-    for path in (candidates_tsv, classified_tsv):
-        if path is None or not path.exists():
-            continue
-        with path.open(newline="", encoding="utf-8") as handle:
-            for row in csv.DictReader(handle, delimiter="\t"):
-                funcs = {
-                    f.strip()
-                    for f in row.get("functions", "").split(";")
-                    if f.strip() and f.strip() != "none"
-                }
-                source = row.get("source", "").strip()
-                p = row.get("path", "").strip()
-                name = row.get("skill_name", "").strip()
-                blob = row.get("blob_id", "").strip()
-                if source and p:
-                    mapping[f"{source}:{p}"].update(funcs)
-                if p:
-                    mapping[p].update(funcs)
-                    parts = Path(p).parts
-                    if len(parts) >= 2 and parts[0] == "skills":
-                        mapping[f"skills/{parts[1]}"].update(funcs)
-                if name:
-                    mapping[name].update(funcs)
-                    mapping[f"skills/{name}"].update(funcs)
-                if blob:
-                    mapping[blob].update(funcs)
+    for row in _function_rows(candidates_tsv, classified_tsv):
+        funcs = {f.strip() for f in row.get("functions", "").split(";") if f.strip() and f.strip() != "none"}
+        source = row.get("source", "").strip()
+        path = row.get("path", "").strip()
+        name = row.get("skill_name", "").strip()
+        blob = row.get("blob_id", "").strip()
+        if source and path:
+            mapping[f"{source}:{path}"].update(funcs)
+        if path:
+            mapping[path].update(funcs)
+            parts = Path(path).parts
+            if len(parts) >= 2 and parts[0] == "skills":
+                mapping[f"skills/{parts[1]}"].update(funcs)
+        if name:
+            mapping[name].update(funcs)
+            mapping[f"skills/{name}"].update(funcs)
+        if blob:
+            mapping[blob].update(funcs)
     return mapping
 
 
-def get_skill_text(member: str, checkouts: Path, skills_dir: Path) -> str:
-    """Reads first MAX_SKILL_CHARS of member's SKILL.md confined to checkouts or skills_dir."""
+def get_skill_text(member: str, checkouts: Path, skills_dir: Path, max_chars: int | None = None) -> str:
+    """Read the member's skill text up to the requested length within its checkout."""
+    max_chars = MAX_SKILL_CHARS if max_chars is None else max_chars
     if is_existing_skill(member):
         rel = member[len("skills/"):].strip("/")
         target = (skills_dir / rel).resolve()
@@ -235,7 +239,7 @@ def get_skill_text(member: str, checkouts: Path, skills_dir: Path) -> str:
             raise ValueError(f"{member}: path leaves skills dir")
         if target.is_file():
             with target.open(encoding="utf-8", errors="replace") as f:
-                return f.read(MAX_SKILL_CHARS)
+                return f.read(max_chars)
         return ""
     else:
         if ":" in member:
@@ -248,7 +252,7 @@ def get_skill_text(member: str, checkouts: Path, skills_dir: Path) -> str:
             raise ValueError(f"{member}: path leaves checkout")
         if target.is_file():
             with target.open(encoding="utf-8", errors="replace") as f:
-                return f.read(MAX_SKILL_CHARS)
+                return f.read(max_chars)
         return ""
 
 
@@ -257,17 +261,17 @@ def grade_answer(
     must_match: list[str] | tuple[str, ...],
     must_not_match: list[str] | tuple[str, ...],
 ) -> tuple[bool, list[str]]:
-    """Deterministic rule assertions; all must_match must match, none of must_not_match may match."""
+    """Apply deterministic regex assertions to an answer."""
     failed: list[str] = []
     for pat in must_match:
         try:
-            if not re.search(pat, answer, re.IGNORECASE):
+            if not re.search(pat, answer, GRADER_FLAGS):
                 failed.append(f"missing: {pat}")
         except re.error as e:
             failed.append(f"invalid regex {pat}: {e}")
     for pat in must_not_match:
         try:
-            if re.search(pat, answer, re.IGNORECASE):
+            if re.search(pat, answer, GRADER_FLAGS):
                 failed.append(f"unexpected: {pat}")
         except re.error as e:
             failed.append(f"invalid regex {pat}: {e}")
@@ -291,33 +295,43 @@ def load_groups(groups_tsv: Path) -> list[dict[str, Any]]:
     return groups
 
 
-def load_done_trials(trials_path: Path) -> dict[tuple[str, str, int], dict[str, Any]]:
-    """Loads completed trials mapping (member, task_id, trial) -> record."""
-    done: dict[tuple[str, str, int], dict[str, Any]] = {}
+def load_done_trials(trials_path: Path) -> dict[str, dict[str, Any]]:
+    """Index the latest versioned trial for each answer identity."""
+    done: dict[str, dict[str, Any]] = {}
     if not trials_path.exists():
         return done
-    with trials_path.open(encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
+    legacy = 0
+    with trials_path.open(encoding="utf-8") as handle:
+        for line in handle:
             try:
                 record = json.loads(line)
-                member = record["member"]
-                task_id = record["task_id"]
-                trial_num = int(record.get("trial", record.get("seed", 1)))
-                done[(member, task_id, trial_num)] = record
-            except (KeyError, ValueError, json.JSONDecodeError):
+            except json.JSONDecodeError:
                 continue
+            if not isinstance(record, dict):
+                continue
+            if record.get("record_version") != TRIAL_RECORD_VERSION or not all(
+                record.get(key) for key in ("answer_fp", "grade_fp", "judge_fp")
+            ):
+                legacy += 1
+                continue
+            if isinstance(record["answer_fp"], str) and isinstance(record.get("answer"), str):
+                done[record["answer_fp"]] = record
+    if legacy:
+        print(f"{legacy} legacy trial records ignored (no input fingerprint): {trials_path}", file=sys.stderr)
     return done
 
 
 def append_trial(trials_path: Path, record: dict[str, Any]) -> None:
-    """Appends one trial JSON record to trials.jsonl."""
+    """Append one trial without overwriting a partial or unterminated previous line."""
     trials_path.parent.mkdir(parents=True, exist_ok=True)
-    with trials_path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(record) + "\n")
-        f.flush()
+    payload = (json.dumps(record) + "\n").encode("utf-8")
+    with trials_path.open("a+b") as handle:
+        if handle.tell():
+            handle.seek(-1, os.SEEK_END)
+            if handle.read(1) != b"\n":
+                payload = b"\n" + payload
+        handle.write(payload)
+        handle.flush()
 
 
 class JudgeHarness:
@@ -434,20 +448,97 @@ def decide_group(
     return undecided
 
 
+def answer_fingerprint(
+    skill_text: str, task_prompt: str, model: str, provider: str, temperature: float, seed: int,
+) -> str:
+    """Fingerprint the exact answer request independently of either grading method."""
+    return fingerprint("answer", {
+        "skill_text_sha256": text_sha256(skill_text),
+        "task_prompt_sha256": text_sha256(task_prompt),
+        "model": model,
+        "provider": provider,
+        "temperature": temperature,
+        "seed": seed,
+        "chat_shape": "system=skill,user=task",
+    })
+
+
+def _grade_fingerprint(task: Task) -> str:
+    """Identify the deterministic grading rules for a task."""
+    return fingerprint("grade", {
+        "must_match": list(task.must_match),
+        "must_not_match": list(task.must_not_match),
+        "grader": GRADER_VERSION,
+    })
+
+
+@dataclass
+class TrialRunner:
+    """Resume or evaluate trials against the inputs for this run."""
+
+    path: Path
+    done: dict[str, dict[str, Any]]
+    chat: Callable[[str, str, float, int], str]
+    judge: Callable[[str], float]
+    model: str
+    judge_model: str
+    provider: str
+    temperature: float
+
+    def judge_fingerprint(self, answer_fp: str, answer_sha256: str, prompt: str) -> str:
+        """Identify the advisory judge request and the answer it scores."""
+        return fingerprint("judge", {
+            "answer_fp": answer_fp,
+            "answer_sha256": answer_sha256,
+            "judge_model": self.judge_model,
+            "provider": self.provider,
+            "judge_system_prompt_sha256": text_sha256(JUDGE_SYSTEM_PROMPT),
+            "judge_prompt_sha256": text_sha256(prompt),
+            "judge_schema_sha256": text_sha256(canonical_json(judge_schema())),
+        })
+
+    def evaluate(self, group_id: str, member: str, skill_text: str, task: Task, seed: int) -> dict[str, Any]:
+        """Reuse the matching answer and refresh only grades with changed inputs."""
+        answer_fp = answer_fingerprint(skill_text, task.prompt, self.model, self.provider, self.temperature, seed)
+        cached = self.done.get(answer_fp, {})
+        answer = cached["answer"] if cached else self.chat(skill_text, task.prompt, self.temperature, seed)
+        answer_hash = text_sha256(answer)
+        grade_fp = _grade_fingerprint(task)
+        prompt = make_judge_prompt(task.prompt, task.rubric, answer)
+        judge_fp = self.judge_fingerprint(answer_fp, answer_hash, prompt)
+
+        regrade = cached.get("grade_fp") != grade_fp or cached.get("answer_sha256") != answer_hash
+        rejudge = cached.get("judge_fp") != judge_fp
+        if regrade:
+            passed, failed = grade_answer(answer, task.must_match, task.must_not_match)
+        else:
+            passed, failed = cached["pass"], cached["failed_assertions"]
+        score = self.judge(prompt) if rejudge else cached["rubric_score"]
+        record = {
+            "group_id": group_id, "member": member, "task_id": task.id,
+            "trial": seed, "seed": seed, "answer_length": len(answer),
+            "pass": passed, "failed_assertions": failed, "rubric_score": score,
+            "model": self.model, "judge_model": self.judge_model,
+            "record_version": TRIAL_RECORD_VERSION, "answer": answer,
+            "answer_sha256": answer_hash, "answer_fp": answer_fp, "grade_fp": grade_fp,
+            "judge_fp": judge_fp, "provider": self.provider, "temperature": self.temperature,
+        }
+        if regrade or rejudge:
+            append_trial(self.path, record)
+            self.done[answer_fp] = record
+        return record
+
+
 def _run_single_group(
     g: dict[str, Any],
     eval_tasks: dict[str, list[Task]],
     member_funcs: dict[str, set[str]],
-    done_trials: dict[tuple[str, str, int], dict[str, Any]],
-    checkouts: Path, skills_dir: Path, trials_out: Path,
-    chat_fn: Callable[[str, str, float, int], str],
-    judge_fn: Callable[[str], float],
-    model: str, judge_model: str, k: int, temperature: float,
+    checkouts: Path, skills_dir: Path, trials: TrialRunner, k: int,
     items: dict[str, Item],
     embeddings: dict[str, list[float]],
     ranks: dict[str, int],
 ) -> dict[str, Any]:
-    """Evaluates a single group across tasks, recording new trials and returning a verdict row."""
+    """Evaluate a group using current trial evidence and return its verdict row."""
     group_id, members = g["group_id"], g["members"]
     texts = {m: get_skill_text(m, checkouts, skills_dir) for m in members}
     metadata = {m: front_matter_or_empty(text) for m, text in texts.items()}
@@ -457,27 +548,12 @@ def _run_single_group(
     if primary and len(group_tasks) != 3:
         raise ValueError(f"{primary}: expected exactly three evaluation tasks")
 
-    group_trials: list[dict[str, Any]] = []
-    for m in members:
-        skill_text = texts[m]
-        for t in group_tasks:
-            for trial_idx in range(1, k + 1):
-                key = (m, t.id, trial_idx)
-                if key in done_trials:
-                    rec = done_trials[key]
-                else:
-                    ans = chat_fn(skill_text, t.prompt, temperature, trial_idx)
-                    passed, failed = grade_answer(ans, t.must_match, t.must_not_match)
-                    score = judge_fn(make_judge_prompt(t.prompt, t.rubric, ans))
-                    rec = {
-                        "group_id": group_id, "member": m, "task_id": t.id,
-                        "trial": trial_idx, "seed": trial_idx, "answer_length": len(ans),
-                        "pass": passed, "failed_assertions": failed, "rubric_score": score,
-                        "model": model, "judge_model": judge_model,
-                    }
-                    append_trial(trials_out, rec)
-                    done_trials[key] = rec
-                group_trials.append(rec)
+    group_trials = [
+        trials.evaluate(group_id, member, texts[member], task, seed)
+        for member in members
+        for task in group_tasks
+        for seed in range(1, k + 1)
+    ]
 
     verdict, kept, dropped, scores, decided_by = decide_group(members, group_tasks, group_trials, k=k)
     if verdict == "keep-better" and any(is_existing_skill(m) for m in copies):
@@ -489,8 +565,8 @@ def _run_single_group(
         "kept": ",".join(kept),
         "dropped": ",".join(dropped),
         "scores": json.dumps(scores, sort_keys=True),
-        "model": model,
-        "judge_model": judge_model,
+        "model": trials.model,
+        "judge_model": trials.judge_model,
         "copies": json.dumps(copies, sort_keys=True),
         "primary_class": primary,
     }
@@ -504,13 +580,12 @@ def _init_callables(
     chat_fn: Callable[[str, str, float, int], str] | None,
     judge_fn: Callable[[str], float] | None,
 ) -> tuple[Callable[[str, str, float, int], str], Callable[[str], float]]:
-    """Initialises chat and judge functions using LLMClient if either is absent."""
+    """Create client callables for any model operation that was not injected."""
     if chat_fn is not None and judge_fn is not None:
         return chat_fn, judge_fn
-    base_url_str = base_url or os.environ.get("PERITIA_LLM_BASE_URL") or ""
-    if not base_url_str:
+    if not base_url:
         raise ValueError("missing base_url (or set PERITIA_LLM_BASE_URL)")
-    client = LLMClient(base_url_str, timeout, api_key=os.environ.get("PERITIA_LLM_API_KEY"))
+    client = LLMClient(base_url, timeout, api_key=os.environ.get("PERITIA_LLM_API_KEY"))
     harness = JudgeHarness(client, model, judge_model)
     return chat_fn or harness.chat, judge_fn or harness.judge
 
@@ -545,8 +620,10 @@ def run(
     limit: int | None = None,
     cache_path: Path | None = None,
     sources_path: Path = DEFAULT_SOURCES,
+    embed_model: str | None = None,
+    embed_dims: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Runs evaluation on groups, writing verdicts.tsv and trials.jsonl."""
+    """Evaluate groups and write their verdicts and newly computed trials."""
     if k < 1:
         raise ValueError("k must be positive")
     groups = load_groups(groups_tsv)
@@ -559,19 +636,20 @@ def run(
     ranks = {s.repository: s.rank for s in load_sources(sources_path)}
     if cache_path is not None and not cache_path.is_file():
         raise ValueError(f"embedding cache not found: {cache_path}")
-    embeddings = load_cache(cache_path)
     candidates = load_candidates(candidates_tsv, checkouts) if candidates_tsv is not None else []
     items = {item.item_id: item for item in candidates + load_existing_skills(skills_dir)}
 
+    if chat_fn is None or judge_fn is None:
+        base_url = base_url or os.environ.get("PERITIA_LLM_BASE_URL")
+    provider = provider_id(base_url)
+    embeddings = load_embeddings(cache_path, list(items.values()),
+                                 embed_model or os.environ.get("PERITIA_LLM_EMBED_MODEL", ""), provider, embed_dims)
     model_str = model or os.environ.get("PERITIA_LLM_MODEL") or ""
     judge_model_str = judge_model or os.environ.get("PERITIA_LLM_JUDGE_MODEL") or ""
     chat_fn, judge_fn = _init_callables(base_url, model_str, judge_model_str, timeout, chat_fn, judge_fn)
-
+    trials = TrialRunner(trials_out, done_trials, chat_fn, judge_fn, model_str, judge_model_str, provider, temperature)
     verdicts_rows = [
-        _run_single_group(
-            g, eval_tasks, member_funcs, done_trials, checkouts, skills_dir,
-            trials_out, chat_fn, judge_fn, model_str, judge_model_str, k, temperature, items, embeddings, ranks,
-        )
+        _run_single_group(g, eval_tasks, member_funcs, checkouts, skills_dir, trials, k, items, embeddings, ranks)
         for g in groups
     ]
 
@@ -617,6 +695,7 @@ def summary(verdicts_path: Path) -> str:
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
+    """Parse group judging options and require an embedding model when using a cache."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     commands = parser.add_subparsers(dest="command", required=True)
 
@@ -624,7 +703,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     run_cmd.add_argument("--groups", type=Path, default=Path("groups.tsv"), help="groups TSV from overlap.py")
     run_cmd.add_argument("--candidates", type=Path, default=Path("candidates.tsv"), help="candidates TSV")
     run_cmd.add_argument("--classified", type=Path, default=Path("classified.tsv"), help="classified TSV")
-    run_cmd.add_argument("--cache", type=Path, default=None, help="overlap stage blob-id embedding cache")
+    run_cmd.add_argument("--cache", type=Path, default=None, help="overlap stage embedding cache")
+    run_cmd.add_argument("--embed-model", default=os.environ.get("PERITIA_LLM_EMBED_MODEL"),
+                         help="embedding model name (PERITIA_LLM_EMBED_MODEL)")
+    run_cmd.add_argument("--embed-dims", type=int, help="select the embedding vector dimensions")
     run_cmd.add_argument("--sources", type=Path, default=DEFAULT_SOURCES, help="ranked source manifest")
     run_cmd.add_argument("--checkouts", type=Path, default=Path("checkouts"), help="folder of checkouts")
     run_cmd.add_argument("--skills-dir", type=Path, default=Path("skills"), help="existing skills folder")
@@ -644,6 +726,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
     args = parser.parse_args(argv)
     if args.command == "run":
+        if args.cache is not None and not args.embed_model:
+            parser.error("--cache requires --embed-model (or set PERITIA_LLM_EMBED_MODEL)")
         if not args.base_url:
             parser.error("missing --base-url (or set PERITIA_LLM_BASE_URL)")
         if not args.model:
@@ -654,6 +738,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 def main(argv: list[str]) -> int:
+    """Run the selected group judging command."""
     args = parse_args(argv)
     if args.command == "summary":
         print(summary(args.verdicts))
@@ -668,6 +753,8 @@ def main(argv: list[str]) -> int:
         candidates_tsv=args.candidates,
         classified_tsv=args.classified,
         cache_path=args.cache,
+        embed_model=args.embed_model,
+        embed_dims=args.embed_dims,
         sources_path=args.sources,
         model=args.model,
         judge_model=args.judge_model,

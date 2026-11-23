@@ -6,6 +6,7 @@ import csv
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import classify
 
@@ -120,6 +121,109 @@ class RunTests(unittest.TestCase):
             self.assertEqual([(row["blob_id"], row["status"], row["model"]) for row in rows],
                              [("1", "ok", "model-a"), ("2", "error", "model-a")])
             self.assertEqual(rows[0]["functions"], "coding;testing")
+
+    def setUp(self):
+        """Create two skills, an output path, and a recording model stub."""
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.folder = Path(directory.name)
+        self.out = self.folder / "resume.tsv"
+        self.items = [classify.Item(str(i), "a/b", f"{name}/SKILL.md", name)
+                      for i, name in enumerate(("x", "y"), 1)]
+        for item in self.items:
+            write_skill(self.folder, item.source, item.path, item.skill_name)
+        self.asked = []
+
+    def ask(self, text):
+        """Record the input and return valid labels."""
+        self.asked.append(text)
+        return GOOD
+
+    def classify(self, model="model-a", **options):
+        """Classify the current items and return the new model calls."""
+        self.asked.clear()
+        classify.run(self.items, self.folder, self.out, self.ask, model, **options)
+        return self.asked.copy()
+
+    def test_unchanged_inputs_skip_all_asks(self):
+        """Reuse all classifications for identical inputs."""
+        self.assertEqual(self.classify(), ["x", "y"])
+        original = self.out.read_bytes()
+        self.assertEqual(self.classify(), [])
+        self.assertEqual(self.out.read_bytes(), original)
+
+    def test_changed_model_asks_for_each_item(self):
+        """Append current model rows and report each blob once."""
+        self.classify()
+        original = self.out.read_bytes()
+        self.assertEqual(self.classify("model-b"), ["x", "y"])
+        self.assertTrue(self.out.read_bytes().startswith(original))
+        self.assertIn("rows=2 ok=2 error=0 models=model-b", classify.summary(self.out))
+
+    def test_return_to_original_model_restores_latest_rows(self):
+        """Ensure the latest rows belong to the requested model after switching back."""
+        self.classify()
+        self.classify("model-b")
+        self.classify()
+        self.assertIn("rows=2 ok=2 error=0 models=model-a", classify.summary(self.out))
+
+    def test_changed_content_and_blob_asks_only_for_that_item(self):
+        """Classify changed content at the same checkout path."""
+        self.classify()
+        item = self.items[0]
+        write_skill(self.folder, item.source, item.path, "changed")
+        self.items[0] = classify.Item("replacement", item.source, item.path, item.skill_name)
+        self.assertEqual(self.classify(), ["changed"])
+
+    def test_changed_sent_text_asks_even_with_old_blob_id(self):
+        """Bind reuse to the actual text when a checkout changes before its census."""
+        self.classify()
+        item = self.items[0]
+        write_skill(self.folder, item.source, item.path, "changed")
+        self.assertEqual(self.classify(), ["changed"])
+
+    def test_changed_provider_asks_for_each_item(self):
+        """Treat two endpoint paths as different providers."""
+        self.classify(provider="https://models.invalid/a/v1")
+        self.assertEqual(self.classify(provider="https://models.invalid/b/v1"), ["x", "y"])
+
+    def test_changed_system_prompt_asks_for_each_item(self):
+        """Reclassify every item after a system prompt edit."""
+        self.classify()
+        with patch.object(classify, "SYSTEM_PROMPT", "new instructions"):
+            self.assertEqual(self.classify(), ["x", "y"])
+
+    def test_changed_schema_asks_for_each_item(self):
+        """Reclassify every item after a schema boundary changes."""
+        self.classify()
+        with patch.object(classify, "MAX_LABELS", 4):
+            self.assertEqual(self.classify(), ["x", "y"])
+
+    def test_changed_taxonomy_asks_for_each_item(self):
+        """Reclassify every item after a label joins the taxonomy."""
+        self.classify()
+        with patch.dict(classify.DOMAINS, {"new-domain": "A new domain"}):
+            self.assertEqual(self.classify(), ["x", "y"])
+
+    def test_legacy_classifications_are_preserved_and_rerun(self):
+        """Move the legacy TSV byte for byte before reclassifying every item."""
+        fields = [field for field in classify.OUTPUT_FIELDS if field != "input_fp"]
+        with self.out.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields, delimiter="\t")
+            writer.writeheader()
+            writer.writerow({"blob_id": "1", "model": "old-model", "status": "ok"})
+        original = self.out.read_bytes()
+        self.assertEqual(self.classify(), ["x", "y"])
+        self.assertEqual(self.out.with_name("resume.legacy-1.tsv").read_bytes(), original)
+        self.assertIn("rows=2 ok=2 error=0 models=model-a", classify.summary(self.out))
+
+    def test_unreadable_skill_can_resume_after_the_file_returns(self):
+        """Retry a read failure because no skill text went to the model."""
+        item = self.items[0]
+        (self.folder / "a__b" / item.path).unlink()
+        self.assertEqual(self.classify(), ["y"])
+        write_skill(self.folder, item.source, item.path, item.skill_name)
+        self.assertEqual(self.classify(), ["x"])
 
     def test_summary_names_zero_hit_domains(self):
         with tempfile.TemporaryDirectory() as folder:

@@ -5,24 +5,49 @@
 import base64
 import csv
 import hashlib
-import json
+import io
 import math
+import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import tomllib
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from unittest.mock import patch
 
 import adopt_skills as adopt
 import census
 import check_skills
+import overlap
 
 REPO = Path(__file__).resolve().parent.parent
 MD = '---\nname: {name}\ndescription: Use when testing adoption.\n---\n\n# Example\n\nCheck the result.\n'
 LICENCE = 'MIT License\n\nCopyright (c) 2025 owner\n'
 CANDIDATE_FIELDS = ['source', 'path', 'skill_name', 'verdict', 'licence', 'licence_evidence', 'functions']
+EMBED_MODEL = 'fixture-embed'
+EMBED_PROVIDER = 'https://models.example.test/v1'
+REAL_RUN = subprocess.run
+
+
+def run_fixture_command(args, **kwargs):
+    """Run local fixtures without inheriting Git's configuration or repository state."""
+    explicit_env = kwargs.get('env')
+    original_env = os.environ if explicit_env is None else explicit_env
+    env = {key: value for key, value in original_env.items() if not key.startswith('GIT_')}
+    env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM='1')
+    if explicit_env is not None:
+        for key in ('GIT_OPTIONAL_LOCKS', 'GIT_NO_LAZY_FETCH'):
+            if key in original_env:
+                env[key] = original_env[key]
+    if args[0] == 'git' and 'commit-tree' in args:
+        env.update(GIT_AUTHOR_NAME='Fixture', GIT_AUTHOR_EMAIL='fixture@example.org',
+                   GIT_COMMITTER_NAME='Fixture', GIT_COMMITTER_EMAIL='fixture@example.org',
+                   GIT_AUTHOR_DATE='2025-01-01T00:00:00Z', GIT_COMMITTER_DATE='2025-01-01T00:00:00Z')
+    kwargs.setdefault('timeout', adopt.TIMEOUT)
+    return REAL_RUN(args, **{**kwargs, 'env': env})
 
 
 def tsv(path, fields, rows):
@@ -44,6 +69,8 @@ def passing_gate(root, staging, skill):
 
 class AdoptionTests(unittest.TestCase):
     def setUp(self):
+        """Prepare an isolated temporary worktree and synthetic source repositories."""
+        self.enterContext(patch.object(subprocess, 'run', run_fixture_command))
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name)
@@ -62,6 +89,7 @@ class AdoptionTests(unittest.TestCase):
         self.reader_calls = []
 
     def source(self, files, source='owner/repo', symlink=None, cone=False):
+        """Create a sparse synthetic checkout and return its pinned commit ID."""
         checkout = self.checkouts / source.replace('/', '__')
         checkout.mkdir()
         adopt.git(checkout, 'init', '--quiet')
@@ -74,11 +102,7 @@ class AdoptionTests(unittest.TestCase):
         adopt.git(checkout, 'add', '--force', '--all')
         tree = adopt.git(checkout, 'write-tree').decode().strip()
         # Synthetic fixture objects only: no git commit, hooks, or working branch edits.
-        with patch.dict('os.environ', {'GIT_AUTHOR_NAME': 'Fixture', 'GIT_AUTHOR_EMAIL': 'fixture@example.org',
-                                      'GIT_COMMITTER_NAME': 'Fixture', 'GIT_COMMITTER_EMAIL': 'fixture@example.org',
-                                      'GIT_AUTHOR_DATE': '2025-01-01T00:00:00Z',
-                                      'GIT_COMMITTER_DATE': '2025-01-01T00:00:00Z'}):
-            pin = adopt.git(checkout, 'commit-tree', tree, data=b'Fixture\n').decode().strip()
+        pin = adopt.git(checkout, 'commit-tree', tree, data=b'Fixture\n').decode().strip()
         adopt.git(checkout, 'update-ref', 'HEAD', pin)
         mode = '--cone' if cone else '--no-cone'
         patterns = b'' if cone else b'**/SKILL.md\n**/LICENSE*\n'
@@ -112,7 +136,8 @@ class AdoptionTests(unittest.TestCase):
         return answers[endpoint]
 
     def invoke(self, *, apply=True, gate=passing_gate, hiss_gate=passing_gate, reader=None,
-               report=None, runner=None, include_grouped=False, cache=None, sources=None):
+               report=None, runner=None, include_grouped=False, cache=None, sources=None, embed_model=EMBED_MODEL):
+        """Write fixture tables and invoke adoption with controlled readers and gates."""
         cand_fields = list(CANDIDATE_FIELDS)
         for key in ('blob_id', 'domains'):
             if any(key in c for c in self.candidates) and key not in cand_fields:
@@ -125,7 +150,22 @@ class AdoptionTests(unittest.TestCase):
                          self.checkouts, self.root, apply=apply,
                          reader=self.reader if reader is None else reader, gate=gate,
                          hiss_gate=hiss_gate, report=report, runner=runner,
-                         include_grouped=include_grouped, cache=cache, sources=sources)
+                         include_grouped=include_grouped, cache=cache, sources=sources,
+                         embed_model=embed_model, base_url=EMBED_PROVIDER)
+
+    def embedding_cache(self, vectors):
+        """Write fixture embeddings using overlap's item preprocessing and cache format."""
+        items = []
+        for row in self.candidates:
+            path = self.checkouts / row['source'].replace('/', '__') / row['path']
+            with path.open(encoding='utf-8') as handle:
+                items.append(overlap.item_from_skill(adopt.candidate_id(row), row['blob_id'], row['skill_name'],
+                                                     handle.read(overlap.MAX_SKILL_CHARS)))
+        path = self.base / 'cache.json'
+        fixture_vectors = iter(vectors[item.blob_id] for item in items)
+        overlap.get_embeddings(items, lambda texts: [next(fixture_vectors) for _ in texts], path,
+                               model=EMBED_MODEL, provider=EMBED_PROVIDER)
+        return path
 
     def test_folder_licence_origin_reuse_and_checker(self):
         self.fixture(extra={'pack/demo/scripts/helper.py': 'print("example")\n'})
@@ -197,6 +237,7 @@ class AdoptionTests(unittest.TestCase):
         self.assertEqual(dry, self.invoke())
 
     def test_default_cli_is_dry_run(self):
+        """Run the CLI with the test interpreter and verify dry-run leaves files alone."""
         self.fixture()
         self.invoke(apply=False)
         argv = [str(REPO / 'tools/adopt_skills.py'), '--candidates', str(self.base / 'candidates.tsv'),
@@ -204,7 +245,7 @@ class AdoptionTests(unittest.TestCase):
                 '--checkouts', str(self.checkouts), '--root', str(self.root)]
         before = snapshot(self.root)
         # The absent markdown gate refuses this fixture, but still produces a report without writes.
-        output = adopt.command(['python3', '-B', *argv]).decode()
+        output = adopt.command([sys.executable, '-B', *argv]).decode()
         self.assertIn('candidate\tverdict\tdirectory\treason', output)
         self.assertEqual(snapshot(self.root), before)
 
@@ -505,6 +546,7 @@ class AdoptionTests(unittest.TestCase):
         self.assertIn('repository root refused', str(ctx.exception))
 
     def test_group_adopts_original_and_refuses_composio_copy(self):
+        """Collapse a copy only when matching embeddings support it."""
         orig_pin = self.source({'pack/demo/SKILL.md': MD.format(name='demo'), 'pack/demo/LICENSE': LICENCE},
                                source='anthropics/skills')
         orig_cand = self.candidate(name='demo', folder='pack/demo', source='anthropics/skills', pin=orig_pin,
@@ -517,8 +559,13 @@ class AdoptionTests(unittest.TestCase):
             'group_id': '101',
             'members': f'{orig_cand["source"]}:{orig_cand["path"]},{copy_cand["source"]}:{copy_cand["path"]}',
         }]
-        cache_file = self.base / 'cache.json'
-        cache_file.write_text(json.dumps({'orig_blob': [1.0, 0.0], 'copy_blob': [0.99, math.sqrt(1 - 0.99**2)]}))
+        cache_file = self.embedding_cache({'orig_blob': [1.0, 0.0], 'copy_blob': [0.99, math.sqrt(1 - 0.99**2)]})
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            other_rows, _ = self.invoke(apply=False, include_grouped=True, cache=cache_file, embed_model='other-model')
+        self.assertEqual([row['verdict'] for row in other_rows], ['adopted', 'adopted'])
+        self.assertIn('other-model', stderr.getvalue())
+        self.assertIn(str(cache_file), stderr.getvalue())
         rows, _ = self.invoke(apply=True, include_grouped=True, cache=cache_file)
         self.assertEqual(len(rows), 2)
         # Anthropics original adopted
@@ -543,6 +590,7 @@ class AdoptionTests(unittest.TestCase):
         self.assertEqual(check_skills.check(self.root), 0)
 
     def test_group_different_skills_adopts_both_with_group_id(self):
+        """Adopt both members when their current embeddings show distinct uses."""
         pin_a = self.source({'pack/alpha/SKILL.md': MD.format(name='alpha'), 'pack/alpha/LICENSE': LICENCE},
                             source='anthropics/skills')
         cand_a = self.candidate(name='alpha', folder='pack/alpha', source='anthropics/skills', pin=pin_a,
@@ -555,8 +603,7 @@ class AdoptionTests(unittest.TestCase):
             'group_id': '42',
             'members': f'{cand_a["source"]}:{cand_a["path"]},{cand_b["source"]}:{cand_b["path"]}',
         }]
-        cache_file = self.base / 'cache.json'
-        cache_file.write_text(json.dumps({'alpha_blob': [1.0, 0.0], 'beta_blob': [0.0, 1.0]}))
+        cache_file = self.embedding_cache({'alpha_blob': [1.0, 0.0], 'beta_blob': [0.0, 1.0]})
         rows, _ = self.invoke(apply=True, include_grouped=True, cache=cache_file)
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0]['verdict'], 'adopted')
@@ -572,6 +619,7 @@ class AdoptionTests(unittest.TestCase):
         self.assertEqual(check_skills.check(self.root), 0)
 
     def test_original_refused_by_gate_leaves_copy_refused(self):
+        """Keep a copy refused when its original fails the adoption gate."""
         orig_pin = self.source({'pack/demo/SKILL.md': MD.format(name='demo'), 'pack/demo/LICENSE': LICENCE},
                                source='anthropics/skills')
         orig_cand = self.candidate(name='demo', folder='pack/demo', source='anthropics/skills', pin=orig_pin,
@@ -584,11 +632,13 @@ class AdoptionTests(unittest.TestCase):
             'group_id': '101',
             'members': f'{orig_cand["source"]}:{orig_cand["path"]},{copy_cand["source"]}:{copy_cand["path"]}',
         }]
-        cache_file = self.base / 'cache.json'
-        cache_file.write_text(json.dumps({'orig_blob': [1.0, 0.0], 'copy_blob': [0.99, math.sqrt(1 - 0.99**2)]}))
+        cache_file = self.embedding_cache({'orig_blob': [1.0, 0.0], 'copy_blob': [0.99, math.sqrt(1 - 0.99**2)]})
+
         def gate_reject_demo(root, staging, skill):
+            """Refuse the original skill staged under its canonical name."""
             if skill.name == 'demo':
                 raise adopt.Refused('markdown: reject original')
+
         rows, _ = self.invoke(apply=True, include_grouped=True, cache=cache_file, gate=gate_reject_demo)
         self.assertEqual(rows[0]['verdict'], 'refused')
         self.assertEqual(rows[0]['reason'], 'markdown: reject original')
@@ -652,6 +702,7 @@ class AdoptionTests(unittest.TestCase):
         self.assertNotIn(pin2, origin2)
 
     def test_group_whose_original_is_present_keeps_copy_refused(self):
+        """Keep a copy refused when its original has already been adopted."""
         orig_pin = self.source({'pack/demo/SKILL.md': MD.format(name='demo'), 'pack/demo/LICENSE': LICENCE},
                                 source='anthropics/skills')
         orig_cand = self.candidate(name='demo', folder='pack/demo', source='anthropics/skills', pin=orig_pin,
@@ -664,8 +715,7 @@ class AdoptionTests(unittest.TestCase):
             'group_id': '101',
             'members': f'{orig_cand["source"]}:{orig_cand["path"]},{copy_cand["source"]}:{copy_cand["path"]}',
         }]
-        cache_file = self.base / 'cache.json'
-        cache_file.write_text(json.dumps({'orig_blob': [1.0, 0.0], 'copy_blob': [0.99, math.sqrt(1 - 0.99**2)]}))
+        cache_file = self.embedding_cache({'orig_blob': [1.0, 0.0], 'copy_blob': [0.99, math.sqrt(1 - 0.99**2)]})
 
         rows1, _ = self.invoke(apply=True, include_grouped=True, cache=cache_file)
         self.assertEqual(rows1[0]['verdict'], 'adopted')
@@ -681,6 +731,17 @@ class AdoptionTests(unittest.TestCase):
         self.assertFalse((self.root / 'skills/demo-composiohq').exists())
         dirs = [p.name for p in (self.root / 'skills').iterdir() if p.is_dir()]
         self.assertEqual(dirs, ['demo'])
+
+    def test_cli_cache_requires_embed_model(self):
+        """Reject a cache argument without an embedding model before inspecting inputs."""
+        argv = ['--candidates', 'candidates.tsv', '--groups', 'groups.tsv', '--census', 'census.tsv',
+                '--checkouts', 'checkouts', '--cache', 'cache.json']
+        stderr = io.StringIO()
+        with (patch.dict('os.environ', {'PERITIA_LLM_EMBED_MODEL': ''}), redirect_stderr(stderr),
+              self.assertRaises(SystemExit) as error):
+            adopt.main(argv)
+        self.assertEqual(error.exception.code, 2)
+        self.assertIn('--embed-model', stderr.getvalue())
 
     def test_fresh_candidate_with_colliding_name_gets_owner_suffix(self):
         pin_other = self.source({'pack/demo/SKILL.md': MD.format(name='demo'), 'pack/demo/LICENSE': LICENCE},
@@ -766,6 +827,7 @@ class AdoptionTests(unittest.TestCase):
         self.assertIn('omitted files the whitespace normalizer would change beyond whitespace (reference/guide.md)', origin)
 
     def test_markdown_normalizer_fixes_supporting_files_and_records_rules_and_fails_closed(self):
+        """Record markdown repairs and refuse adoption if the normalizer is unavailable."""
         unnormalized_ref = (
             '# Reference\n'
             '## Tight Heading\n'
@@ -804,7 +866,7 @@ class AdoptionTests(unittest.TestCase):
         diff_proc = subprocess.run(
             [git_bin, 'diff', '--no-index', '-w', '--ignore-blank-lines',
              str(fenced_upstream), str(skill / 'reference/guide.md')],
-            capture_output=True, check=False,
+            capture_output=True, check=False, timeout=adopt.TIMEOUT,
         )
         self.assertEqual(diff_proc.returncode, 0, diff_proc.stdout.decode('utf-8', errors='replace'))
         self.assertEqual(diff_proc.stdout, b'')

@@ -27,12 +27,11 @@ from pathlib import Path, PurePosixPath
 
 import census
 import check_skills
-import judge_groups
+import overlap
 from candidates import LICENSE_FILENAMES, MAX_ROWS, find_folder_licence_file, normalize_name
 from census import LiveReader, SourceReadError
 from judge_groups import collapse_copies, get_skill_text, is_existing_skill, load_sources
 from check_skills import front_matter_or_empty
-from overlap import Item, git_blob_id, load_cache
 
 MAX_FILES = 200
 MAX_BYTES = 2 * 1024 * 1024
@@ -858,78 +857,88 @@ def write_index(root: Path, adopted_map: dict[str, dict] | None = None,
         writer.writerows(rows)
 
 
+def _pinned_member_text(checkout: Path, pin: str | None, path: str) -> str:
+    """Read the pinned skill when a sparse checkout omits its working-tree file."""
+    if not pin or not checkout.is_dir():
+        return ''
+    try:
+        data = git(checkout, 'show', f'{pin}:{path}')
+        return data.decode('utf-8', errors='replace').replace('\r\n', '\n').replace('\r', '\n')[:overlap.MAX_SKILL_CHARS]
+    except (Refused, OSError, subprocess.SubprocessError):
+        return ''
+
+
+def _adopted_member_text(skills_dir: Path, source: str, path: str) -> str:
+    """Read an adopted member when its source text is unavailable."""
+    if not skills_dir.is_dir():
+        return ''
+    folder = PurePosixPath(path).parent if path.endswith('/SKILL.md') else PurePosixPath(path)
+    present = read_present_skills(skills_dir).get((source.lower(), str(folder)))
+    if present is None:
+        return ''
+    skill_md = skills_dir / present['name'] / 'SKILL.md'
+    if not skill_md.is_file():
+        return ''
+    try:
+        with skill_md.open(encoding='utf-8', errors='replace') as handle:
+            return handle.read(overlap.MAX_SKILL_CHARS)
+    except OSError:
+        return ''
+
+
 def get_member_skill_text(member: str, checkouts: Path, skills_dir: Path, pins: dict[str, str] | None = None) -> str:
-    text = get_skill_text(member, checkouts, skills_dir)
-    if text:
+    """Read the member's overlap input from its checkout, pinned blob, or adopted copy."""
+    text = get_skill_text(member, checkouts, skills_dir, max_chars=overlap.MAX_SKILL_CHARS)
+    if text or ':' not in member:
         return text
-    if ':' in member and pins:
-        source, path_str = member.split(':', 1)
-        if source in pins:
-            checkout = checkouts / source.replace('/', '__')
-            if checkout.is_dir():
-                try:
-                    data = git(checkout, 'show', f'{pins[source]}:{path_str}')
-                    return data.decode('utf-8', errors='replace')[:judge_groups.MAX_SKILL_CHARS]
-                except Exception:
-                    pass
-    if ':' in member and skills_dir.is_dir():
-        source, path_str = member.split(':', 1)
-        present = read_present_skills(skills_dir)
-        folder = str(PurePosixPath(path_str).parent) if path_str.endswith('/SKILL.md') else str(PurePosixPath(path_str))
-        key = (source.lower(), folder)
-        if key in present:
-            skill_md = skills_dir / present[key]['name'] / 'SKILL.md'
-            if skill_md.is_file():
-                try:
-                    return skill_md.read_text(encoding='utf-8', errors='replace')[:judge_groups.MAX_SKILL_CHARS]
-                except Exception:
-                    pass
-    return ''
+    source, path = member.split(':', 1)
+    checkout = checkouts / source.replace('/', '__')
+    pinned_text = _pinned_member_text(checkout, (pins or {}).get(source), path)
+    return pinned_text or _adopted_member_text(skills_dir, source, path)
 
 
-def resolve_copies(group_rows, checkouts, root, pins, all_candidates, cache, sources):
+def _copy_ranks(sources):
+    """Load the source ranks used to select original skills."""
+    if isinstance(sources, dict):
+        return dict(sources)
+    path = Path(sources) if sources is not None else Path(__file__).resolve().parent / 'census-sources.json'
+    return {repository: source.rank for source in load_sources(path)
+            for repository in (source.repository, source.repository.lower())}
+
+
+def _copy_item(member: str, candidate: dict | None, text: str, skills_dir: Path) -> overlap.Item:
+    """Build an overlap item using the same preprocessing as the cache producer."""
+    if is_existing_skill(member):
+        rel = member.removeprefix('skills/').strip('/')
+        path = skills_dir / rel / 'SKILL.md'
+        blob_id = overlap.git_blob_id(path.read_bytes()) if path.is_file() else ''
+        return overlap.item_from_skill(member, blob_id, rel, text, is_existing=True)
+    candidate = candidate or {}
+    blob_id = candidate.get('blob_id', '').strip()
+    if not blob_id and text:
+        blob_id = overlap.git_blob_id(text.encode('utf-8'))
+    return overlap.item_from_skill(member, blob_id, candidate.get('skill_name', ''), text)
+
+
+def resolve_copies(group_rows, checkouts, root, pins, all_candidates, cache, sources,
+                   embed_model, base_url, embed_dims):
+    """Resolve grouped copies using provenance and embeddings bound to the current inputs."""
     if cache is None:
         raise ValueError('--include-grouped requires --cache')
     cache_path = Path(cache)
     if not cache_path.is_file():
         raise ValueError(f'embedding cache not found: {cache_path}')
-    embeddings = load_cache(cache_path)
-
-    if sources is None:
-        sources_path = Path(__file__).resolve().parent / 'census-sources.json'
-    else:
-        sources_path = Path(sources)
-    if isinstance(sources, dict):
-        ranks = dict(sources)
-    else:
-        loaded_src = load_sources(sources_path)
-        ranks = {s.repository: s.rank for s in loaded_src}
-        for s in loaded_src:
-            ranks[s.repository.lower()] = s.rank
-
+    ranks = _copy_ranks(sources)
     cand_by_cid = {candidate_id(r): r for r in all_candidates}
     all_members = {m.strip() for grow in group_rows for m in grow['members'].split(',') if m.strip()}
-    items: dict[str, Item] = {}
+    items: dict[str, overlap.Item] = {}
     metadata: dict[str, dict[str, str]] = {}
+    skills_dir = root / 'skills'
     for m in all_members:
-        text = get_member_skill_text(m, checkouts, root / 'skills', pins)
-        meta = front_matter_or_empty(text)
-        metadata[m] = meta
-        if is_existing_skill(m):
-            rel = m[len('skills/'):].strip('/')
-            sf = root / 'skills' / rel / 'SKILL.md'
-            b_id = git_blob_id(sf.read_bytes()) if sf.is_file() else ''
-            name = meta.get('name') or rel
-            desc = meta.get('description', '')
-            items[m] = Item(item_id=m, blob_id=b_id, skill_name=name, description=desc, is_existing=True)
-        else:
-            cand = cand_by_cid.get(m)
-            b_id = cand.get('blob_id', '').strip() if cand else ''
-            if not b_id and text:
-                b_id = git_blob_id(text.encode('utf-8'))
-            name = (cand.get('skill_name') if cand else None) or meta.get('name') or ''
-            desc = meta.get('description', '')
-            items[m] = Item(item_id=m, blob_id=b_id, skill_name=name, description=desc, is_existing=False)
+        text = get_member_skill_text(m, checkouts, skills_dir, pins)
+        metadata[m] = front_matter_or_empty(text)
+        items[m] = _copy_item(m, cand_by_cid.get(m), text, skills_dir)
+    embeddings = overlap.load_embeddings(cache_path, list(items.values()), embed_model, base_url or '', embed_dims)
 
     copies_map = {}
     for grow in group_rows:
@@ -992,7 +1001,8 @@ def evaluate(row, grouped, order, pins, checkouts, root, staging, occupied, appl
 
 
 def default_download_runner(args, *, cwd=None):
-    proc = subprocess.run(args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    """Download licence text with the adoption command deadline."""
+    proc = subprocess.run(args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=TIMEOUT)
     if proc.returncode != 0:
         detail = proc.stderr.decode('utf-8', errors='replace').strip()[:500]
         spdx_id = args[-1] if args else 'unknown'
@@ -1047,7 +1057,11 @@ def resolve_report_path(report: Path | None, root: Path) -> Path | None:
 def run(candidates, groups, census, checkouts, root=Path('.'), *, apply=False,
         reader=default_reader, gate=markdown_gate, hiss_gate=hiss_gate,
         report=None, runner=None, download_runner=None,
-        include_grouped=False, cache=None, sources=None):
+        include_grouped=False, cache=None, sources=None, embed_model=None, base_url=None, embed_dims=None):
+    """Preview or apply adoption using the selected overlap cache namespace."""
+    embed_model = embed_model or os.environ.get('PERITIA_LLM_EMBED_MODEL')
+    if cache is not None and not embed_model:
+        raise ValueError('--cache requires --embed-model (or set PERITIA_LLM_EMBED_MODEL)')
     if download_runner is not None:
         runner = download_runner
     if runner is None:
@@ -1063,7 +1077,8 @@ def run(candidates, groups, census, checkouts, root=Path('.'), *, apply=False,
 
     copies_map = {}
     if include_grouped:
-        copies_map = resolve_copies(group_rows, checkouts, root, pins, all_candidates, cache, sources)
+        copies_map = resolve_copies(group_rows, checkouts, root, pins, all_candidates, cache, sources,
+                                    embed_model, base_url, embed_dims)
 
     reuse, credits = initial_metadata(root)
     occupied = {path.name for path in (root / 'skills').iterdir() if path.is_dir()} if (root / 'skills').exists() else set()
@@ -1096,6 +1111,7 @@ def run(candidates, groups, census, checkouts, root=Path('.'), *, apply=False,
 
 
 def main(argv=None):
+    """Parse adoption options and print the report for the requested run."""
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('candidates', 'groups', 'census', 'checkouts'):
         parser.add_argument('--' + name, required=True, type=Path)
@@ -1104,11 +1120,19 @@ def main(argv=None):
     parser.add_argument('--report', type=Path, default=None, help='write adopt-report.tsv to this path')
     parser.add_argument('--include-grouped', action='store_true', help='adopt overlap-group members except collapsed copies')
     parser.add_argument('--cache', type=Path, default=None, help='embedding cache JSON path (required by --include-grouped)')
+    parser.add_argument('--embed-model', default=os.environ.get('PERITIA_LLM_EMBED_MODEL'),
+                        help='model for cached embeddings (PERITIA_LLM_EMBED_MODEL)')
+    parser.add_argument('--base-url', default=os.environ.get('PERITIA_LLM_BASE_URL'),
+                        help='provider URL for cached embeddings (PERITIA_LLM_BASE_URL)')
+    parser.add_argument('--embed-dims', type=int, help='dimension of the cached embedding vectors')
     args = parser.parse_args(argv)
+    if args.cache is not None and not args.embed_model:
+        parser.error('--cache requires --embed-model (or set PERITIA_LLM_EMBED_MODEL)')
     try:
         rows, totals = run(args.candidates, args.groups, args.census, args.checkouts, args.root,
                            apply=args.apply, report=args.report,
-                           include_grouped=args.include_grouped, cache=args.cache)
+                           include_grouped=args.include_grouped, cache=args.cache, embed_model=args.embed_model,
+                           base_url=args.base_url, embed_dims=args.embed_dims)
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
         print(f'adopt-skills: {error}', file=sys.stderr)
         return 1

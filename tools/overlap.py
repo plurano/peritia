@@ -14,22 +14,23 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import io
 import json
 import math
 import os
 import sys
+import tempfile
 import urllib.error
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-_TOOLS_DIR = Path(__file__).resolve().parent
-if str(_TOOLS_DIR) not in sys.path:
-    sys.path.insert(0, str(_TOOLS_DIR))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from check_skills import front_matter_or_empty  # noqa: E402
-from llm_client import LLMClient  # noqa: E402
+from check_skills import front_matter_or_empty
+from input_identity import canonical_json, fingerprint, open_fingerprinted_tsv, provider_id, text_sha256
+from llm_client import LLMClient
 
 MAX_CANDIDATES = 200_000
 MAX_EXISTING_SKILLS = 5_000
@@ -38,13 +39,21 @@ MAX_GROUPS = 100_000
 MAX_BATCH_SIZE = 64
 MAX_DESC_CHARS = 600
 MAX_SKILL_CHARS = 8192
+EMBED_PREPROCESSING = fingerprint("embed-prep", {
+    "text": "skill_name + ': ' + description",
+    "max_desc_chars": MAX_DESC_CHARS,
+    "max_skill_chars": MAX_SKILL_CHARS,
+    "crlf": "lf",
+    "normalise": "l2-at-use",
+})
 ATTEMPTS = 2
 DEFAULT_K = 5
 DEFAULT_EMBED_MODEL = os.environ.get("PERITIA_LLM_EMBED_MODEL")
 DEFAULT_JUDGE_MODEL = os.environ.get("PERITIA_LLM_JUDGE_MODEL")
 DEFAULT_BASE_URL = os.environ.get("PERITIA_LLM_BASE_URL")
 
-OVERLAP_FIELDS = ["a", "b", "cosine", "rank", "name_match", "same_use", "reason", "model"]
+OVERLAP_FIELDS = ["a", "b", "cosine", "rank", "name_match", "same_use", "reason", "model",
+                  "blob_a", "blob_b", "judge_fp"]
 GROUPS_FIELDS = ["group_id", "members", "edges", "has_existing"]
 
 JUDGE_SYSTEM_PROMPT = (
@@ -74,6 +83,7 @@ class Item:
     skill_name: str
     description: str
     is_existing: bool = False
+    content_blob_id: str = ""
 
 
 @dataclass
@@ -87,8 +97,30 @@ class CandidatePair:
     item_b: Item
 
 
+def item_from_skill(
+    item_id: str, blob_id: str, fallback_name: str, text: str, is_existing: bool = False,
+    *, content_blob_id: str = "",
+) -> Item:
+    """Extract the same name and description for every embedding cache consumer."""
+    meta = front_matter_or_empty(text.replace("\r\n", "\n").replace("\r", "\n")[:MAX_SKILL_CHARS])
+    return Item(item_id, blob_id, meta.get("name") or fallback_name,
+                meta.get("description", "")[:MAX_DESC_CHARS], is_existing, content_blob_id)
+
+
+def _read_candidate_skill(path: Path) -> tuple[str, str]:
+    """Read the embedding text prefix and hash the on-disk skill as a Git blob."""
+    with path.open("rb") as handle:
+        size = os.fstat(handle.fileno()).st_size
+        digest = hashlib.sha1(f"blob {size}\0".encode("utf-8"))
+        for chunk in range(0, size, 65536):
+            digest.update(handle.read(min(65536, size - chunk)))
+        handle.seek(0)
+        with io.TextIOWrapper(handle, encoding="utf-8", errors="replace") as text:
+            return text.read(MAX_SKILL_CHARS), digest.hexdigest()
+
+
 def load_candidates(candidates_tsv: Path, checkouts: Path) -> list[Item]:
-    """Reads verdict candidate rows from candidates.tsv and their SKILL.md from checkouts."""
+    """Read candidate items and their current skill inputs from confined checkouts."""
     items: list[Item] = []
     if not candidates_tsv.exists():
         return items
@@ -113,21 +145,17 @@ def load_candidates(candidates_tsv: Path, checkouts: Path) -> list[Item]:
                 continue
 
             try:
-                with skill_path.open(encoding="utf-8", errors="replace") as f:
-                    content = f.read(MAX_SKILL_CHARS).replace("\r\n", "\n")
+                text, current_blob = _read_candidate_skill(skill_path)
             except OSError:
                 continue
 
-            meta = front_matter_or_empty(content)
-            name = meta.get("name") or skill_name
-            desc = meta.get("description", "")[:MAX_DESC_CHARS]
-            item_id = f"{source}:{path_str}"
-            items.append(Item(item_id=item_id, blob_id=blob_id, skill_name=name, description=desc, is_existing=False))
+            items.append(item_from_skill(f"{source}:{path_str}", blob_id, skill_name,
+                                         text, content_blob_id=current_blob))
     return items
 
 
 def load_existing_skills(skills_dir: Path) -> list[Item]:
-    """Reads existing skills from the repository's skills/<name>/SKILL.md."""
+    """Read existing skills under the repository's skills directory."""
     items: list[Item] = []
     if not skills_dir.is_dir():
         return items
@@ -141,12 +169,8 @@ def load_existing_skills(skills_dir: Path) -> list[Item]:
         except OSError:
             continue
         blob_id = git_blob_id(raw_bytes)
-        content = raw_bytes.decode("utf-8", errors="replace")[:MAX_SKILL_CHARS].replace("\r\n", "\n")
-        meta = front_matter_or_empty(content)
-        name = meta.get("name") or p.name
-        desc = meta.get("description", "")[:MAX_DESC_CHARS]
-        item_id = f"skills/{p.name}"
-        items.append(Item(item_id=item_id, blob_id=blob_id, skill_name=name, description=desc, is_existing=True))
+        items.append(item_from_skill(f"skills/{p.name}", blob_id, p.name,
+                                     raw_bytes.decode("utf-8", errors="replace"), is_existing=True))
     return items
 
 
@@ -183,48 +207,184 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
-def load_cache(cache_path: Path | None) -> dict[str, list[float]]:
-    """Loads cached embeddings mapping blob_id -> vector."""
+def _read_embedding_cache(cache_path: Path | None) -> tuple[dict[str, Any], bool]:
+    """Read cache namespaces and quarantine a legacy cache without binding its vectors."""
     if cache_path is None or not cache_path.exists():
-        return {}
-    with cache_path.open(encoding="utf-8") as handle:
-        return json.load(handle)
+        return {"version": 2, "namespaces": {}}, False
+    try:
+        with cache_path.open(encoding="utf-8") as handle:
+            cache = json.load(handle)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"{cache_path}: invalid embedding cache JSON: {error}") from error
+    if isinstance(cache, dict) and cache.get("version") == 2 and isinstance(cache.get("namespaces"), dict):
+        return cache, False
+    if isinstance(cache, dict) and all(isinstance(vector, list) for vector in cache.values()):
+        return {"version": 2, "namespaces": {}, "legacy_unbound": cache}, True
+    raise ValueError(f"{cache_path}: invalid embedding cache format")
 
 
-def save_cache(cache_path: Path, cache: dict[str, list[float]]) -> None:
-    """Atomically saves cached embeddings."""
+def save_cache(cache_path: Path, cache: dict[str, Any]) -> None:
+    """Replace the embedding cache atomically after writing a complete temporary file."""
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    temp = cache_path.with_suffix(".tmp")
-    with temp.open("w", encoding="utf-8") as handle:
-        json.dump(cache, handle)
-    temp.replace(cache_path)
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=cache_path.parent, delete=False) as handle:
+        temp = Path(handle.name)
+        try:
+            json.dump(cache, handle)
+            handle.close()
+            temp.replace(cache_path)
+        finally:
+            temp.unlink(missing_ok=True)
+
+
+@dataclass(frozen=True)
+class EmbeddingSpace:
+    """Identify an embedding model and the text preparation it receives."""
+
+    model: str
+    provider: str
+    preprocessing: str
+
+    def fields(self) -> dict[str, str]:
+        """Return the namespace fields common to all vector dimensions."""
+        return {"model": self.model, "provider": self.provider, "preprocessing": self.preprocessing}
+
+    def key(self, dims: int) -> str:
+        """Fingerprint the space at the given vector dimension."""
+        return fingerprint("embed", {**self.fields(), "dims": dims})
+
+    def resolve(self, namespaces: dict, dims: int | None) -> int | None:
+        """Select explicit dimensions or infer them from a unique matching namespace."""
+        if dims is not None:
+            if type(dims) is not int or dims < 1:
+                raise ValueError(f"embedding model {self.model}: --embed-dims must be positive")
+            return dims
+        fields = self.fields()
+        matches = [space.get("dims") for space in namespaces.values()
+                   if isinstance(space, dict) and all(space.get(key) == value for key, value in fields.items())]
+        if len(matches) > 1:
+            raise ValueError(f"embedding model {self.model}: multiple dimensions in cache, specify --embed-dims")
+        if not matches:
+            return None
+        dims = matches[0]
+        if type(dims) is not int or dims < 1:
+            raise ValueError(f"embedding model {self.model}: invalid cache dimensions {dims!r}")
+        return dims
+
+    def vectors(self, namespaces: dict, dims: int | None) -> dict | None:
+        """Return entries from a namespace only when its key and metadata match."""
+        if dims is None:
+            return None
+        space = namespaces.get(self.key(dims))
+        if not isinstance(space, dict) or any(space.get(key) != value for key, value in self.fields().items()):
+            return None
+        if space.get("dims") != dims or not isinstance(space.get("vectors"), dict):
+            raise ValueError(f"embedding model {self.model}: invalid cache namespace {self.key(dims)}")
+        return space["vectors"]
+
+
+def _embedding_texts(items: list[Item]) -> dict[str, str]:
+    """Index the exact input text for each blob in the embedding request."""
+    texts: dict[str, str] = {}
+    for item in items:
+        if not item.blob_id:
+            continue
+        text = make_embed_text(item)
+        if texts.setdefault(item.blob_id, text) != text:
+            raise ValueError(f"embedding blob {item.blob_id}: conflicting input texts")
+    return texts
+
+
+def _check_vector(model: str, dims: int | None, vector: list[float]) -> int:
+    """Validate a vector and return its dimensions when they were unknown."""
+    if not isinstance(vector, list):
+        raise TypeError(f"embedding model {model}: vector must be an array")
+    expected = len(vector) if dims is None else dims
+    if expected < 1 or len(vector) != expected:
+        raise ValueError(f"embedding model {model}: expected {expected} dimensions, got {len(vector)}")
+    if not all(type(value) in (int, float) and math.isfinite(value) for value in vector):
+        raise ValueError(f"embedding model {model}: vector must contain finite numbers")
+    return expected
+
+
+def _matching_embeddings(texts: dict[str, str], entries: dict, model: str, dims: int | None) -> dict[str, list[float]]:
+    """Return only validated vectors for the exact current input texts."""
+    matched = {}
+    for blob, text in texts.items():
+        entry = entries.get(blob)
+        if dims is not None and isinstance(entry, dict) and entry.get("text_sha256") == text_sha256(text):
+            vector = entry.get("vector")
+            _check_vector(model, dims, vector)
+            matched[blob] = vector
+    return matched
+
+
+def _embed_missing(
+    texts: dict[str, str], missing: list[str], dims: int | None, model: str,
+    embed_fn: Callable[[list[str]], list[list[float]]],
+) -> tuple[int | None, dict[str, list[float]]]:
+    """Embed missing texts in bounded batches and assert a common vector length."""
+    additions = {}
+    for start in range(0, len(missing), MAX_BATCH_SIZE):
+        batch = missing[start : start + MAX_BATCH_SIZE]
+        vectors = embed_fn([texts[blob] for blob in batch])
+        if len(vectors) != len(batch):
+            raise ValueError(f"embedding model {model}: expected {len(batch)} vectors, got {len(vectors)}")
+        for blob, vector in zip(batch, vectors):
+            dims = _check_vector(model, dims, vector)
+            additions[blob] = vector
+    return dims, additions
+
+
+def load_embeddings(
+    cache_path: Path | None, items: list[Item], model: str, provider: str, embed_dims: int | None = None,
+    *,
+    embed_fn: Callable[[list[str]], list[list[float]]] | None = None,
+) -> dict[str, list[float]]:
+    """Read embeddings for current inputs and optionally generate missing vectors."""
+    if cache_path is None and embed_fn is None:
+        return {}
+    if cache_path is not None and not model:
+        raise ValueError("--cache requires --embed-model (or set PERITIA_LLM_EMBED_MODEL)")
+    cache, migrated = _read_embedding_cache(cache_path)
+    namespaces = cache["namespaces"]
+    space = EmbeddingSpace(model, provider_id(provider), EMBED_PREPROCESSING)
+    dims = space.resolve(namespaces, embed_dims)
+    entries = space.vectors(namespaces, dims)
+    if entries is None and embed_fn is None:
+        legacy_note = " (legacy vectors are unbound)" if migrated else ""
+        print(f"{cache_path}: no matching embedding namespace for model {model}{legacy_note}", file=sys.stderr)
+        return {}
+
+    texts = _embedding_texts(items)
+    result = _matching_embeddings(texts, entries or {}, model, dims)
+    if embed_fn is None:
+        return result
+    missing = [blob for blob in texts if blob not in result]
+    dims, additions = _embed_missing(texts, missing, dims, model, embed_fn)
+    if cache_path is not None and (additions or migrated):
+        if dims is not None and additions:
+            updated = dict(entries or {})
+            updated.update({blob: {"text_sha256": text_sha256(texts[blob]), "vector": vector}
+                            for blob, vector in additions.items()})
+            namespaces[space.key(dims)] = {**space.fields(), "dims": dims, "vectors": updated}
+        save_cache(cache_path, cache)
+        if migrated:
+            print(f"{cache_path}: moved legacy embedding vectors to legacy_unbound", file=sys.stderr)
+    result.update(additions)
+    return result
 
 
 def get_embeddings(
     items: list[Item],
     embed_fn: Callable[[list[str]], list[list[float]]],
-    cache: dict[str, list[float]],
     cache_path: Path | None = None,
+    *,
+    model: str = "",
+    provider: str = "",
+    embed_dims: int | None = None,
 ) -> dict[str, list[float]]:
-    """Retrieves embeddings for items, batching uncached calls up to 64 texts."""
-    uncached: dict[str, str] = {}
-    for item in items:
-        if item.blob_id not in cache and item.blob_id not in uncached:
-            uncached[item.blob_id] = make_embed_text(item)
-
-    if uncached:
-        uncached_blobs = list(uncached.keys())
-        for i in range(0, len(uncached_blobs), MAX_BATCH_SIZE):
-            batch_blobs = uncached_blobs[i : i + MAX_BATCH_SIZE]
-            batch_texts = [uncached[b] for b in batch_blobs]
-            embeddings = embed_fn(batch_texts)
-            for b, emb in zip(batch_blobs, embeddings):
-                cache[b] = emb
-
-        if cache_path is not None:
-            save_cache(cache_path, cache)
-
-    return cache
+    """Read cached embeddings and make requests for any missing inputs."""
+    return load_embeddings(cache_path, items, model, provider, embed_dims, embed_fn=embed_fn)
 
 
 def find_candidate_pairs(
@@ -332,14 +492,12 @@ def judge_one(judge_fn: Callable[[str], Any], prompt: str) -> tuple[bool, str] |
 
 
 def load_done_pairs(overlap_tsv: Path) -> dict[tuple[str, str], dict[str, str]]:
-    """Loads previously judged pairs from overlap.tsv so runs resume."""
+    """Read the latest row per pair, including legacy rows for summary."""
     if not overlap_tsv.exists():
         return {}
     done: dict[tuple[str, str], dict[str, str]] = {}
     with overlap_tsv.open(newline="", encoding="utf-8") as handle:
-        for i, row in enumerate(csv.DictReader(handle, delimiter="\t")):
-            if i >= MAX_PAIRS:
-                break
+        for row in csv.DictReader(handle, delimiter="\t"):
             a, b = row.get("a", ""), row.get("b", "")
             if a and b:
                 key = (min(a, b), max(a, b))
@@ -495,23 +653,18 @@ def _count_unjudged(
     valid_ids: set[str] | None,
     skills_dir: Path | None,
 ) -> int:
-    """Counts unjudged pairs between valid items."""
+    """Count the last result for each unjudged pair between valid items."""
     num_unjudged = 0
-    if not overlap_path.exists():
-        return 0
-    with overlap_path.open(newline="", encoding="utf-8") as handle:
-        for i, row in enumerate(csv.DictReader(handle, delimiter="\t")):
-            if i >= MAX_PAIRS:
-                break
-            if row.get("same_use") == "unjudged":
-                a = row.get("a", "")
-                b = row.get("b", "")
-                if valid_ids is not None:
-                    a_valid = a in valid_ids or (not (skills_dir and skills_dir.is_dir()) and a.startswith("skills/"))
-                    b_valid = b in valid_ids or (not (skills_dir and skills_dir.is_dir()) and b.startswith("skills/"))
-                    if not (a_valid and b_valid):
-                        continue
-                num_unjudged += 1
+    allow_unknown_existing = not (skills_dir and skills_dir.is_dir())
+    for (a, b), row in load_done_pairs(overlap_path).items():
+        if row.get("same_use") != "unjudged":
+            continue
+        if valid_ids is not None and any(
+            item not in valid_ids and not (allow_unknown_existing and item.startswith("skills/"))
+            for item in (a, b)
+        ):
+            continue
+        num_unjudged += 1
     return num_unjudged
 
 
@@ -560,21 +713,58 @@ class OverlapJudge:
         )
 
 
+@dataclass(frozen=True)
+class PairJudgeIdentity:
+    """Bind a pair judgment to its model, endpoint, prompts and response schema."""
+
+    model: str
+    provider: str
+    system_prompt_sha256: str
+    schema_sha256: str
+
+    def key(self, prompt: str) -> str:
+        """Fingerprint the exact judge request for this pair."""
+        return fingerprint("pair-judge", {
+            "judge_model": self.model,
+            "provider": self.provider,
+            "judge_system_prompt_sha256": self.system_prompt_sha256,
+            "judge_prompt_sha256": text_sha256(prompt),
+            "judge_schema_sha256": self.schema_sha256,
+        })
+
+
+def _pair_blobs(a: Item, b: Item) -> tuple[str, str]:
+    """Return the blob ids of the two skill files that are currently on disk."""
+    return a.content_blob_id or a.blob_id, b.content_blob_id or b.blob_id
+
+
+def _matching_pairs(
+    overlap_out: Path, items: list[Item], identity: PairJudgeIdentity,
+) -> dict[tuple[str, str], dict[str, str]]:
+    """Keep only the last pair rows that still describe current judging inputs."""
+    by_id = {item.item_id: item for item in items}
+    matched = {}
+    for key, row in load_done_pairs(overlap_out).items():
+        a, b = by_id.get(key[0]), by_id.get(key[1])
+        if a is None or b is None or (row.get("blob_a"), row.get("blob_b")) != _pair_blobs(a, b):
+            continue
+        if row.get("judge_fp") == identity.key(make_judge_prompt(a, b)):
+            matched[key] = row
+    return matched
+
+
 def _judge_pairs(
     pairs: list[CandidatePair],
-    done: dict[tuple[str, str], dict[str, str]],
+    all_items: list[Item],
     overlap_out: Path,
     judge_fn: Callable[[str], Any],
-    judge_model: str,
-) -> None:
-    """Judges candidate pairs not yet in done, appending each to overlap_out."""
-    fresh = not overlap_out.exists()
+    identity: PairJudgeIdentity,
+) -> dict[tuple[str, str], dict[str, str]]:
+    """Resume matching judgments and append one row for each newly judged pair."""
     overlap_out.parent.mkdir(parents=True, exist_ok=True)
-    with overlap_out.open("a", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=OVERLAP_FIELDS, delimiter="\t", lineterminator="\n")
-        if fresh:
-            writer.writeheader()
-
+    handle, writer = open_fingerprinted_tsv(overlap_out, OVERLAP_FIELDS, "judge_fp")
+    with handle:
+        done = _matching_pairs(overlap_out, all_items, identity)
         for pair in pairs:
             pair_key = (pair.a, pair.b)
             if pair_key in done:
@@ -589,6 +779,7 @@ def _judge_pairs(
                 same_use = "unjudged"
                 reason = "unjudged: failed after 2 attempts"
 
+            blob_a, blob_b = _pair_blobs(pair.item_a, pair.item_b)
             row = {
                 "a": pair.a,
                 "b": pair.b,
@@ -597,11 +788,15 @@ def _judge_pairs(
                 "name_match": "true" if pair.name_match else "false",
                 "same_use": same_use,
                 "reason": reason,
-                "model": judge_model,
+                "model": identity.model,
+                "blob_a": blob_a,
+                "blob_b": blob_b,
+                "judge_fp": identity.key(prompt),
             }
             writer.writerow(row)
             handle.flush()
             done[pair_key] = row
+    return done
 
 
 def run(
@@ -616,20 +811,24 @@ def run(
     cache_path: Path | None = None,
     k: int = DEFAULT_K,
     limit: int | None = None,
+    embed_model: str | None = DEFAULT_EMBED_MODEL,
+    provider: str = "",
+    embed_dims: int | None = None,
 ) -> tuple[int, int]:
-    """Runs overlap detection and judging, writing overlap.tsv and groups.tsv."""
+    """Detect overlap and write current pair judgments and groups."""
     candidates = load_candidates(candidates_tsv, checkouts)
     if limit is not None:
         candidates = candidates[:limit]
     existing = load_existing_skills(skills_dir)
     all_items = candidates + existing
 
-    cache = load_cache(cache_path)
-    embeddings = get_embeddings(all_items, embed_fn, cache, cache_path)
+    embeddings = get_embeddings(all_items, embed_fn, cache_path, model=embed_model or "",
+                                provider=provider, embed_dims=embed_dims)
     pairs = find_candidate_pairs(candidates, all_items, embeddings, k=k)
 
-    done = load_done_pairs(overlap_out)
-    _judge_pairs(pairs, done, overlap_out, judge_fn, judge_model)
+    identity = PairJudgeIdentity(judge_model, provider_id(provider), text_sha256(JUDGE_SYSTEM_PROMPT),
+                                 text_sha256(canonical_json(judge_schema())))
+    done = _judge_pairs(pairs, all_items, overlap_out, judge_fn, identity)
 
     groups = build_groups(list(done.values()), all_items)
     write_groups(groups_out, groups)
@@ -637,6 +836,7 @@ def run(
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
+    """Parse overlap commands and require the endpoint and models for a run."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     commands = parser.add_subparsers(dest="command", required=True)
 
@@ -649,6 +849,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     run_cmd.add_argument("--cache", type=Path, default=None, help="JSON cache file for embeddings")
     run_cmd.add_argument("--embed-model", default=DEFAULT_EMBED_MODEL,
                          help="embedding model name (PERITIA_LLM_EMBED_MODEL)")
+    run_cmd.add_argument("--embed-dims", type=int, help="assert the embedding vector dimensions")
     run_cmd.add_argument("--judge-model", default=DEFAULT_JUDGE_MODEL,
                          help="chat model name for judging (PERITIA_LLM_JUDGE_MODEL)")
     run_cmd.add_argument("--base-url", default=DEFAULT_BASE_URL,
@@ -675,6 +876,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 def main(argv: list[str]) -> int:
+    """Run the selected overlap command."""
     args = parse_args(argv)
     if args.command == "summary":
         print(summary(args.overlap, args.groups, args.candidates, skills_dir=args.skills_dir))
@@ -691,6 +893,9 @@ def main(argv: list[str]) -> int:
         judge_fn=judge.judge,
         judge_model=args.judge_model,
         cache_path=args.cache,
+        embed_model=args.embed_model,
+        provider=args.base_url,
+        embed_dims=args.embed_dims,
         k=args.k,
         limit=args.limit,
     )

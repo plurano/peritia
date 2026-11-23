@@ -3,11 +3,13 @@
 # SPDX-License-Identifier: EUPL-1.2
 """Offline self-tests for judge_groups.py; no test calls a live model."""
 import csv
+import io
 import json
 import math
 import re
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from unittest.mock import Mock, patch
 from pathlib import Path
 import sys
@@ -18,6 +20,7 @@ if str(_TOOLS_DIR) not in sys.path:
 
 import classify
 import judge_groups
+import overlap
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -220,6 +223,7 @@ class PrimaryClassTests(unittest.TestCase):
 
 
 def _setup_resume_env(tmp: Path) -> tuple[Path, Path, Path, Path, Path, Path, Path]:
+    """Write two distinct skills and three distinct task prompts in one group."""
     groups_tsv = tmp / "groups.tsv"
     trials_jsonl = tmp / "trials.jsonl"
     verdicts_tsv = tmp / "verdicts.tsv"
@@ -229,6 +233,8 @@ def _setup_resume_env(tmp: Path) -> tuple[Path, Path, Path, Path, Path, Path, Pa
     skills_dir = tmp / "skills"
     checkouts.mkdir()
     skills_dir.mkdir()
+    for member in ("cand-1", "cand-2"):
+        (checkouts / member).write_text(member, encoding="utf-8")
 
     with groups_tsv.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=["group_id", "members", "edges", "has_existing"], delimiter="\t")
@@ -245,7 +251,7 @@ def _setup_resume_env(tmp: Path) -> tuple[Path, Path, Path, Path, Path, Path, Pa
         "version": 1,
         "classes": {
             "coding": [{
-                "id": f"code-{i}", "prompt": "write a greeting module in python",
+                "id": f"code-{i}", "prompt": f"write a greeting module in python, variant {i}",
                 "must_match": ["hello"], "must_not_match": ["bad"],
                 "rubric": "friendly greeting",
             } for i in range(3)]
@@ -256,6 +262,7 @@ def _setup_resume_env(tmp: Path) -> tuple[Path, Path, Path, Path, Path, Path, Pa
 
 
 def setup_copy_env(tmp):
+    """Build two near copies and a validated cache at their serving endpoint."""
     paths = _setup_resume_env(tmp)
     groups, tasks, candidates, verdicts, trials, checkouts, skills = paths
     rows = []
@@ -273,12 +280,15 @@ def setup_copy_env(tmp):
     members = [f"{row['source']}:{row['path']}" for row in rows]
     groups.write_text("group_id\tmembers\n1\t" + ",".join(members) + "\n")
     cache = tmp / "cache.json"
-    cache.write_text(json.dumps({"original": [1, 0], "copy": [0.99, math.sqrt(1 - 0.99 ** 2)]}))
+    overlap.get_embeddings(overlap.load_candidates(candidates, checkouts),
+                           lambda texts: [[1, 0], [0.99, math.sqrt(1 - 0.99 ** 2)]],
+                           cache, model="embed-model", provider="http://127.0.0.1:9999/v1")
     return paths, members, cache
 
 
 class EndToEndAndResumeTests(unittest.TestCase):
     def test_cli_uses_cache_and_never_calls_models_for_copy(self):
+        """Use matching cached embeddings to judge only the original skill."""
         with tempfile.TemporaryDirectory() as folder:
             paths, members, cache = setup_copy_env(Path(folder))
             groups, tasks, candidates, verdicts, trials, checkouts, skills = paths
@@ -289,7 +299,8 @@ class EndToEndAndResumeTests(unittest.TestCase):
                                            "--checkouts", str(checkouts), "--skills-dir", str(skills),
                                            "--out", str(verdicts), "--trials-out", str(trials), "--cache", str(cache),
                                            "--base-url", "http://127.0.0.1:9999/v1", "--model", "test-model",
-                                           "--judge-model", "test-judge"])
+                                           "--judge-model", "test-judge", "--embed-model", "embed-model",
+                                           "--embed-dims", "2"])
             self.assertEqual(status, 0)
             self.assertEqual(chat.call_count, 9)
             self.assertEqual(judge.call_count, 9)
@@ -317,6 +328,7 @@ class EndToEndAndResumeTests(unittest.TestCase):
             self.assertEqual({call.args[1] for call in chat.call_args_list}, {f"test prompt {i}" for i in range(3)})
 
     def test_existing_copy_is_replacement_proposal_never_dropped(self):
+        """Retain an existing skill even when its source names an original."""
         with tempfile.TemporaryDirectory() as folder:
             paths, members, cache = setup_copy_env(Path(folder))
             groups, tasks, candidates, verdicts, trials, checkouts, skills = paths
@@ -326,54 +338,217 @@ class EndToEndAndResumeTests(unittest.TestCase):
             groups.write_text("group_id\tmembers\n1\t" + members[0] + ",skills/pdf\n")
             chat = Mock(return_value="hello")
             row = judge_groups.run(groups, tasks, checkouts, skills, verdicts, trials, candidates,
-                                   chat_fn=chat, judge_fn=lambda prompt: 8, cache_path=cache)[0]
+                                   chat_fn=chat, judge_fn=lambda prompt: 8, cache_path=cache,
+                                   embed_model="embed-model", base_url="http://127.0.0.1:9999/v1")[0]
             self.assertEqual(row["verdict"], "replace-proposed")
             self.assertEqual(row["dropped"], "")
             self.assertEqual(json.loads(row["copies"]), {"skills/pdf": f"copy-of:{members[0]}"})
             self.assertTrue((existing / "SKILL.md").exists())
             self.assertEqual(chat.call_count, 9)
 
+    def test_other_embedding_model_does_not_infer_copy(self):
+        """Warn and retain both members when a cache belongs to another model."""
+        with tempfile.TemporaryDirectory() as folder:
+            paths, _, cache = setup_copy_env(Path(folder))
+            groups, tasks, candidates, verdicts, trials, checkouts, skills = paths
+            chat, judge = Mock(return_value="hello"), Mock(return_value=8.0)
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                row = judge_groups.run(groups, tasks, checkouts, skills, verdicts, trials, candidates,
+                                       chat_fn=chat, judge_fn=judge, cache_path=cache, embed_model="other-model",
+                                       base_url="http://127.0.0.1:9999/v1", k=1)[0]
+            self.assertEqual(json.loads(row["copies"]), {})
+            self.assertEqual((chat.call_count, judge.call_count), (6, 6))
+            self.assertEqual(len(stderr.getvalue().splitlines()), 1)
+            self.assertIn("other-model", stderr.getvalue())
+            self.assertIn(str(cache), stderr.getvalue())
+
+    def test_cache_cli_requires_model(self):
+        """Reject a cache without a specified embedding model."""
+        stderr = io.StringIO()
+        with (patch.dict("os.environ", {"PERITIA_LLM_EMBED_MODEL": ""}),
+              redirect_stderr(stderr), self.assertRaises(SystemExit) as error):
+            judge_groups.parse_args(["run", "--cache", "cache.json"])
+        self.assertEqual(error.exception.code, 2)
+        self.assertIn("--cache requires --embed-model", stderr.getvalue())
+
+
+class TrialIdentityTests(unittest.TestCase):
+    """Check answer, rule grade and model judge invalidation independently."""
+
+    def setUp(self):
+        """Create a two-member run with independently identifiable prompts and answers."""
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        groups, self.tasks, candidates, self.verdicts, self.trials, self.checkouts, skills = (
+            _setup_resume_env(Path(temp.name))
+        )
+        self.chat = Mock(return_value="hello world")
+        self.judge = Mock(return_value=8.0)
+        self.options = dict(groups_tsv=groups, eval_tasks_json=self.tasks, checkouts=self.checkouts,
+                            skills_dir=skills, verdicts_out=self.verdicts, trials_out=self.trials,
+                            candidates_tsv=candidates, chat_fn=self.chat, judge_fn=self.judge,
+                            k=2, model="model-one", judge_model="judge-one", base_url="", temperature=0.7)
+
+    def first_run(self):
+        """Write twelve trials and clear the counters so the next run is measurable."""
+        judge_groups.run(**self.options)
+        self.assert_calls(12, 12)
+        self.chat.reset_mock()
+        self.judge.reset_mock()
+        return self.trials.read_bytes()
+
+    def assert_calls(self, chat, judge):
+        """Check both fake model call counts for a single run."""
+        self.assertEqual((self.chat.call_count, self.judge.call_count), (chat, judge))
+
+    def new_rows(self, previous=b""):
+        """Decode appended rows after checking that the prior bytes are intact."""
+        current = self.trials.read_bytes()
+        self.assertTrue(current.startswith(previous))
+        return [json.loads(line) for line in current[len(previous):].splitlines()]
+
+    def set_task_field(self, field, value):
+        """Replace one field of the first task without changing its id."""
+        data = json.loads(self.tasks.read_text())
+        data["classes"]["coding"][0][field] = value
+        self.tasks.write_text(json.dumps(data), encoding="utf-8")
+
     def test_resume_skips_done_trials(self):
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            groups_tsv, eval_tasks_json, candidates_tsv, verdicts_tsv, trials_jsonl, checkouts, skills_dir = (
-                _setup_resume_env(Path(tmp_dir))
-            )
-            chat_counter = 0
+        """Reuse matching trials with no append and neither model called."""
+        before = self.first_run()
+        judge_groups.run(**self.options)
+        self.assert_calls(0, 0)
+        self.assertEqual(self.trials.read_bytes(), before)
 
-            def fake_chat(sys_prompt: str, user_prompt: str, temp: float, seed: int) -> str:
-                nonlocal chat_counter
-                chat_counter += 1
-                return "hello world"
+    def test_changed_answer_model_runs_all_trials(self):
+        """Generate and judge every answer under a new answer model."""
+        before = self.first_run()
+        row = judge_groups.run(**(self.options | {"model": "model-two"}))[0]
+        self.assert_calls(12, 12)
+        added = self.new_rows(before)
+        self.assertEqual(len(added), 12)
+        self.assertEqual({rec["model"] for rec in added}, {"model-two"})
+        self.assertEqual({rec["record_version"] for rec in added}, {2})
+        self.assertEqual({rec["answer"] for rec in added}, {"hello world"})
+        self.assertEqual(row["model"], "model-two")
 
-            def fake_judge(prompt: str) -> float:
-                return 8.0
+    def test_changed_provider_runs_all_trials(self):
+        """Invalidate answers when the endpoint changes, even with injected callables."""
+        before = self.first_run()
+        base = "https://user:password@provider.test:123/v1/?key=hidden#fragment"
+        judge_groups.run(**(self.options | {"base_url": base}))
+        self.assert_calls(12, 12)
+        self.assertEqual({rec["provider"] for rec in self.new_rows(before)}, {"https://provider.test:123/v1"})
 
-            run_kwargs = {
-                "groups_tsv": groups_tsv, "eval_tasks_json": eval_tasks_json,
-                "checkouts": checkouts, "skills_dir": skills_dir,
-                "verdicts_out": verdicts_tsv, "trials_out": trials_jsonl,
-                "candidates_tsv": candidates_tsv, "chat_fn": fake_chat,
-                "judge_fn": fake_judge, "k": 1,
-            }
+    def test_changed_temperature_runs_all_trials(self):
+        """Distinguish temperatures that differ beyond the first decimal."""
+        before = self.first_run()
+        judge_groups.run(**(self.options | {"temperature": 0.70000001}))
+        self.assert_calls(12, 12)
+        self.assertEqual({rec["temperature"] for rec in self.new_rows(before)}, {0.70000001})
 
-            # First run: 2 members, 3 primary tasks
-            judge_groups.run(**run_kwargs)
-            self.assertEqual(chat_counter, 6)
-            self.assertTrue(trials_jsonl.exists())
-            self.assertEqual(len(trials_jsonl.read_text(encoding="utf-8").strip().splitlines()), 6)
-            self.assertTrue(verdicts_tsv.exists())
+    def test_changed_skill_runs_only_its_trials(self):
+        """Change the skill text while retaining the member id."""
+        before = self.first_run()
+        (self.checkouts / "cand-1").write_text("edited skill", encoding="utf-8")
+        judge_groups.run(**self.options)
+        self.assert_calls(6, 6)
+        self.assertEqual({rec["member"] for rec in self.new_rows(before)}, {"cand-1"})
 
-            with verdicts_tsv.open(encoding="utf-8") as f:
-                reader = csv.DictReader(f, delimiter="\t")
-                self.assertIn("decided_by", reader.fieldnames)
-                rows = list(reader)
-                self.assertEqual(len(rows), 1)
-                self.assertIn(rows[0]["decided_by"], ("rule", "none"))
+    def test_changed_task_prompt_runs_only_its_trials(self):
+        """Regenerate and judge the changed prompt for both members."""
+        before = self.first_run()
+        self.set_task_field("prompt", "different task prompt")
+        judge_groups.run(**self.options)
+        self.assert_calls(4, 4)
+        self.assertEqual({rec["task_id"] for rec in self.new_rows(before)}, {"code-0"})
 
-            # Second run: all trials done -> 0 new chat calls
-            judge_groups.run(**run_kwargs)
-            self.assertEqual(chat_counter, 6)
-            self.assertEqual(len(trials_jsonl.read_text(encoding="utf-8").strip().splitlines()), 6)
+    def test_changed_must_match_regrades_without_model_calls(self):
+        """Regrade the affected task using stored answers on an assertion change."""
+        before = self.first_run()
+        self.set_task_field("must_match", ["does not match"])
+        judge_groups.run(**self.options)
+        self.assert_calls(0, 0)
+        added = self.new_rows(before)
+        self.assertEqual(len(added), 4)
+        self.assertEqual({rec["task_id"] for rec in added}, {"code-0"})
+        self.assertEqual({rec["pass"] for rec in added}, {False})
+        self.assertEqual({rec["answer"] for rec in added}, {"hello world"})
+
+    def test_changed_must_not_match_regrades_without_model_calls(self):
+        """Recheck forbidden patterns against each stored answer of the task."""
+        before = self.first_run()
+        self.set_task_field("must_not_match", ["world"])
+        judge_groups.run(**self.options)
+        self.assert_calls(0, 0)
+        added = self.new_rows(before)
+        self.assertEqual(len(added), 4)
+        self.assertEqual({rec["pass"] for rec in added}, {False})
+
+    def test_changed_rubric_rejudges_only_its_trials(self):
+        """Rescore one task's answers when its rubric changes."""
+        before = self.first_run()
+        self.set_task_field("rubric", "must test the greeting")
+        judge_groups.run(**self.options)
+        self.assert_calls(0, 4)
+        self.assertEqual({rec["task_id"] for rec in self.new_rows(before)}, {"code-0"})
+
+    def test_changed_judge_model_rescores_existing_answers(self):
+        """Rescore every unchanged answer without calling the answer model."""
+        before = self.first_run()
+        row = judge_groups.run(**(self.options | {"judge_model": "judge-two"}))[0]
+        self.assert_calls(0, 12)
+        self.assertEqual({rec["judge_model"] for rec in self.new_rows(before)}, {"judge-two"})
+        self.assertEqual(row["judge_model"], "judge-two")
+
+    def test_legacy_trials_are_kept_but_never_resumed(self):
+        """Keep the legacy bytes and use only current-model trials in verdicts."""
+        legacy = b'{"group_id":"1","member":"cand-1","task_id":"code-0","trial":1,"model":"old-model"}\r\n'
+        self.trials.write_bytes(legacy)
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            row = judge_groups.run(**self.options)[0]
+        self.assert_calls(12, 12)
+        self.assertEqual(stderr.getvalue().splitlines(),
+                         [f"1 legacy trial records ignored (no input fingerprint): {self.trials}"])
+        self.assertEqual({rec["model"] for rec in self.new_rows(legacy)}, {"model-one"})
+        self.assertEqual(row["model"], "model-one")
+        self.assertNotIn("old-model", self.verdicts.read_text())
+
+    def test_legacy_trial_without_final_newline_keeps_its_bytes(self):
+        """Separate consecutive JSON records without overwriting the legacy tail."""
+        legacy = b'{"member":"cand-1","task_id":"code-0","trial":1,"model":"old-model"}'
+        self.trials.write_bytes(legacy)
+        with redirect_stderr(io.StringIO()):
+            judge_groups.run(**self.options)
+        self.assertEqual(len(self.new_rows(legacy + b"\n")), 12)
+        self.chat.reset_mock()
+        self.judge.reset_mock()
+        with redirect_stderr(io.StringIO()):
+            judge_groups.run(**self.options)
+        self.assert_calls(0, 0)
+
+    def test_answer_fingerprint_binds_every_answer_input(self):
+        """Distinguish each changed answer input while keeping other inputs fixed."""
+        values = dict(skill_text="skill", task_prompt="task", model="model", provider="provider",
+                      temperature=0.7, seed=1)
+        base = judge_groups.answer_fingerprint(**values)
+        for key, value in (("skill_text", "edited"), ("task_prompt", "new prompt"), ("model", "different"),
+                           ("provider", "elsewhere"), ("temperature", 0.70000001), ("seed", 2)):
+            with self.subTest(key=key):
+                self.assertNotEqual(judge_groups.answer_fingerprint(**(values | {key: value})), base)
+
+    def test_answer_fingerprint_excludes_all_grade_inputs(self):
+        """Keep answer identities when rubric, assertions and judge model alone change."""
+        before = self.first_run()
+        self.set_task_field("rubric", "new rubric")
+        self.set_task_field("must_match", ["different"])
+        self.set_task_field("must_not_match", ["world"])
+        judge_groups.run(**(self.options | {"judge_model": "judge-two"}))
+        self.assert_calls(0, 12)
+        previous = {json.loads(line)["answer_fp"] for line in before.splitlines()}
+        self.assertEqual({rec["answer_fp"] for rec in self.new_rows(before)}, previous)
 
 
 class EvalTasksJsonTests(unittest.TestCase):
