@@ -29,7 +29,7 @@ _TOOLS_DIR = Path(__file__).resolve().parent
 if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
-import method_contract as mc  # noqa: E402
+import method_contract as mc
 
 TESTDATA = mc.CONTRACTS_DIR / "testdata"
 EPITROP_FIXTURES = mc.EPITROP_DIR / "testdata" / "result"
@@ -47,16 +47,19 @@ def _bounded_paths(paths: Iterator[Path]) -> list[Path]:
 def _done_document() -> dict:
     """Return a fresh copy of Epitrop's accepted result with evidence."""
     fixture = mc.read_document(EPITROP_FIXTURES / "result-done-with-evidence.json")
-    assert isinstance(fixture, dict)
+    if not isinstance(fixture, dict):
+        raise AssertionError("fixture is not a JSON object")
     document = mc.parse_document(fixture["document"], fixture["id"])
-    assert isinstance(document, dict)
+    if not isinstance(document, dict):
+        raise AssertionError("result document is not a JSON object")
     return document
 
 
 def _load(name: str) -> dict:
     """Return a fresh copy of one battery fixture document."""
     document = mc.read_document(TESTDATA / name)
-    assert isinstance(document, dict)
+    if not isinstance(document, dict):
+        raise AssertionError(f"battery fixture {name} must contain an object")
     return copy.deepcopy(document)
 
 
@@ -87,7 +90,7 @@ class EpitropFixtureTest(unittest.TestCase):
         """Every vendored file has the digest vendor.json pins, and no file is unpinned."""
         pin_path = mc.EPITROP_DIR / "vendor.json"
         pin = mc.read_document(pin_path)
-        assert isinstance(pin, dict)
+        self.assertIsInstance(pin, dict)
         self.assertRegex(pin["commit"], r"^[0-9a-f]{40}$")
         on_disk = sorted(path.relative_to(mc.EPITROP_DIR).as_posix()
                          for path in _bounded_paths(mc.EPITROP_DIR.rglob("*"))
@@ -113,7 +116,7 @@ class EpitropFixtureTest(unittest.TestCase):
         directions = set()
         for path in fixtures:
             fixture = mc.read_document(path)
-            assert isinstance(fixture, dict)
+            self.assertIsInstance(fixture, dict)
             directions.add(fixture["direction"])
             with self.subTest(fixture=fixture["id"]):
                 if fixture["direction"] == "compliant":
@@ -154,9 +157,11 @@ class ResultTest(unittest.TestCase):
         for container, key, path in fields:
             value = container[key]
             container[key] = value + "\n"
-            with self.subTest(path=path):
-                with self.assertRaisesRegex(mc.ContractError, re.escape(path) + r": .* does not match"):
-                    mc.result_from_document(document)
+            with (
+                self.subTest(path=path),
+                self.assertRaisesRegex(mc.ContractError, re.escape(path) + r": .* does not match"),
+            ):
+                mc.result_from_document(document)
             container[key] = value
 
     def test_refuses_unclean_evidence_paths(self) -> None:
@@ -183,6 +188,18 @@ class ResultTest(unittest.TestCase):
                 with self.assertRaisesRegex(mc.ContractError, re.escape(reason)):
                     mc.result_from_document(document)
 
+    def test_evidence_lines_refuse_a_json_boolean(self) -> None:
+        """Both schema validation and typed evidence conversion reject a JSON boolean line count."""
+        document = _done_document()
+        evidence = document["evidence"][0]
+        evidence["lines"] = mc.parse_document("true", "lines")
+        schema_reason = "$.evidence[0].lines: True is not of type 'integer'"
+        with self.assertRaisesRegex(mc.ContractError, re.escape(schema_reason)):
+            mc.result_from_document(document)
+        reader_reason = f"result: evidence {evidence['path']!r} lines True is not an integer"
+        with self.assertRaisesRegex(mc.ContractError, re.escape(reader_reason)):
+            mc._checked_evidence(document["evidence"])
+
     def test_schema_wraps_a_nesting_error(self) -> None:
         """A parseable document can exceed the recursion limit during schema traversal."""
         depth = 600
@@ -192,9 +209,11 @@ class ResultTest(unittest.TestCase):
             schema = {"type": "array", "items": schema}
         validators = mc._validators()
         nested_validator = validators["result"].evolve(schema=schema)
-        with mock.patch.dict(validators, result=nested_validator):
-            with self.assertRaisesRegex(mc.ContractError, "^result: nested too deep$"):
-                mc.result_from_document(document)
+        with (
+            mock.patch.dict(validators, result=nested_validator),
+            self.assertRaisesRegex(mc.ContractError, "^result: nested too deep$"),
+        ):
+            mc.result_from_document(document)
 
 
 class MethodDefinitionTest(unittest.TestCase):
@@ -218,9 +237,8 @@ class MethodDefinitionTest(unittest.TestCase):
         validator.validate(_load("method-battery-spm.json"))
         for document, reason in ((None, "is not of type 'object'"), ({}, "'id' is a required property"),
                                  ({"owner": "x"}, "'owner' was unexpected")):
-            with self.subTest(document=document):
-                with self.assertRaisesRegex(ValidationError, reason):
-                    validator.validate(document)
+            with self.subTest(document=document), self.assertRaisesRegex(ValidationError, reason):
+                validator.validate(document)
 
     def test_patterns_refuse_a_trailing_newline(self) -> None:
         """Version, unit and input name accept clean text and report the path of a final newline."""
@@ -363,7 +381,7 @@ class SchemaTest(unittest.TestCase):
     def test_schema_failure_names_the_file(self) -> None:
         """Invalid schema syntax and missing IDs raise ContractError with the schema path."""
         schema = mc.read_document(mc.METHOD_SCHEMA_PATH)
-        assert isinstance(schema, dict)
+        self.assertIsInstance(schema, dict)
         invalid = dict(schema, type="invalid")
         missing_id = dict(schema)
         del missing_id["$id"]
@@ -557,9 +575,11 @@ class DocumentTest(unittest.TestCase):
             ("doubled key", '{"value": 1, "value": 2}', "key 'value' is given twice"),
         )
         for label, text, reason in cases:
-            with self.subTest(label=label):
-                with self.assertRaisesRegex(mc.ContractError, f"{label}: not a JSON document: {reason}"):
-                    mc.parse_document(text, label)
+            with (
+                self.subTest(label=label),
+                self.assertRaisesRegex(mc.ContractError, f"{label}: not a JSON document: {reason}"),
+            ):
+                mc.parse_document(text, label)
 
     def test_document_size_counts_utf8_bytes(self) -> None:
         """Bytes and multibyte text pass at the cap and fail at one byte over it."""
@@ -577,13 +597,17 @@ class DocumentTest(unittest.TestCase):
         """A BOM fails for text and bytes, and bytes always decode as UTF-8."""
         bom = '\ufeff{"value": 1}'
         for text in (bom, bom.encode("utf-8")):
-            with self.subTest(input_type=type(text).__name__):
-                with self.assertRaisesRegex(mc.ContractError, "bom: not a JSON document: .*UTF-8 BOM"):
-                    mc.parse_document(text, "bom")
+            with (
+                self.subTest(input_type=type(text).__name__),
+                self.assertRaisesRegex(mc.ContractError, "bom: not a JSON document: .*UTF-8 BOM"),
+            ):
+                mc.parse_document(text, "bom")
         for encoding in ("utf-16", "utf-32"):
-            with self.subTest(encoding=encoding):
-                with self.assertRaisesRegex(mc.ContractError, "encoding: not a JSON document: .*can't decode byte"):
-                    mc.parse_document("{}".encode(encoding), "encoding")
+            with (
+                self.subTest(encoding=encoding),
+                self.assertRaisesRegex(mc.ContractError, "encoding: not a JSON document: .*can't decode byte"),
+            ):
+                mc.parse_document("{}".encode(encoding), "encoding")
 
     def test_parse_wraps_a_nesting_error(self) -> None:
         """Excessive JSON nesting raises ContractError at the parse boundary."""
