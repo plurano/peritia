@@ -374,6 +374,25 @@ class ReceiptTest(unittest.TestCase):
             mc.receipt_from_document(document, _method())
         self.assertIn(says, str(caught.exception))
 
+    def test_schema_root_validates_a_receipt(self) -> None:
+        """The receipt validator uses the root schema to accept a receipt and refuse unrelated values."""
+        validator = mc._validators()["receipt"]
+        validator.validate(_done())
+        for document, reason in ((None, "is not of type 'object'"), ({}, "'method' is a required property")):
+            with self.subTest(document=document):
+                with self.assertRaisesRegex(ValidationError, reason):
+                    validator.validate(document)
+        self.assertEqual(validator.schema, mc.read_document(mc.RECEIPT_SCHEMA_PATH))
+
+    def test_patterns_refuse_a_trailing_newline(self) -> None:
+        """The shared name pattern also applies to receipt inputs and missing names."""
+        done, blocked = _done(), _blocked()
+        done["inputs"][0]["name"] = "initial_soc\n"
+        blocked["missing"][0] = "initial_soc\n"
+        for document, path in ((done, "$.inputs[0].name"), (blocked, "$.missing[0]")):
+            with self.subTest(path=path):
+                self._refused(document, f"{path}: 'initial_soc\\n' does not match")
+
     def test_reads_the_done_receipt(self) -> None:
         """A done receipt with every required input in domain and a passing verifier reads."""
         receipt = mc.receipt_from_document(_done(), _method())
@@ -408,6 +427,26 @@ class ReceiptTest(unittest.TestCase):
         _value(document, "c_rate")["value"] = 0.5000001
         self._refused(document, "'c_rate' = 0.5000001 lies outside the validity domain")
 
+    def test_point_bound_compares_binary64_values(self) -> None:
+        """A JSON decimal that rounds to the bound's binary64 value meets the point bound."""
+        document = _done()
+        _value(document, "initial_soc")["value"] = mc.parse_document("0.80000000000000001", "initial_soc")
+        receipt = mc.receipt_from_document(document, _method())
+        self.assertEqual(receipt.result.outcome, "done")
+        self.assertEqual(receipt.inputs[0].value, 0.8)
+
+    def test_refuses_nonfinite_values_in_python_documents(self) -> None:
+        """A direct document cannot supply a boolean or a non-finite float, even without both bounds."""
+        document = _done()
+        method = _method()
+        max_only = (mc.Bound("step_duration", None, 600),)
+        for value, bounds in ((float("nan"), ()), (float("inf"), ()), (float("-inf"), max_only), (True, ())):
+            with self.subTest(value=value):
+                _value(document, "step_duration")["value"] = value
+                reason = f"input 'step_duration' = {value} is not a finite number"
+                with self.assertRaisesRegex(mc.ContractError, re.escape(reason)):
+                    mc.receipt_from_document(document, replace(method, validity_domain=bounds))
+
     def test_failed_run_may_record_an_out_of_domain_value(self) -> None:
         """A failed receipt records a value outside the domain; only a done claim needs the domain."""
         document = _done()
@@ -437,10 +476,30 @@ class ReceiptTest(unittest.TestCase):
                 self._refused(document, says)
 
     def test_refuses_blocked_run_that_does_not_ask(self) -> None:
-        """A missing required input must be asked for by name."""
+        """An ID, a dotted reference or a longer name does not ask for the missing input."""
         document = _blocked()
-        document["result"]["questions"] = ["ASK battery-measured-cell-soc: which soc did the cycler log"]
-        self._refused(document, "no question asks for missing input 'initial_soc'")
+        lines = (
+            "ASK battery-measured-cell-soc: which soc did the cycler log",
+            "ASK cell-initial_soc: what is the temperature",
+            "ASK cell-soc: which foo.initial_soc did the cycler log",
+            "DECISION cell-soc: which initial_soc.raw did the cycler log",
+            "ASK cell-soc: which initial_soc_max did the cycler log",
+        )
+        for line in lines:
+            with self.subTest(line=line):
+                document["result"]["questions"] = [line]
+                self._refused(document, "no question asks for missing input 'initial_soc'")
+
+    def test_question_asks_for_the_missing_input_by_name(self) -> None:
+        """A sentence-final period and Epitrop lines without a fleet ID both work."""
+        document = _blocked()
+        lines = ("DECISION cell-soc: supply initial_soc.", "ASK which initial_soc did the cycler log",
+                 "ASK which initial_soc: use the cycler log")
+        for line in lines:
+            with self.subTest(line=line):
+                document["result"]["questions"] = [line]
+                receipt = mc.receipt_from_document(document, _method())
+                self.assertEqual(receipt.result.outcome, "blocked")
 
     def test_refuses_invalid_inputs(self) -> None:
         """Undeclared inputs, wrong units, doubled values and inputs both given and missing are refused."""
@@ -450,7 +509,6 @@ class ReceiptTest(unittest.TestCase):
             "given twice": (lambda d: d["inputs"].append(dict(d["inputs"][0])), "given twice"),
             "given and missing": (lambda d: d.update(missing=["c_rate"]), "both given and missing"),
             "other method": (lambda d: d.update(method="battery-dfn"), "not battery-spm-constant-current"),
-            "boolean value": (lambda d: d["inputs"][0].update(value=True), "is not of type 'number'"),
         }
         for label, (mutate, says) in cases.items():
             with self.subTest(label=label):

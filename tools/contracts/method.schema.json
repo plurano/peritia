@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/plurano/peritia/tools/contracts/method.schema.json",
   "title": "Peritia method contract",
-  "description": "A method definition states what one executable method computes and when its result holds. A method receipt binds one run of that method to an Epitrop slot result, which it carries unchanged. tools/method_contract.py adds the checks a schema cannot express.",
+  "description": "A method definition states what one executable method computes and when its result holds. tools/method_contract.py adds the checks a schema cannot express.",
   "$ref": "#/$defs/method",
   "$defs": {
     "name": {
@@ -43,7 +43,7 @@
       }
     },
     "bound": {
-      "description": "Where the method's result holds for one input, in that input's unit. Both ends are inclusive.",
+      "description": "Where the method's result holds for one input, in that input's unit. Both ends are inclusive. Comparisons use IEEE 754 binary64 for decimal and exponent JSON tokens (RFC 8259, section 6) and integers for integer tokens. For example, 0.80000000000000001 reads as 0.8 and meets a 0.8 point bound.",
       "type": "object",
       "additionalProperties": false,
       "required": ["input"],
@@ -122,53 +122,6 @@
             "hypothesis",
             "checked-proof"
           ]
-        }
-      }
-    },
-    "receipt": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["method", "result", "inputs", "missing", "verifier"],
-      "properties": {
-        "method": { "$ref": "#/$defs/id" },
-        "result": {
-          "description": "The Epitrop slot result of the run, unchanged.",
-          "$ref": "https://github.com/tekmora/epitrop/internal/slot/result.schema.json"
-        },
-        "inputs": {
-          "description": "The values the run used, each with the evidence entry it was read from.",
-          "type": "array",
-          "maxItems": 64,
-          "items": {
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["name", "value", "unit", "evidence"],
-            "properties": {
-              "name": { "$ref": "#/$defs/name" },
-              "value": { "type": "number" },
-              "unit": { "$ref": "#/$defs/unit" },
-              "evidence": { "$ref": "#/$defs/evidence_path" }
-            }
-          }
-        },
-        "missing": {
-          "description": "Inputs the run did not have. A missing value is asked for, never assumed.",
-          "type": "array",
-          "maxItems": 64,
-          "uniqueItems": true,
-          "items": { "$ref": "#/$defs/name" }
-        },
-        "verifier": {
-          "description": "What the method's verifier said about this run. A verifier that ran names its log.",
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["outcome"],
-          "properties": {
-            "outcome": { "enum": ["pass", "fail", "not-run"] },
-            "evidence": { "$ref": "#/$defs/evidence_path" }
-          },
-          "if": { "properties": { "outcome": { "enum": ["pass", "fail"] } } },
-          "then": { "required": ["evidence"] }
         }
       }
     }
