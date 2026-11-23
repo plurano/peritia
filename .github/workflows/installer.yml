@@ -26,7 +26,7 @@ env:
   # This workflow builds no engine; the Git hooks read the declaration
   # so local commits are judged by the engine the repository was
   # adopted with.
-  PRAETOR_REF: "d9cb68ca1ea1b2f18eee354e54596696c875a04d"
+  PRAETOR_REF: "5e95dec491f2ad2f1a39d6f8835b86ddcf3bf771"
 
 jobs:
   selftest:
