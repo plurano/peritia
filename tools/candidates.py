@@ -20,12 +20,28 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+if __package__:
+    from . import licence_policy
+else:
+    import licence_policy
+
 _TOOLS_DIR = Path(__file__).resolve().parent
 if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
 from check_skills import front_matter_or_empty  # noqa: E402
 from classify import DOMAINS, FUNCTIONS  # noqa: E402
+
+# Preserve the licence policy names exposed by earlier candidate versions.
+LICENSE_FILE_PATTERN = licence_policy.LICENSE_FILE_PATTERN
+LICENSE_FILENAMES = licence_policy.LICENSE_FILENAMES
+PERMISSIVE_LICENCES = licence_policy.PERMISSIVE_LICENCES
+SPDX_LOOKUP = licence_policy.SPDX_LOOKUP
+SPDX_TABLE = licence_policy.SPDX_TABLE
+WEAK_LICENCES = licence_policy.WEAK_LICENCES
+find_folder_licence_file = licence_policy.find_folder_licence_file
+licence_class = licence_policy.licence_class
+normalise_licence = licence_policy.normalise_licence
 
 CORE_FUNCTIONS = frozenset({
     "coding",
@@ -44,19 +60,6 @@ MAX_ROWS = 200_000
 MAX_GH_CALLS = 2000
 GH_TIMEOUT_SECONDS = 20.0
 MAX_SKILL_CHARS = 8192
-
-SPDX_TABLE = (
-    "MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "0BSD",
-    "Zlib", "Unlicense", "CC0-1.0", "CC-BY-4.0", "MPL-2.0", "EUPL-1.2",
-    "LGPL-2.1", "LGPL-3.0", "GPL-2.0", "GPL-3.0", "AGPL-3.0", "MIT-0",
-)
-SPDX_LOOKUP = {s.upper(): s for s in SPDX_TABLE}
-
-PERMISSIVE_LICENCES = frozenset({
-    "MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "0BSD",
-    "Zlib", "Unlicense", "CC0-1.0", "MIT-0",
-})
-WEAK_LICENCES = frozenset({"MPL-2.0", "EUPL-1.2"})
 
 HEADINGS: list[tuple[str, re.Pattern[str]]] = [
     ("AGPL-3.0", re.compile(r"GNU\s+Affero\s+General\s+Public\s+License.*?(?:Version\s+3|v3|\b3\b)", re.I | re.S)),
@@ -89,12 +92,6 @@ GITHUB_REPO_URL_RE = re.compile(
 GITHUB_REPO_PLAIN_RE = re.compile(
     r"^([A-Za-z0-9][A-Za-z0-9-]*)/([A-Za-z0-9._-]+)$",
 )
-LICENSE_FILENAMES = (
-    "LICENSE", "LICENCE", "COPYING",
-    "LICENSE.md", "LICENSE.txt", "LICENCE.md", "LICENCE.txt", "COPYING.txt",
-)
-LICENSE_FILE_PATTERN = re.compile(r"\b(LICEN[SC]E|COPYING)(?:\.[A-Za-z0-9_-]+)?\b", re.I)
-
 OUTPUT_FIELDS = [
     "blob_id", "source", "path", "skill_name", "functions", "domains", "match_clause",
     "licence", "licence_class", "licence_evidence", "verdict", "reason",
@@ -176,48 +173,6 @@ def identify_licence_text(text: str) -> str:
     return "unknown"
 
 
-def normalise_licence(raw: str) -> tuple[str, str, bool]:
-    """Normalises raw licence string.
-
-    Returns (output_id, base_id, is_known).
-    If unknown, returns ("unknown", "unknown", False).
-    """
-    if not raw:
-        return ("unknown", "unknown", False)
-    val = raw.strip().strip("'\"").strip()
-    val = re.sub(r"\s+licen[sc]e$", "", val, flags=re.I).strip()
-    val = val.strip("'\"").strip()
-    if not val or val.lower() == "unknown":
-        return ("unknown", "unknown", False)
-
-    m = re.search(r"^(.*?)-(only|or-later)$", val, flags=re.I)
-    if m:
-        base_cand = m.group(1).strip()
-        suffix = m.group(2).lower()
-        if base_cand.upper() in SPDX_LOOKUP:
-            canonical_base = SPDX_LOOKUP[base_cand.upper()]
-            full_id = f"{canonical_base}-{suffix}"
-            return (full_id, canonical_base, True)
-
-    if val.upper() in SPDX_LOOKUP:
-        canonical = SPDX_LOOKUP[val.upper()]
-        return (canonical, canonical, True)
-
-    return (val, val, False)
-
-
-def licence_class(spdx: str) -> str:
-    m = re.search(r"^(.*?)-(?:only|or-later)$", spdx, flags=re.I)
-    base = m.group(1).strip() if m else spdx.strip()
-    if base in PERMISSIVE_LICENCES:
-        return "permissive"
-    if base in WEAK_LICENCES or base.startswith("LGPL-"):
-        return "weak"
-    if base.startswith("GPL-") or base.startswith("AGPL-"):
-        return "strong"
-    return "other"
-
-
 def parse_github_repo(val: str) -> str | None:
     cleaned = val.strip().strip("'\"").strip()
     if not cleaned:
@@ -246,18 +201,6 @@ def extract_upstream_repo(meta: dict[str, str], aggregator_source: str | None = 
         if aggregator_source and repo.lower() == aggregator_source.lower():
             continue
         return repo
-    return None
-
-
-def find_folder_licence_file(folder: Path) -> Path | None:
-    for name in LICENSE_FILENAMES:
-        cand = folder / name
-        if cand.is_file():
-            return cand
-    if folder.is_dir():
-        for child in sorted(folder.iterdir()):
-            if child.is_file() and re.match(r"^(LICEN[SC]E|COPYING)(?:\.[A-Za-z0-9_-]+)?$", child.name, re.I):
-                return child
     return None
 
 
@@ -523,7 +466,7 @@ def decide_row(
         verdict, reason = "refused", filter_reason
     elif lic_res.verdict is not None:
         verdict, reason = lic_res.verdict, lic_res.reason
-    elif lic_cls in ("permissive", "weak"):
+    elif lic_cls in licence_policy.CANDIDATE_LICENCE_CLASSES:
         verdict, reason = "candidate", ""
     elif lic_cls == "strong":
         verdict, reason = "report", f"licence:{licence} strong copyleft: a person decides"

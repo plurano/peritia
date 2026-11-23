@@ -32,6 +32,7 @@ from candidates import LICENSE_FILENAMES, MAX_ROWS, find_folder_licence_file, no
 from census import LiveReader, SourceReadError
 from judge_groups import collapse_copies, get_skill_text, is_existing_skill, load_sources
 from check_skills import front_matter_or_empty
+from licence_policy import LICENSE_BASENAME_PATTERN, candidate_licence_id
 from overlap import Item, git_blob_id, load_cache
 
 MAX_FILES = 200
@@ -58,6 +59,10 @@ THREAD_ID = re.compile(r'^[A-Za-z0-9_-]+\Z')
 
 class Refused(ValueError):
     """One candidate cannot be adopted; other candidates can continue."""
+
+
+class _LicenceDownloadError(ValueError):
+    """A required canonical SPDX template could not be downloaded."""
 
 
 def command(args, *, cwd=None, data=None, timeout=TIMEOUT, allow_fetch=False):
@@ -131,8 +136,8 @@ def safe_path(raw):
 
 
 def is_licence_name(name: str) -> bool:
-    return (name in LICENSE_FILENAMES or
-            bool(re.fullmatch(r'(LICEN[SC]E|COPYING)(?:\.[A-Za-z0-9_-]+)?', name, re.IGNORECASE)))
+    """Identify upstream licence files by their shared filename policy."""
+    return name in LICENSE_FILENAMES or bool(LICENSE_BASENAME_PATTERN.fullmatch(name))
 
 
 def checkout_for(checkouts, row, pin):
@@ -299,6 +304,7 @@ def upstream_licence(repository, reader):
 
 
 def licence_text(row, checkout, pin, skill, apply, reader):
+    """Copy the licence text from the pinned source to the staged skill."""
     evidence = row['licence_evidence']
     note = ''
     try:
@@ -307,8 +313,7 @@ def licence_text(row, checkout, pin, skill, apply, reader):
             data = licence.read_bytes() if licence else b''
         elif evidence in ('repository', 'repository:self', 'frontmatter'):
             entries = tree_files(checkout, pin, PurePosixPath('.'), recursive=False)
-            entries = [entry for entry in entries if entry[0].name in LICENSE_FILENAMES or
-                       re.fullmatch(r'(LICEN[SC]E|COPYING)(?:\.[A-Za-z0-9_-]+)?', entry[0].name, re.I)]
+            entries = [entry for entry in entries if is_licence_name(entry[0].name)]
             with tempfile.TemporaryDirectory(prefix='adopt-licence-') as tmp:
                 if apply:
                     for entry in entries:
@@ -657,7 +662,8 @@ def run_gates(root, staging, skill, row, folder, pin, state, gates: GateOptions)
             git(staging, 'add', '-A', '--', 'skills')
 
 
-def stage_one(row, pin, checkouts, root, staging, occupied, apply, reader):
+def stage_one(row, pin, checkouts, root, staging, occupied, apply, reader, *, template_cache=None, runner=None):
+    """Stage one skill and verify it against its canonical SPDX template."""
     checkout, folder = checkout_for(checkouts, row, pin)
     name = choose_name(row, occupied)
     if apply:
@@ -673,11 +679,12 @@ def stage_one(row, pin, checkouts, root, staging, occupied, apply, reader):
     lic_note = licence_text(row, checkout, pin, skill, apply, reader)
     note = build_notes(skill, filter_notes, normalized, {}, {}, lic_note, patched=patched)
     attribution(skill, row, folder, pin, note, fence_changed=bool(fenced_files))
-    problems = check_skills.skill_problems(skill)
+    template_dir = _stage_licence_template(root, template_cache, row['licence'], runner)
+    problems = check_skills.skill_problems(skill, template_dir=template_dir)
     if problems:
         raise Refused('skill-check: ' + '; '.join(problems))
     year = git(checkout, 'show', '-s', '--format=%cs', pin).decode().strip()[:4]
-    return skill, year, folder, (filter_notes, normalized, lic_note, fenced_files, patched)
+    return skill, year, folder, (filter_notes, normalized, lic_note, fenced_files, patched), template_dir
 
 
 def initial_metadata(root):
@@ -942,7 +949,8 @@ def resolve_copies(group_rows, checkouts, root, pins, all_candidates, cache, sou
 
 def evaluate(row, grouped, order, pins, checkouts, root, staging, occupied, apply, reader,
              gate=markdown_gate, hiss_gate=hiss_gate, include_grouped=False, copies=None,
-             present=None):
+             present=None, template_cache=None, runner=None):
+    """Stage and verify a candidate, returning its adoption report row."""
     result = dict(zip(REPORT_FIELDS, (candidate_id(row), 'refused', '', '')))
     cid = result['candidate']
     if include_grouped:
@@ -973,11 +981,12 @@ def evaluate(row, grouped, order, pins, checkouts, root, staging, occupied, appl
         if len(occupied) >= check_skills.MAX_SKILLS:
             raise Refused('skill-count-limit')
         pin = pins[row['source']]
-        skill, year, folder, state = stage_one(
-            row, pin, checkouts, root, staging, occupied, apply, reader)
+        skill, year, folder, state, template_dir = stage_one(
+            row, pin, checkouts, root, staging, occupied, apply, reader,
+            template_cache=template_cache, runner=runner)
         run_gates(root, staging, skill, row, folder, pin, state, GateOptions(gate=gate, hiss_gate=hiss_gate))
         # A future gate fixer must preserve the checker contract too.
-        problems = check_skills.skill_problems(skill)
+        problems = check_skills.skill_problems(skill, template_dir=template_dir)
         if problems:
             raise Refused('skill-check: ' + '; '.join(problems))
         result.update(verdict='adopted', directory=f'skills/{skill.name}')
@@ -986,13 +995,16 @@ def evaluate(row, grouped, order, pins, checkouts, root, staging, occupied, appl
         detail = ' '.join(str(error).split())
         result['reason'] = f'licence-text-missing: {detail}' if detail else 'licence-text-missing'
         return result, None, ''
+    except _LicenceDownloadError:
+        raise
     except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
         result['reason'] = ' '.join(str(error).split())
         return result, None, ''
 
 
 def default_download_runner(args, *, cwd=None):
-    proc = subprocess.run(args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    """Run the REUSE downloader with a deadline and include failures in diagnostics."""
+    proc = subprocess.run(args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=TIMEOUT)
     if proc.returncode != 0:
         detail = proc.stderr.decode('utf-8', errors='replace').strip()[:500]
         spdx_id = args[-1] if args else 'unknown'
@@ -1001,7 +1013,34 @@ def default_download_runner(args, *, cwd=None):
     return proc.stdout
 
 
-def sync_licences(root: Path, reuse_text: str, runner=default_download_runner):
+def _download_licence(root: Path, spdx: str, runner) -> None:
+    """Download a single SPDX template and require the promised output file."""
+    (root / 'LICENSES').mkdir(parents=True, exist_ok=True)
+    try:
+        runner(['reuse', 'download', spdx], cwd=root)
+    except Exception as error:
+        raise _LicenceDownloadError(f'licence download failed for {spdx}: {error}') from error
+    if not (root / 'LICENSES' / f'{spdx}.txt').is_file():
+        raise _LicenceDownloadError(f'licence download failed for {spdx}: template missing')
+
+
+def _stage_licence_template(root: Path, cache: Path | None, raw_id: str, runner) -> Path:
+    """Use a local SPDX template or download it once into the adoption staging cache."""
+    local = root / 'LICENSES'
+    spdx = candidate_licence_id(raw_id)
+    if spdx is None or cache is None or runner is None:
+        return local
+    local_entry = local / f'{spdx}.txt'
+    if local_entry.is_symlink() or local_entry.exists():
+        return local
+    staged = cache / 'LICENSES'
+    if not (staged / f'{spdx}.txt').is_file():
+        _download_licence(cache, spdx, runner)
+    return staged
+
+
+def sync_licences(root: Path, reuse_text: str, runner=default_download_runner, *, template_cache=None):
+    """Install the staged SPDX texts and fetch any other missing REUSE texts."""
     licenses_dir = root / 'LICENSES'
     licenses_dir.mkdir(parents=True, exist_ok=True)
     data = tomllib.loads(reuse_text)
@@ -1014,21 +1053,25 @@ def sync_licences(root: Path, reuse_text: str, runner=default_download_runner):
                     spdx_ids.add(token)
     for spdx_id in sorted(spdx_ids):
         lic_file = licenses_dir / f'{spdx_id}.txt'
-        if not lic_file.is_file():
-            try:
-                runner(['reuse', 'download', spdx_id], cwd=root)
-            except Exception as error:
-                raise ValueError(f'licence download failed for {spdx_id}') from error
+        if lic_file.is_file():
+            continue
+        cached = template_cache / 'LICENSES' / lic_file.name if template_cache else None
+        if cached is not None and cached.is_file():
+            shutil.copyfile(cached, lic_file)
+        else:
+            _download_licence(root, spdx_id, runner)
 
 
-def publish(root, saved, rows, reuse, credits, adopted_map=None, group_map=None, runner=default_download_runner):
+def publish(root, saved, rows, reuse, credits, adopted_map=None, group_map=None, runner=default_download_runner,
+            *, template_cache=None):
+    """Publish verified skills and their metadata after installing their licence templates."""
     # All gates have completed before publishing any skill. Never overwrite a skill.
+    sync_licences(root, reuse, runner=runner, template_cache=template_cache)
     for row in rows:
         if row['verdict'] == 'adopted':
             shutil.copytree(saved / Path(row['directory']).name, root / row['directory'])
     for name, text in [('REUSE.toml', reuse), ('CREDITS.md', credits)]:
         (root / name).write_text(text, encoding='utf-8')
-    sync_licences(root, reuse, runner=runner)
     write_index(root, adopted_map=adopted_map, group_map=group_map)
 
 
@@ -1048,6 +1091,7 @@ def run(candidates, groups, census, checkouts, root=Path('.'), *, apply=False,
         reader=default_reader, gate=markdown_gate, hiss_gate=hiss_gate,
         report=None, runner=None, download_runner=None,
         include_grouped=False, cache=None, sources=None):
+    """Evaluate candidates in staging and publish the accepted set in apply mode."""
     if download_runner is not None:
         runner = download_runner
     if runner is None:
@@ -1073,6 +1117,7 @@ def run(candidates, groups, census, checkouts, root=Path('.'), *, apply=False,
     with tempfile.TemporaryDirectory(prefix='adopt-skills-') as tmp:
         saved = Path(tmp) / 'accepted'
         saved.mkdir()
+        template_cache = Path(tmp) / 'templates'
         for row in selected:
             with tempfile.TemporaryDirectory(prefix='adopt-gate-') as work:
                 staging = Path(work)
@@ -1080,7 +1125,7 @@ def run(candidates, groups, census, checkouts, root=Path('.'), *, apply=False,
                 result, skill, year = evaluate(row, grouped, order, pins, checkouts, root, staging,
                                                occupied, apply, reader, gate=gate, hiss_gate=hiss_gate,
                                                include_grouped=include_grouped, copies=copies_map,
-                                               present=present)
+                                               present=present, template_cache=template_cache, runner=runner)
                 rows.append(result)
                 if skill is not None:
                     reuse, credits = add_metadata(reuse, credits, row, skill.name, year)
@@ -1088,7 +1133,8 @@ def run(candidates, groups, census, checkouts, root=Path('.'), *, apply=False,
                     shutil.move(str(skill), saved / skill.name)
                     adopted_map[skill.name] = row
         if apply:
-            publish(root, saved, rows, reuse, credits, adopted_map=adopted_map, group_map=group_map, runner=runner)
+            publish(root, saved, rows, reuse, credits, adopted_map=adopted_map, group_map=group_map,
+                    runner=runner, template_cache=template_cache)
     if report_file is not None:
         report_file.parent.mkdir(parents=True, exist_ok=True)
         report_file.write_text(report_text(rows), encoding='utf-8')

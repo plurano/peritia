@@ -47,11 +47,14 @@ def passing_gate(root, staging, skill):
 
 class AdoptionTests(unittest.TestCase):
     def setUp(self):
+        """Create a fixture repository with a canonical MIT template."""
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name)
         self.root = self.base / 'root'
         self.root.mkdir()
+        (self.root / 'LICENSES').mkdir()
+        shutil.copyfile(REPO / 'LICENSES/MIT.txt', self.root / 'LICENSES/MIT.txt')
         for name in ('.standards.yaml', '.standards-baseline.json'):
             src = REPO / name
             if src.is_file():
@@ -452,6 +455,7 @@ class AdoptionTests(unittest.TestCase):
         self.assertTrue((self.root / 'skills/good').exists())
 
     def test_missing_licence_text_triggers_download_through_runner(self):
+        """Verify the downloaded template in staging and install the verified copy on apply."""
         files = {'pack/demo/SKILL.md': MD.format(name='demo'), 'pack/demo/LICENSE': MIT_ZERO_LICENCE}
         pin = self.source(files)
         row = dict(source='owner/repo', path='pack/demo/SKILL.md', skill_name='demo',
@@ -462,15 +466,21 @@ class AdoptionTests(unittest.TestCase):
         commands = []
         def fake_runner(cmd, *, cwd=None):
             commands.append((list(cmd), cwd))
-            (cwd / 'LICENSES' / f'{cmd[-1]}.txt').write_text('Downloaded MIT-0')
+            (cwd / 'LICENSES' / f'{cmd[-1]}.txt').write_text(MIT_ZERO_LICENCE, encoding='utf-8')
             return b'Downloaded'
 
+        preview, _ = self.invoke(apply=False, runner=fake_runner)
+        self.assertEqual(preview[0]['verdict'], 'adopted', preview)
+        self.assertFalse((self.root / 'LICENSES/MIT-0.txt').exists())
         rows, _ = self.invoke(apply=True, runner=fake_runner)
-        self.assertEqual(rows[0]['verdict'], 'adopted')
-        self.assertEqual(commands, [(['reuse', 'download', 'MIT-0'], self.root)])
-        self.assertTrue((self.root / 'LICENSES/MIT-0.txt').is_file())
+        self.assertEqual(rows, preview)
+        self.assertEqual([cmd for cmd, _ in commands], [['reuse', 'download', 'MIT-0']] * 2)
+        self.assertTrue(all(cwd != self.root for _, cwd in commands))
+        self.assertEqual((self.root / 'LICENSES/MIT-0.txt').read_text(encoding='utf-8'), MIT_ZERO_LICENCE)
+        self.assertEqual(check_skills.check(self.root), 0)
 
     def test_failed_licence_download_fails_run(self):
+        """Leave the target tree alone when a required template cannot be downloaded."""
         files = {'pack/demo/SKILL.md': MD.format(name='demo'), 'pack/demo/LICENSE': MIT_ZERO_LICENCE}
         pin = self.source(files)
         row = dict(source='owner/repo', path='pack/demo/SKILL.md', skill_name='demo',
@@ -484,6 +494,8 @@ class AdoptionTests(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             self.invoke(apply=True, runner=failing_runner)
         self.assertIn('MIT-0', str(ctx.exception))
+        self.assertFalse((self.root / 'skills/demo').exists())
+        self.assertFalse((self.root / 'LICENSES/MIT-0.txt').exists())
 
     def test_report_path_written_and_root_refused(self):
         self.fixture()
@@ -807,7 +819,7 @@ class AdoptionTests(unittest.TestCase):
         diff_proc = subprocess.run(
             [git_bin, 'diff', '--no-index', '-w', '--ignore-blank-lines',
              str(fenced_upstream), str(skill / 'reference/guide.md')],
-            capture_output=True, check=False,
+            capture_output=True, check=False, timeout=60,
         )
         self.assertEqual(diff_proc.returncode, 0, diff_proc.stdout.decode('utf-8', errors='replace'))
         self.assertEqual(diff_proc.stdout, b'')

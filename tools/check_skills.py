@@ -7,31 +7,35 @@ made here (or "own" for a skill written here); the upstream LICENSE beside any a
 installs packages or fetches code when the skill runs.
 Usage: check_skills.py [ROOT] | check_skills.py selftest
 """
+import io
+import os
 import re
 import sys
 import tempfile
+import unittest
+from collections import Counter
+from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 from markdown_it import MarkdownIt
 import yaml
 
 try:
     from install_user_skills import read_install_set
+    from licence_policy import LICENCE_POINTERS, candidate_licence_id
+    from licence_text import read_utf8, verify_licence
 except ImportError:
     from tools.install_user_skills import read_install_set
+    from tools.licence_policy import LICENCE_POINTERS, candidate_licence_id
+    from tools.licence_text import read_utf8, verify_licence
 
 COMMONMARK = MarkdownIt("commonmark")
 MAX_SKILLS = 5000  # bounds the directories read (HISS-02)
 MAX_SKILL_ENTRIES = 1000  # bounds the entries walked in one skill (HISS-02)
-MAX_LICENCE_CHARS = 4096
-LICENCE_FAMILIES = ("Apache-2.0", "CC0-1.0", "MIT-0", "MIT")
-FRONT_LICENCES = {
-    **{family: family for family in LICENCE_FAMILIES},
-    "MIT license": "MIT",
-    "Complete terms in LICENSE.txt": None,
-}
-MIT_GRANT = "Permission is hereby granted, free of charge"
-MIT_NOTICE = "The above copyright notice and this permission notice shall be included"
+MAX_SKILL_MD_BYTES = 2 * 1024 * 1024
+MAX_ORIGIN_BYTES = 256 * 1024
+MAX_YAML_MAPPING_KEYS = 1000
 AGENT_CONTROL_FILES = frozenset({
     "protocol.md", "agents.md", "claude.md", "gemini.md",
     ".cursorrules", ".windsurfrules", "copilot-instructions.md",
@@ -48,20 +52,54 @@ FETCH = re.compile(r"\b(?:pip install|uv pip install|uvx |npx |npm install|pnpm 
 
 
 def fields(text):
+    """Read the scalar provenance fields in ORIGIN.md."""
     return {m.group("key"): m.group("value").strip() for m in FIELD.finditer(text)}
 
 
-def front_matter(text: str, *, exact_license: bool = False) -> dict[str, str]:
-    """Parse up to 100 YAML fields and preserve the exact licence field when requested."""
+class _UniqueKeyLoader(yaml.SafeLoader):
+    """Load validation front matter with unique keys at every mapping level."""
+
+    def _require_unique_keys(self, node):
+        """Check keys before merge expansion and again on the effective mapping."""
+        if len(node.value) > MAX_YAML_MAPPING_KEYS:
+            raise ValueError(f"mapping exceeds {MAX_YAML_MAPPING_KEYS} keys")
+        seen = set()
+        for key_node, _ in node.value:
+            tag = key_node.tag
+            key = key_node.value if tag.endswith((":merge", ":value")) else self.construct_object(key_node)
+            try:
+                if key in seen:
+                    raise ValueError(f"duplicate key {key!r}")
+                seen.add(key)
+            except TypeError as exc:
+                raise ValueError(f"unhashable YAML key {key!r}") from exc
+
+    def construct_mapping(self, node, deep=False):
+        """Refuse duplicate literal and merged keys before constructing values."""
+        self._require_unique_keys(node)
+        self.flatten_mapping(node)
+        self._require_unique_keys(node)
+        return super().construct_mapping(node, deep=deep)
+
+
+def _load_front_matter(text: str, loader: type[yaml.SafeLoader]) -> dict:
+    """Parse the YAML mapping without converting value types."""
     match = FRONT.match(text.replace("\r\n", "\n"))
     if not match:
         return {}
     try:
-        data = yaml.safe_load(match.group(1))
-    except yaml.YAMLError as exc:
+        data = yaml.load(match.group(1), Loader=loader)
+    except (yaml.YAMLError, RecursionError) as exc:
         raise ValueError(str(exc)) from exc
     if not isinstance(data, dict):
         raise ValueError("expected a mapping")
+    return data
+
+
+def front_matter(text: str, *, exact_license: bool = False) -> dict[str, str]:
+    """Project up to 100 YAML fields to strings for upstream discovery."""
+    loader = _UniqueKeyLoader if exact_license else yaml.SafeLoader
+    data = _load_front_matter(text, loader)
     meta: dict[str, str] = {}
     for i, (k, v) in enumerate(data.items()):
         if i >= 100:
@@ -124,68 +162,71 @@ def _skill_md_link_problems(skill: Path, text: str) -> list[str]:
     return out
 
 
-def licence_family(text: str) -> str | None:
-    """Identify the licence family from markers in the first 4096 characters."""
-    flat = " ".join(text[:MAX_LICENCE_CHARS].split())
-    if "Apache License" in flat and "Version 2.0" in flat:
-        return "Apache-2.0"
-    if "CC0 1.0 Universal" in flat or ("Creative Commons Legal Code" in flat and "CC0" in flat):
-        return "CC0-1.0"
-    if MIT_GRANT in flat:
-        return "MIT-0" if MIT_NOTICE not in flat else "MIT"
+def _front_licence_problem(meta: dict, spdx: str) -> str | None:
+    """Require each front matter licence to be an agreeing ID or a complete pointer."""
+    for key in ("license", "licence"):
+        if key not in meta:
+            continue
+        raw = meta[key]
+        label = f"front matter {key}"
+        if not isinstance(raw, str):
+            return f"{label} has type {type(raw).__name__}; expected a string"
+        if not raw.strip():
+            return f"{label} is an empty string"
+        if " ".join(raw.casefold().split()) in LICENCE_POINTERS:
+            continue
+        front_id = candidate_licence_id(raw)
+        if front_id is None:
+            return f"{label} {raw} not recognised"
+        if front_id != spdx:
+            return f"{label} {raw} disagrees with ORIGIN.md licence {spdx}"
     return None
 
 
-def _licence_problems(skill: Path, declared: str | None, front_license: str | None) -> list[str]:
-    """Check the licence file and front matter against the adapted skill's provenance."""
-    out = []
-    known_origin = declared in LICENCE_FAMILIES
-    if declared is not None and not known_origin:
-        out.append(f"{skill.name}/ORIGIN.md: licence {declared} not recognised")
-
-    licence = skill / "LICENSE"
-    if licence.is_file():
-        with licence.open(encoding="utf-8", errors="replace") as handle:
-            family = licence_family(handle.read(MAX_LICENCE_CHARS))
-        if family is None:
-            out.append(f"{skill.name}: LICENSE text matches no known licence")
-        elif known_origin and family != declared:
-            out.append(f"{skill.name}: LICENSE is {family}, ORIGIN.md declares {declared}")
-    else:
-        out.append(f"{skill.name}: the upstream LICENSE must sit beside an adapted skill")
-
-    if front_license is not None:
-        if front_license not in FRONT_LICENCES:
-            out.append(f"{skill.name}/SKILL.md: front matter license {front_license} not recognised")
-        elif known_origin and FRONT_LICENCES[front_license] not in (None, declared):
-            out.append(f"{skill.name}/SKILL.md: front matter license {front_license} disagrees with ORIGIN.md licence {declared}")
-    return out
+def _licence_problem(skill: Path, declared: str, meta: dict, template_dir: Path,
+                     verified: Counter[str] | None) -> str | None:
+    """Report the first licence problem or record the verified SPDX ID."""
+    spdx = candidate_licence_id(declared)
+    if spdx is None:
+        return f"{skill.name}/ORIGIN.md: licence {declared} not recognised"
+    front_problem = _front_licence_problem(meta, spdx)
+    if front_problem:
+        return f"{skill.name}/SKILL.md: {front_problem}"
+    try:
+        verify_licence(skill / "LICENSE", template_dir, spdx)
+    except (ValueError, FileNotFoundError) as exc:
+        return f"{skill.name}: {exc}"
+    if verified is not None:
+        verified[spdx] += 1
+    return None
 
 
-def skill_problems(skill):
+def skill_problems(skill: Path, *, template_dir: Path | None = None, verified: Counter[str] | None = None) -> list[str]:
     """Problems of one skill directory, each naming the file and the rule."""
     out = []
     md, origin = skill / "SKILL.md", skill / "ORIGIN.md"
-    if not md.is_file():
-        return [f"{skill.name}: SKILL.md missing"]
-    text = md.read_text(encoding="utf-8")
     try:
-        meta = front_matter(text, exact_license=True)
+        text = read_utf8(md, MAX_SKILL_MD_BYTES)
+    except (ValueError, FileNotFoundError) as exc:
+        return [f"{skill.name}: {exc}"]
+    try:
+        meta = _load_front_matter(text, _UniqueKeyLoader)
     except ValueError as exc:
-        out.append(f"{skill.name}/SKILL.md: front matter is not valid YAML: {exc}")
-        meta = {}
-    if meta.get("name") != skill.name:
+        return [f"{skill.name}/SKILL.md: front matter is not valid YAML: {' '.join(str(exc).split())}"]
+    if str(meta.get("name")).strip() != skill.name:
         out.append(f"{skill.name}/SKILL.md: front matter name must be {skill.name!r}")
-    if not meta.get("description", "").strip():
+    desc = meta.get("description")
+    if isinstance(desc, (list, dict, type(None))) or not str(desc).strip():
         out.append(f"{skill.name}/SKILL.md: front matter needs a description")
     for n, line in enumerate(text.splitlines(), 1):
         if FETCH.search(line):
             out.append(f"{skill.name}/SKILL.md:{n}: installs or fetches code at run time")
     out.extend(_skill_md_link_problems(skill, text))
     out.extend(_workbench_problems(skill))
-    if not origin.is_file():
-        return out + [f"{skill.name}: ORIGIN.md missing"]
-    rec = fields(origin.read_text(encoding="utf-8"))
+    try:
+        rec = fields(read_utf8(origin, MAX_ORIGIN_BYTES))
+    except (ValueError, FileNotFoundError) as exc:
+        return out + [f"{skill.name}: {exc}"]
     if rec.get("upstream") == "own":
         return out
     for key in ("upstream", "path", "commit", "licence", "changes"):
@@ -193,7 +234,11 @@ def skill_problems(skill):
             out.append(f"{skill.name}/ORIGIN.md: needs '{key}:'")
     if rec.get("commit") and not COMMIT.match(rec["commit"]):
         out.append(f"{skill.name}/ORIGIN.md: commit must be the full 40-hex SHA")
-    out.extend(_licence_problems(skill, rec.get("licence"), meta.get("license")))
+    if declared := rec.get("licence"):
+        if template_dir is None:
+            template_dir = skill.parent.parent / "LICENSES"
+        if problem := _licence_problem(skill, declared, meta, template_dir, verified):
+            out.append(problem)
     return out
 
 
@@ -248,17 +293,22 @@ def index_problems(root, skills=None):
 
 
 def check(root):
+    """Check the skill tree and report verified licence counts."""
     skills = sorted(p for p in (root / "skills").iterdir() if p.is_dir())[:MAX_SKILLS] if (root / "skills").is_dir() else []
-    problems = [p for s in skills for p in skill_problems(s)]
+    verified: Counter[str] = Counter()
+    problems = [p for s in skills for p in skill_problems(s, verified=verified)]
     problems += check_install_set(root)
     problems.extend(index_problems(root, skills))
     for p in problems:
         print(f"[FAIL] {p}")
+    if verified:
+        print("verified licences: " + ", ".join(f"{spdx}={count}" for spdx, count in sorted(verified.items())))
     print(f"skills: {len(skills)} checked, {len(problems)} problems")
     return 1 if problems else 0
 
 
 def write_index(root, rows):
+    """Write the index TSV for fixture skills."""
     d = root / "skills"
     d.mkdir(parents=True, exist_ok=True)
     lines = [INDEX_HEADER]
@@ -277,7 +327,7 @@ def _fixture_licence(spdx: str) -> str:
 
 
 def write(root, name, skill_md, origin=None, licence=True, *, licence_text=None):
-    """Write a fixture skill with MIT text by default."""
+    """Write a fixture skill and seed its canonical template if available."""
     d = root / "skills" / name
     d.mkdir(parents=True, exist_ok=True)
     (d / "SKILL.md").write_text(skill_md, encoding="utf-8")
@@ -286,6 +336,15 @@ def write(root, name, skill_md, origin=None, licence=True, *, licence_text=None)
     if licence:
         text = _fixture_licence("MIT") if licence_text is None else licence_text
         (d / "LICENSE").write_text(text, encoding="utf-8")
+        spdx = candidate_licence_id(fields(origin or "").get("licence", "MIT"))
+        if spdx:
+            path = root / "LICENSES" / f"{spdx}.txt"
+            try:
+                template = _fixture_licence(spdx)
+            except FileNotFoundError:
+                return
+            path.parent.mkdir(exist_ok=True)
+            path.write_text(template, encoding="utf-8")
 
 
 def selftest():
@@ -334,7 +393,8 @@ def selftest():
         (root / "install-set.txt").unlink()
         _selftest_cases(Path(tmp), good_md, good_origin)
         _selftest_licences(root, good_md, good_origin)
-    return 0
+    suite = unittest.defaultTestLoader.loadTestsFromTestCase(_LicenceRegressionTests)
+    return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
 
 
 def _selftest_cases(tmp, good_md, good_origin):
@@ -349,7 +409,7 @@ def _selftest_cases(tmp, good_md, good_origin):
         "wrong-name": (good_md.format(n="other"), good_origin, True, "front matter name"),
         "no-origin": (good_md.format(n="no-origin"), None, True, "ORIGIN.md missing"),
         "short-pin": (good_md.format(n="short-pin"), good_origin.replace("a" * 40, "abc1234"), True, "full 40-hex"),
-        "no-licence": (good_md.format(n="no-licence"), good_origin, False, "upstream LICENSE"),
+        "no-licence": (good_md.format(n="no-licence"), good_origin, False, "LICENSE missing"),
         "installs": (good_md.format(n="installs") + "\n    uv pip install numpy==2.5.3\n", good_origin, True, "installs or fetches"),
         "empty-desc": ("---\nname: empty-desc\ndescription: >\n---\n\n# x\n", good_origin, True, "needs a description"),
         "bad-yaml": ("---\nname: [\n---\n\n# x\n", good_origin, True, "not valid YAML"),
@@ -409,20 +469,21 @@ def _selftest_licences(tmp, good_md, good_origin):
     mit = _fixture_licence("MIT")
     apache = _fixture_licence("Apache-2.0")
     mit_zero = _fixture_licence("MIT-0")
-    wrapped_mit = "\n".join(mit.split()) + "\n"
+    header, sep, body = mit.partition("Permission")
+    wrapped_mit = header + "\n".join((sep + body).split()) + "\n"
     cases = (
         ("carrier-licence", mit, "Apache-2.0", "Apache-2.0",
-         "LICENSE is MIT, ORIGIN.md declares Apache-2.0"),
-        ("apache-as-mit", apache, "MIT", None, "LICENSE is Apache-2.0, ORIGIN.md declares MIT"),
-        ("mit-zero-as-mit", mit_zero, "MIT", None, "LICENSE is MIT-0, ORIGIN.md declares MIT"),
-        ("mit-as-mit-zero", mit, "MIT-0", None, "LICENSE is MIT, ORIGIN.md declares MIT-0"),
-        ("unknown-text", "All rights reserved.\n", "MIT", None, "LICENSE text matches no known licence"),
+         "LICENSE differs from Apache-2.0 at word offset"),
+        ("apache-as-mit", apache, "MIT", None, "LICENSE differs from MIT at word offset"),
+        ("mit-zero-as-mit", mit_zero, "MIT", None, "LICENSE differs from MIT at word offset"),
+        ("mit-as-mit-zero", mit, "MIT-0", None, "LICENSE differs from MIT-0 at word offset"),
+        ("unknown-text", "All rights reserved.\n", "MIT", None, "LICENSE differs from MIT at word offset"),
         ("unknown-origin", mit, "GPL-3.0", None, "ORIGIN.md: licence GPL-3.0 not recognised"),
         ("front-mismatch", mit, "MIT", "Apache-2.0",
          "front matter license Apache-2.0 disagrees with ORIGIN.md licence MIT"),
         ("unknown-front", mit, "MIT", "BSD-ish", "front matter license BSD-ish not recognised"),
-        ("null-front", mit, "MIT", "null", "front matter license <NoneType> not recognised"),
-        ("padded-front", mit, "MIT", '" MIT "', "front matter license  MIT  not recognised"),
+        ("null-front", mit, "MIT", "null", "front matter license has type NoneType"),
+        ("padded-front", mit, "MIT", '" MIT "', None),
         ("mit-alias", mit, "MIT", '"MIT license"', None),
         ("license-pointer", apache, "Apache-2.0", "Complete terms in LICENSE.txt", None),
         ("rewrapped-mit", wrapped_mit, "MIT", "MIT", None),
@@ -444,6 +505,188 @@ def _selftest_licences(tmp, good_md, good_origin):
             assert len(problems) == 1 and expected in problems[0], (name, expected, problems)
             refused += 1
     print(f"licence selftest ok: {refused} planted defects refused, {len(cases) - refused} valid cases passed")
+
+
+class _LicenceRegressionTests(unittest.TestCase):
+    """Plant licence files and declarations for the production skill checker."""
+
+    def setUp(self):
+        """Create an isolated skill tree and canonical template directory."""
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.templates = self.root / "LICENSES"
+        self.templates.mkdir()
+        self.mit = _fixture_licence("MIT")
+        self.apache = _fixture_licence("Apache-2.0")
+        self.mit_zero = _fixture_licence("MIT-0")
+        for spdx, body in (("MIT", self.mit), ("Apache-2.0", self.apache), ("MIT-0", self.mit_zero)):
+            (self.templates / f"{spdx}.txt").write_text(body, encoding="utf-8")
+
+    def _plant(self, body, declared="MIT", front="", *, name="planted"):
+        """Write a skill and optionally write exact bytes into its LICENSE."""
+        md = f'---\nname: "{name}"\ndescription: Use when testing licences.\n{front}---\n'
+        origin = f"upstream: https://github.com/o/r\npath: skills/x\ncommit: {'a' * 40}\n"
+        origin += f"licence: {declared}\nchanges: register rewritten\n"
+        write(self.root, name, md, origin, licence=False)
+        skill = self.root / "skills" / name
+        if body is not None:
+            (skill / "LICENSE").write_bytes(body if isinstance(body, bytes) else body.encode())
+        return skill
+
+    def _refused(self, skill, message):
+        """Require one diagnostic naming the skill and the reason."""
+        problems = skill_problems(skill)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn(skill.name, problems[0])
+        self.assertIn(message, problems[0])
+
+    def test_false_accepts(self):
+        """Reject partial matches, mixed bodies and bytes outside UTF-8."""
+        notice_start = self.mit.index("The above copyright notice")
+        late_notice = self.mit[:notice_start] + " " * 4096 + self.mit[notice_start:]
+        cases = (
+            ("mit-quotes-apache", self.mit + '\n"Apache License, Version 2.0"\n', "Apache-2.0", "word offset"),
+            ("late-mit-notice", late_notice, "MIT-0", "word offset"),
+            ("apache-heading", "Apache License, Version 2.0\n", "Apache-2.0", "word offset"),
+            ("bare-mit-grant", "Permission is hereby granted, free of charge\n", "MIT-0", "word offset"),
+            ("invalid-utf8", b"\xff\n" + self.mit.encode(), "MIT", "invalid UTF-8"),
+            ("apache-plus-notice", self.apache + "\n" + self.mit[notice_start:], "Apache-2.0", "word offset"),
+            ("mit-extra-word", self.mit + "\nExtra\n", "MIT", "word offset"),
+            ("mit-as-mit-zero", self.mit, "MIT-0", "word offset"),
+            ("mit-zero-as-mit", self.mit_zero, "MIT", "word offset"),
+        )
+        for name, body, declared, message in cases:
+            with self.subTest(name=name):
+                self._refused(self._plant(body, declared, name=name), message)
+
+    def test_candidate_families(self):
+        """Admit additional candidate families only when their template exists."""
+        ids = ("ISC", "BSD-2-Clause", "BSD-3-Clause", "0BSD", "Zlib", "Unlicense",
+               "MPL-2.0", "EUPL-1.2", "LGPL-2.1", "LGPL-3.0-only", "LGPL-2.0-or-later")
+        for spdx in ids:
+            body = f"Fixture terms for {spdx}. The complete grant appears here.\n"
+            skill = self._plant(body, spdx, name=spdx.lower())
+            with self.subTest(spdx=spdx, template="missing"):
+                self._refused(skill, f"reuse download {spdx}")
+            with self.subTest(spdx=spdx, template="present"):
+                (self.templates / f"{spdx}.txt").write_text(body, encoding="utf-8")
+                self.assertEqual(skill_problems(skill), [])
+
+    def test_front_matter(self):
+        """Accept shared ID forms and exact file pointers, reject other values."""
+        cases = (
+            ("mit-name", "MIT License", "MIT", self.mit, None),
+            ("mit-lower", "mit", "MIT", self.mit, None),
+            ("mit-origin", "MIT", "mit licence", self.mit, None),
+            ("apache-name", "Apache 2.0", "Apache-2.0", self.apache, "not recognised"),
+            ("see-licence", "SEE LICENSE IN LICENSE", "MIT", self.mit, None),
+            ("see-txt", "SEE LICENSE IN LICENSE.txt", "MIT", self.mit, None),
+            ("complete-txt", "Complete terms in LICENSE.txt", "MIT", self.mit, None),
+            ("see-arbitrary", "SEE LICENSE ON EXAMPLE.INVALID", "MIT", self.mit, "not recognised"),
+            ("list", "[MIT]", "MIT", self.mit, "type list"),
+            ("integer", "4", "MIT", self.mit, "type int"),
+            ("boolean", "true", "MIT", self.mit, "type bool"),
+            ("null-value", "", "MIT", self.mit, "type NoneType"),
+            ("empty-string", "''", "MIT", self.mit, "empty string"),
+        )
+        for name, front, declared, body, message in cases:
+            with self.subTest(name=name):
+                skill = self._plant(body, declared, f"license: {front}\n", name=name)
+                if message is None:
+                    self.assertEqual(skill_problems(skill), [])
+                else:
+                    self._refused(skill, message)
+
+    def test_duplicate_keys(self):
+        """Refuse duplicate licence or unrelated mapping keys."""
+        for key, front in (
+            ("license", "license: Apache-2.0\nlicense: MIT\n"),
+            ("name", "name: planted\n"),
+            ("nested", "metadata:\n  nested: x\n  nested: y\n"),
+        ):
+            with self.subTest(key=key):
+                self._refused(self._plant(self.mit, front=front), f"duplicate key {key!r}")
+
+    def test_file_failures(self):
+        """Report missing, directory, symlink and unreadable licence files."""
+        skill = self._plant(None, name="missing")
+        with self.subTest(case="missing"):
+            self._refused(skill, "LICENSE missing")
+        skill = self._plant(None, name="directory")
+        (skill / "LICENSE").mkdir()
+        with self.subTest(case="directory"):
+            self._refused(skill, "LICENSE is a directory")
+        skill = self._plant(None, name="symlink")
+        (skill / "LICENSE").symlink_to(self.templates / "MIT.txt")
+        with self.subTest(case="symlink"):
+            self._refused(skill, "LICENSE is a symlink")
+        skill = self._plant(None, name="dangling")
+        (skill / "LICENSE").symlink_to(self.templates / "missing.txt")
+        with self.subTest(case="dangling"):
+            self._refused(skill, "LICENSE is a symlink")
+        skill = self._plant(self.mit, name="permission-error")
+        original_open = Path.open
+
+        def refuse_licence(path, *args, **kwargs):
+            """Simulate an unreadable file even when the test runs as root."""
+            if path == skill / "LICENSE":
+                raise PermissionError("permission denied fixture")
+            return original_open(path, *args, **kwargs)
+
+        with self.subTest(case="permission-error"), patch.object(Path, "open", refuse_licence):
+            self._refused(skill, "cannot read LICENSE")
+
+    @unittest.skipUnless(hasattr(os, "geteuid") and os.geteuid() != 0, "chmod requires a non-root Unix user")
+    def test_chmod_unreadable(self):
+        """Report a real unreadable file on systems that enforce Unix mode bits."""
+        skill = self._plant(self.mit)
+        path = skill / "LICENSE"
+        self.addCleanup(path.chmod, 0o600)
+        path.chmod(0o000)
+        self._refused(skill, "cannot read LICENSE")
+
+    def test_scan_continues(self):
+        """Report separate licence failures and still verify a later clean skill."""
+        self._plant(b"\xff", name="bad-encoding")
+        self._plant(None, name="missing")
+        self._plant(self.mit, name="valid")
+        names = ("bad-encoding", "missing", "valid")
+        write_index(self.root, [{"skill": name} for name in names])
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(check(self.root), 1)
+        report = output.getvalue()
+        self.assertIn("[FAIL] bad-encoding: LICENSE has invalid UTF-8", report)
+        self.assertIn("[FAIL] missing: LICENSE missing", report)
+        self.assertIn("verified licences: MIT=1", report)
+        self.assertIn("skills: 3 checked, 2 problems", report)
+
+    def test_accepted_text_variants(self):
+        """Accept presentation changes and omission of the Apache appendix."""
+        end_marker = "END OF TERMS AND CONDITIONS"
+        apache_end = self.apache.index(end_marker) + len(end_marker)
+        formatted_apache = self.apache.replace("http://", "https://").replace(
+            "non-exclusive", "non–exclusive").replace("1. Definitions.", "• Definitions.")
+        cases = (
+            ("apache-no-appendix", self.apache[:apache_end], "Apache-2.0"),
+            ("apache-formatting", formatted_apache, "Apache-2.0"),
+            ("bom-crlf", b"\xef\xbb\xbf" + self.mit.replace("\n", "\r\n").encode(), "MIT"),
+            ("long-mit", self.mit.replace("The above copyright notice", " " * 4096 + "The above copyright notice"), "MIT"),
+            ("cap-minus-one", self.mit.ljust(256 * 1024 - 1), "MIT"),
+            ("normalisation", self.mit.lower().replace('"', "“").replace("license", "licence"), "MIT"),
+            ("title-absent", self.mit.removeprefix("MIT License\n"), "MIT"),
+            ("title-alias", self.mit.replace("MIT License", "The MIT License", 1), "MIT"),
+            ("metadata-lines", "# SPDX-License-Identifier: MIT\n© 2026 Owner\n" + self.mit, "MIT"),
+        )
+        for name, body, declared in cases:
+            with self.subTest(name=name):
+                self.assertEqual(skill_problems(self._plant(body, declared, name=name)), [])
+
+    def test_over_size_cap(self):
+        """Refuse a valid body that is one byte over the cap."""
+        skill = self._plant(self.mit.ljust(256 * 1024 + 1), name="oversize")
+        self._refused(skill, "256 KiB")
 
 
 if __name__ == "__main__":

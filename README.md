@@ -28,9 +28,10 @@ One directory per skill under `skills/`:
 
 A skill adapted from upstream lists its changes against the pinned upstream text
 in `ORIGIN.md`. A skill written here says so there.
-For adapted skills, the `LICENSE` text must match the licence declared in
-`ORIGIN.md`, and any front matter `license` declaration must agree
-(see `python3 -B tools/check_skills.py selftest`).
+For adapted skills, the checker compares the complete `LICENSE` body with the
+canonical SPDX text in `LICENSES/` for the ID declared in `ORIGIN.md`.
+A front matter `license` declaration must identify the same licence or point
+to the licence file.
 
 ## Using it
 
