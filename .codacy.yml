@@ -30,6 +30,14 @@ engines:
       # pull request 27). Verdict: FACT peritia-decided-codacy-trial-verdict-27-path-traversal.
       - "tools/markdownlint/normalize.mjs"
       - "tools/markdownlint/test_normalize.mjs"
+      # javascript node-ssrf and regex-dos: Praetor's figure gate fetches the pinned player
+      # archive only from its fixed release origin and follows at most three redirects, each
+      # checked against an allow-list of HTTPS release hosts. The flagged expressions are single
+      # character classes with no nested quantifier and run in linear time (under 5 ms on
+      # one-million-character inputs). The engine tests allowed and refused redirects and the
+      # chain bound in tools/figures/astro.test.mjs (2 findings on pull request 29).
+      # Verdict: FACT peritia-decided-codacy-verdict-29-figures-fetch.
+      - "tools/figures/astro.mjs"
       # python dangerous subprocess use: the adoption tests start node and git with a fixed
       # argument list, by full path from shutil.which, on test input (2 findings).
       # Verdict: FACT peritia-decided-codacy-trial-verdict-27-test-subprocess.
