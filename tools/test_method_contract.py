@@ -5,8 +5,8 @@
 
 The Epitrop fixtures under contracts/epitrop/testdata/ are Epitrop's own result fixtures, replayed in both
 directions: a result Epitrop accepts reads here, and one it refuses is refused here with the reason Epitrop names.
-The battery method under contracts/testdata/ follows skills/battery-modeling. Its validity domain is the tested
-reference case of that skill, and its verifier program is a stand-in: the skill ships no helper script.
+The battery fixtures under contracts/testdata/ follow skills/battery-modeling. Their validity domain is the tested
+reference case of that skill, and their verifier program is a stand-in: the skill ships no helper script.
 """
 from __future__ import annotations
 
@@ -61,8 +61,23 @@ def _load(name: str) -> dict:
 
 
 def _method() -> mc.Method:
-    """Return the typed battery method definition."""
+    """Return the typed battery method the receipts are checked against."""
     return mc.method_from_document(_load("method-battery-spm.json"))
+
+
+def _done() -> dict:
+    """Return the done receipt document."""
+    return _load("receipt-battery-spm-done.json")
+
+
+def _blocked() -> dict:
+    """Return the blocked receipt document."""
+    return _load("receipt-battery-spm-blocked.json")
+
+
+def _value(receipt: dict, name: str) -> dict:
+    """Return the receipt's input value entry called name."""
+    return next(item for item in receipt["inputs"] if item["name"] == name)
 
 
 class EpitropFixtureTest(unittest.TestCase):
@@ -348,6 +363,109 @@ class SchemaTest(unittest.TestCase):
                     mc._validators.cache_clear()
                     with self.assertRaisesRegex(mc.ContractError, reason_prefix + reason):
                         mc._validators()
+
+
+class ReceiptTest(unittest.TestCase):
+    """Reading receipts against the battery method."""
+
+    def _refused(self, document: dict, says: str) -> None:
+        """Assert the receipt is refused with a message containing says."""
+        with self.assertRaises(mc.ContractError) as caught:
+            mc.receipt_from_document(document, _method())
+        self.assertIn(says, str(caught.exception))
+
+    def test_reads_the_done_receipt(self) -> None:
+        """A done receipt with every required input in domain and a passing verifier reads."""
+        receipt = mc.receipt_from_document(_done(), _method())
+        self.assertEqual(receipt.result.outcome, "done")
+        self.assertEqual(receipt.verifier_outcome, "pass")
+        self.assertEqual(receipt.inputs[2], mc.InputValue("c_rate", 0.5, "/h", ".slot/out/evidence/protocol.json"))
+        self.assertEqual(len(receipt.result.evidence), 2)
+
+    def test_reads_the_blocked_receipt(self) -> None:
+        """A blocked receipt that asks for its missing input reads, with no verifier log."""
+        receipt = mc.receipt_from_document(_blocked(), _method())
+        self.assertEqual(receipt.missing, ("initial_soc",))
+        self.assertEqual((receipt.verifier_outcome, receipt.verifier_evidence), ("not-run", ""))
+
+    def test_optional_input_may_be_missing_from_a_done_run(self) -> None:
+        """A missing optional input does not stop a done claim."""
+        document = _done()
+        document["missing"] = ["until_voltage"]
+        self.assertEqual(mc.receipt_from_document(document, _method()).missing, ("until_voltage",))
+
+    def test_domain_edges(self) -> None:
+        """Values on a bound's edges read; the next value past an edge is refused."""
+        document = _done()
+        document["inputs"].append({"name": "until_voltage", "value": 2.5, "unit": "V",
+                                   "evidence": ".slot/out/evidence/protocol.json"})
+        mc.receipt_from_document(document, _method())
+        _value(document, "until_voltage")["value"] = 4.2
+        mc.receipt_from_document(document, _method())
+        _value(document, "until_voltage")["value"] = 4.2000001
+        self._refused(document, "'until_voltage' = 4.2000001 lies outside the validity domain")
+        document = _done()
+        _value(document, "c_rate")["value"] = 0.5000001
+        self._refused(document, "'c_rate' = 0.5000001 lies outside the validity domain")
+
+    def test_failed_run_may_record_an_out_of_domain_value(self) -> None:
+        """A failed receipt records a value outside the domain; only a done claim needs the domain."""
+        document = _done()
+        document["result"]["outcome"] = "failed"
+        document["verifier"] = {"outcome": "not-run"}
+        _value(document, "c_rate")["value"] = 2.0
+        self.assertEqual(mc.receipt_from_document(document, _method()).result.outcome, "failed")
+
+    def test_refuses_insufficient_evidence(self) -> None:
+        """Done claims without their inputs, verifier or cited evidence are refused."""
+        cases = {
+            "required input missing": (lambda d: (d["inputs"].pop(0), d.update(missing=["initial_soc"])),
+                                       "the outcome must be blocked"),
+            "required input unaccounted": (lambda d: d["inputs"].pop(0), "neither given nor listed as missing"),
+            "verifier failed": (lambda d: d["verifier"].update(outcome="fail"), "needs a passing verifier"),
+            "verifier not run": (lambda d: d.update(verifier={"outcome": "not-run"}), "needs a passing verifier"),
+            "uncited evidence": (lambda d: d["inputs"][0].update(evidence=".slot/out/evidence/other.json"),
+                                 "which the result does not list"),
+            "verifier log not listed": (lambda d: d["verifier"].update(evidence=".slot/out/evidence/x.log"),
+                                        "verifier cites"),
+            "verifier ran without log": (lambda d: d["verifier"].pop("evidence"), "'evidence' is a required"),
+        }
+        for label, (mutate, says) in cases.items():
+            with self.subTest(label=label):
+                document = _done()
+                mutate(document)
+                self._refused(document, says)
+
+    def test_refuses_blocked_run_that_does_not_ask(self) -> None:
+        """A missing required input must be asked for by name."""
+        document = _blocked()
+        document["result"]["questions"] = ["ASK battery-measured-cell-soc: which soc did the cycler log"]
+        self._refused(document, "no question asks for missing input 'initial_soc'")
+
+    def test_refuses_invalid_inputs(self) -> None:
+        """Undeclared inputs, wrong units, doubled values and inputs both given and missing are refused."""
+        cases = {
+            "undeclared": (lambda d: d["inputs"][0].update(name="pressure"), "'pressure' is not declared"),
+            "wrong unit": (lambda d: d["inputs"][1].update(unit="Cel"), "is in Cel, the method reads K"),
+            "given twice": (lambda d: d["inputs"].append(dict(d["inputs"][0])), "given twice"),
+            "given and missing": (lambda d: d.update(missing=["c_rate"]), "both given and missing"),
+            "other method": (lambda d: d.update(method="battery-dfn"), "not battery-spm-constant-current"),
+            "boolean value": (lambda d: d["inputs"][0].update(value=True), "is not of type 'number'"),
+        }
+        for label, (mutate, says) in cases.items():
+            with self.subTest(label=label):
+                document = _done()
+                mutate(document)
+                self._refused(document, says)
+
+    def test_refuses_results_epitrop_refuses(self) -> None:
+        """The carried result is held to Epitrop's schema and its done-needs-head rule."""
+        document = _done()
+        document["result"]["merged"] = True
+        self._refused(document, "'merged' was unexpected")
+        document = _done()
+        del document["result"]["head"]
+        self._refused(document, "outcome done needs the head commit")
 
 
 class DocumentTest(unittest.TestCase):

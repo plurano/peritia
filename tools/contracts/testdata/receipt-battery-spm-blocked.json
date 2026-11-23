@@ -1,0 +1,25 @@
+{
+  "method": "battery-spm-constant-current",
+  "result": {
+    "unit": "peritia:battery-spm-measured-cell",
+    "outcome": "blocked",
+    "summary": "The cell's initial state of charge is not recorded, so the run did not start.",
+    "evidence": [
+      {
+        "path": ".slot/out/evidence/protocol.json",
+        "sha256": "f4192386c7bf9ce3a388bf076a1a54767cc8c5b0b662f053b5dbb6e2273aad39",
+        "lines": 1
+      }
+    ],
+    "questions": [
+      "ASK battery-measured-cell-soc: which initial_soc did the cycler log before the first step | blocks: the simulation"
+    ]
+  },
+  "inputs": [
+    { "name": "temperature", "value": 298.15, "unit": "K", "evidence": ".slot/out/evidence/protocol.json" },
+    { "name": "c_rate", "value": 0.5, "unit": "/h", "evidence": ".slot/out/evidence/protocol.json" },
+    { "name": "step_duration", "value": 600, "unit": "s", "evidence": ".slot/out/evidence/protocol.json" }
+  ],
+  "missing": ["initial_soc"],
+  "verifier": { "outcome": "not-run" }
+}

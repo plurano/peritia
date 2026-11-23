@@ -5,14 +5,17 @@
 
 A method definition states what one executable method computes, from which inputs in which units,
 under which model, with which exact tool version, where its result holds and how it is checked. A
-run's result is the Epitrop slot result, whose shape is Epitrop's own schema, vendored at the commit
-contracts/epitrop/vendor.json pins from https://github.com/tekmora/epitrop (EUPL-1.2).
+receipt binds one run of that method to the Epitrop slot result of that run and carries it unchanged.
+The result's shape is Epitrop's own schema, vendored at the commit contracts/epitrop/vendor.json pins
+from https://github.com/tekmora/epitrop (EUPL-1.2).
 
 The schemas decide shape. This module adds what a schema cannot state: each input is declared once,
-and a validity bound names a declared input and has min at most max. For results it mirrors Epitrop's
-done-needs-head rule, the checks on evidence path text, and the integer representation of evidence
-line counts. Epitrop's workspace policy covers the run's unit id, the 64 KiB result-file cap,
-symlinks, and evidence file checks.
+a validity bound names a declared input and has finite ends with min at most max, and input names a
+receipt refers to must be declared. For results it mirrors Epitrop's done-needs-head rule, the checks
+on evidence path text, and the integer representation of evidence line counts. Epitrop's workspace
+policy covers the run's unit id, the 64 KiB result-file cap, symlinks, and evidence file checks.
+A receipt claims done only with every required input, every value inside the validity domain and a
+passing verifier. A required input the run did not have makes it blocked, with a question naming it.
 Documents are parsed as strict UTF-8 JSON with finite numbers and unique keys.
 """
 from __future__ import annotations
@@ -22,6 +25,7 @@ import itertools
 import json
 import math
 import posixpath
+import re
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,6 +43,7 @@ EPITROP_RESULT_SCHEMA_PATH = EPITROP_DIR / "result.schema.json"
 MAX_DOCUMENT_BYTES = 1 << 20  # a contract document is small; refuse anything larger
 MAX_REPORTED_ERRORS = 16  # bounds the schema errors read from one document (HISS-02)
 DONE = "done"
+BLOCKED = "blocked"
 EVIDENCE_PREFIX = ".slot/out/evidence/"
 
 
@@ -113,6 +118,28 @@ class SlotResult:
     questions: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class InputValue:
+    """One value a run used, with the evidence entry it was read from."""
+
+    name: str
+    value: float
+    unit: str
+    evidence: str
+
+
+@dataclass(frozen=True)
+class Receipt:
+    """A typed method receipt: the run's slot result, its inputs and what its verifier said."""
+
+    method: str
+    result: SlotResult
+    inputs: tuple[InputValue, ...]
+    missing: tuple[str, ...]
+    verifier_outcome: str
+    verifier_evidence: str
+
+
 def _refuse_constant(name: str) -> float:
     """Refuse NaN and Infinity, which JSON does not have and every bound check would pass."""
     raise ValueError(f"{name} is not a JSON number")
@@ -185,7 +212,7 @@ _ContractValidator = validators.extend(Draft202012Validator, validators={"patter
 
 @functools.cache
 def _validators() -> dict[str, Validator]:
-    """Compile the method and Epitrop result validators once, refusing a broken schema."""
+    """Compile the method, receipt and Epitrop result validators once, refusing a broken schema."""
     schemas = {}
     resources = []
     for path in (METHOD_SCHEMA_PATH, EPITROP_RESULT_SCHEMA_PATH):
@@ -204,6 +231,8 @@ def _validators() -> dict[str, Validator]:
     registry = Registry().with_resources(resources)
     return {
         "method": _ContractValidator(schemas[METHOD_SCHEMA_PATH], registry=registry),
+        "receipt": _ContractValidator({"$ref": f"{schemas[METHOD_SCHEMA_PATH]['$id']}#/$defs/receipt"},
+                                      registry=registry),
         "result": _ContractValidator(schemas[EPITROP_RESULT_SCHEMA_PATH], registry=registry),
     }
 
@@ -304,3 +333,81 @@ def result_from_document(document: object) -> SlotResult:
         evidence=_checked_evidence(checked.get("evidence", ())),
         questions=tuple(checked.get("questions", ())),
     )
+
+
+def _input_reasons(method: Method, inputs: tuple[InputValue, ...], evidence: set[str]) -> list[str]:
+    """Return why the receipt's input values do not fit the method's declared inputs."""
+    reasons = []
+    names = [value.name for value in inputs]
+    if len(set(names)) != len(names):
+        reasons.append("an input value is given twice")
+    for value in inputs:
+        declared = method.input(value.name)
+        if declared is None:
+            reasons.append(f"input {value.name!r} is not declared by method {method.id}")
+        elif value.unit != declared.unit:
+            reasons.append(f"input {value.name!r} is in {value.unit}, the method reads {declared.unit}")
+        if value.evidence not in evidence:
+            reasons.append(f"input {value.name!r} cites {value.evidence!r}, which the result does not list")
+    return reasons
+
+
+def _missing_reasons(method: Method, receipt: Receipt) -> list[str]:
+    """Return why the receipt's missing list does not account for the method's required inputs."""
+    reasons = []
+    supplied = {value.name for value in receipt.inputs}
+    for name in receipt.missing:
+        if method.input(name) is None:
+            reasons.append(f"missing input {name!r} is not declared by method {method.id}")
+        if name in supplied:
+            reasons.append(f"input {name!r} is both given and missing")
+    for item in method.inputs:
+        if item.required and item.name not in supplied and item.name not in receipt.missing:
+            reasons.append(f"required input {item.name!r} is neither given nor listed as missing")
+    return reasons
+
+
+def _claim_reasons(method: Method, receipt: Receipt) -> list[str]:
+    """Return why the receipt's outcome is not backed by its inputs and verifier."""
+    reasons = []
+    absent = [name for name in receipt.missing if (declared := method.input(name)) is not None and declared.required]
+    if absent and receipt.result.outcome != BLOCKED:
+        reasons.append(f"required inputs {absent} are missing, so the outcome must be blocked")
+    for name in absent:
+        asked = re.compile(rf"\b{re.escape(name)}\b")
+        if not any(asked.search(question) for question in receipt.result.questions):
+            reasons.append(f"no question asks for missing input {name!r}")
+    if receipt.result.outcome != DONE:
+        return reasons
+    if receipt.verifier_outcome != "pass":
+        reasons.append(f"outcome done needs a passing verifier, it is {receipt.verifier_outcome}")
+    for value in receipt.inputs:
+        bound = next((item for item in method.validity_domain if item.input == value.name), None)
+        if bound is not None and not bound.holds(value.value):
+            reasons.append(f"input {value.name!r} = {value.value} lies outside the validity domain")
+    return reasons
+
+
+def receipt_from_document(document: object, method: Method) -> Receipt:
+    """Return the typed receipt a document states for method, or raise ContractError."""
+    document = _checked("receipt", document)
+    result = result_from_document(document["result"])
+    verifier = document["verifier"]
+    receipt = Receipt(
+        method=document["method"],
+        result=result,
+        inputs=tuple(InputValue(**item) for item in document["inputs"]),
+        missing=tuple(document["missing"]),
+        verifier_outcome=verifier["outcome"],
+        verifier_evidence=verifier.get("evidence", ""),
+    )
+    evidence = {entry.path for entry in result.evidence}
+    reasons = [] if receipt.method == method.id else [f"receipt is for method {receipt.method}, not {method.id}"]
+    reasons += _input_reasons(method, receipt.inputs, evidence)
+    if receipt.verifier_evidence and receipt.verifier_evidence not in evidence:
+        reasons.append(f"verifier cites {receipt.verifier_evidence!r}, which the result does not list")
+    reasons += _missing_reasons(method, receipt)
+    reasons += _claim_reasons(method, receipt)
+    if reasons:
+        raise ContractError(f"receipt for {method.id}: " + "; ".join(reasons))
+    return receipt
