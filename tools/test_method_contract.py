@@ -48,10 +48,10 @@ def _done_document() -> dict:
     """Return a fresh copy of Epitrop's accepted result with evidence."""
     fixture = mc.read_document(EPITROP_FIXTURES / "result-done-with-evidence.json")
     if not isinstance(fixture, dict):
-        raise AssertionError("fixture is not a JSON object")
+        raise TypeError("fixture is not a JSON object")
     document = mc.parse_document(fixture["document"], fixture["id"])
     if not isinstance(document, dict):
-        raise AssertionError("result document is not a JSON object")
+        raise TypeError("result document is not a JSON object")
     return document
 
 
