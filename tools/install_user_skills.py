@@ -13,9 +13,19 @@ Usage:
   install_user_skills.py plan      [--tag TAG] [--repo URL] [--home DIR] [--clients all]
   install_user_skills.py install   [--tag TAG] [--repo URL] [--home DIR] [--clients all] [--apply]
   install_user_skills.py verify    [--home DIR]
+  install_user_skills.py drift     [--home DIR] [--json]
   install_user_skills.py uninstall [--home DIR] [--apply]
   install_user_skills.py selftest
 Without --apply, install and uninstall only print what they would do.
+
+Drift exits 0 for agreement, 1 for differences, and 2 for a scan error.
+With --json it prints one object with:
+  folders: objects with path and status (scanned, absent, or error)
+  summary: counts named drifting, shared, and folders (scanned folders)
+  drift: objects with name, first_difference (relative path), and copies
+         (each has a full SHA-256 digest and a list of installed locations)
+  error: a diagnostic string for the first scan error, otherwise null
+Only completed folders contribute to the counts and differences on a scan error.
 """
 import hashlib
 import json
@@ -25,6 +35,10 @@ import stat
 import subprocess
 import sys
 import tempfile
+from collections import Counter
+from contextlib import redirect_stdout
+from io import StringIO
+from itertools import islice
 from pathlib import Path
 
 REPO = "https://github.com/plurano/peritia"
@@ -35,6 +49,8 @@ INSTALL_SET_FILE = "install-set.txt"
 INSTALL_LIMIT = 129  # Codex skill list limit (measured 2026-10-15)
 GIT_TIMEOUT = 300  # seconds for one clone or ls-remote (HISS-02)
 MAX_FILES = 20000  # bounds every tree walk (HISS-02)
+MAX_DRIFT_DEPTH = 16  # directory levels below a skill root
+MAX_DRIFT_ENTRIES = 25000  # entries per folder listing or across an entire skill tree
 # Windows refuses a symbolic link without developer mode or admin rights; a directory junction needs neither.
 # PERITIA_LINK_MODE=junction forces junctions (to test that path where symlinks work); the output names the mode.
 LINK_MODE_ENV = "PERITIA_LINK_MODE"
@@ -48,6 +64,14 @@ CLIENTS = (
     ("antigravity", "agy", ".gemini/config/skills"),
     ("gemini-cli", "gemini", ".gemini/skills"),
     ("opencode", "opencode", ".agents/skills"),
+)
+# Additional folders from the workstation installation survey (2026-11-24).
+# The second field marks a directory whose children are separate skill sets.
+DRIFT_EXTRA_FOLDERS = (
+    (".copilot/skills", False),
+    (".pi/agent/skills", False),
+    (".claude/skills/synced", True),
+    (".codex/skills/.system", False),
 )
 
 
@@ -64,6 +88,203 @@ def client_dirs(home, everyone):
         else:
             out[name] = home / rel
     return out, skipped
+
+
+def drift_entries(folder, remaining):
+    """List at most the remaining entry budget, in path order."""
+    with os.scandir(folder) as entries:
+        paths = [Path(entry.path) for entry in islice(entries, remaining + 1)]
+    if len(paths) > remaining:
+        raise ValueError(f"{folder}: exceeds MAX_DRIFT_ENTRIES={MAX_DRIFT_ENTRIES}")
+    return sorted(paths)
+
+
+def drift_is_dir(path):
+    """Identify directories and tolerate missing entries and dangling links."""
+    try:
+        return stat.S_ISDIR(path.stat().st_mode)
+    except FileNotFoundError:
+        return False
+
+
+def drift_tree_path(root, path):
+    """Resolve an entry within a skill and skip dangling links and outside targets."""
+    target = link_target(path)
+    if target is None:
+        return path
+    target = path.parent / target
+    if not Path(os.path.abspath(target)).is_relative_to(root):
+        return None
+    try:
+        resolved = target.resolve(strict=True)
+    except FileNotFoundError:
+        return None
+    return resolved if resolved.is_relative_to(root) else None
+
+
+def drift_skill_root(location):
+    """Return the resolved root of a directory with a regular SKILL.md."""
+    if not drift_is_dir(location):
+        return None
+    root = location.resolve(strict=True)
+    marker = drift_tree_path(root, root / "SKILL.md")
+    if marker is not None:
+        try:
+            if stat.S_ISREG(marker.stat().st_mode):
+                return root
+        except FileNotFoundError:
+            return None
+    return None
+
+
+def drift_add_file(files, root, relative, target):
+    """Record a file digest within the cap, naming the file if reading fails."""
+    if len(files) == MAX_FILES:
+        raise ValueError(f"{root}: exceeds MAX_FILES={MAX_FILES}")
+    try:
+        files[relative.as_posix()] = digest(target)
+    except OSError as exc:
+        raise OSError(f"cannot hash {target}: {exc}") from exc
+
+
+def drift_tree_digest(root):
+    """Return a digest of sorted relative paths and their file digests, plus that inventory."""
+    pending = [(root, Path(), (root,))]
+    remaining = MAX_DRIFT_ENTRIES
+    files = {}
+    for _ in range(MAX_DRIFT_ENTRIES + 1):
+        if not pending:
+            break
+        folder, prefix, ancestors = pending.pop()
+        entries = drift_entries(folder, remaining)
+        remaining -= len(entries)
+        for entry in entries:
+            target = drift_tree_path(root, entry)
+            if target is None:
+                continue
+            relative = prefix / entry.name
+            mode = target.stat().st_mode
+            if stat.S_ISREG(mode):
+                drift_add_file(files, root, relative, target)
+            elif stat.S_ISDIR(mode) and target not in ancestors:
+                if len(relative.parts) > MAX_DRIFT_DEPTH:
+                    raise ValueError(f"{root}: {relative} exceeds MAX_DRIFT_DEPTH={MAX_DRIFT_DEPTH}")
+                pending.append((target, relative, (*ancestors, target)))
+    tree = hashlib.sha256()
+    for relative, file_digest in sorted(files.items()):
+        tree.update(os.fsencode(relative) + b"\0" + bytes.fromhex(file_digest))
+    return tree.hexdigest(), files
+
+
+def drift_scan_folder(folder, locations, trees):
+    """Record skill locations after a full folder scan, hashing each resolved root once."""
+    found = []
+    for location in drift_entries(folder, MAX_DRIFT_ENTRIES):
+        root = drift_skill_root(location)
+        if root is None:
+            continue
+        if root not in trees:
+            trees[root] = drift_tree_digest(root)
+        found.append((location, root))
+    for location, root in found:
+        locations.setdefault(location.name, []).append((location, root))
+
+
+def drift_scan(home):
+    """Scan configured roots and per-set folders, returning the first scan error if any."""
+    clients, _ = client_dirs(home, everyone=True)
+    roots = dict.fromkeys(clients.values(), False)
+    roots.update((home / relative, expand) for relative, expand in DRIFT_EXTRA_FOLDERS)
+    folders, locations, trees = {}, {}, {}
+    pending = list(reversed(roots.items()))
+    for _ in range(len(roots) + MAX_DRIFT_ENTRIES):
+        if not pending:
+            break
+        folder, expand = pending.pop()
+        if folder in folders:
+            continue
+        try:
+            try:
+                mode = folder.stat().st_mode
+            except FileNotFoundError:
+                folders[folder] = "absent"
+                continue
+            if not stat.S_ISDIR(mode):
+                raise NotADirectoryError("expected a skill directory")
+            if expand:
+                sets = drift_entries(folder, MAX_DRIFT_ENTRIES)
+                pending.extend((path, False) for path in reversed(sets) if drift_is_dir(path))
+            else:
+                drift_scan_folder(folder, locations, trees)
+                folders[folder] = "scanned"
+        except (OSError, ValueError) as exc:
+            folders[folder] = "error"
+            return folders, locations, trees, f"{folder}: {exc}"
+    return folders, locations, trees, None
+
+
+def drift_copies(locations, trees):
+    """Group installed locations by resolved folder while retaining every alias."""
+    copies = {}
+    for location, root in sorted(locations):
+        copy = copies.setdefault(root, {"digest": trees[root][0], "locations": []})
+        copy["locations"].append(str(location))
+    return list(copies.values())
+
+
+def drift_difference(copies, inventories):
+    """Find the first different path between the two most common copy digests."""
+    counts = Counter(copy["digest"] for copy in copies)
+    if len(counts) < 2:
+        return None
+    first, second = sorted(counts, key=lambda fingerprint: (-counts[fingerprint], fingerprint))[:2]
+    left, right = inventories[first], inventories[second]
+    return next(path for path in sorted(left.keys() | right.keys()) if left.get(path) != right.get(path))
+
+
+def drift_report(home):
+    """Build the report shared by the text and JSON views."""
+    folders, locations, trees, error = drift_scan(home)
+    inventories = dict(trees.values())
+    shared = 0
+    differences = []
+    for name, paths in sorted(locations.items()):
+        copies = drift_copies(paths, trees)
+        if len(copies) < 2:
+            continue
+        shared += 1
+        difference = drift_difference(copies, inventories)
+        if difference is not None:
+            differences.append({"name": name, "copies": copies, "first_difference": difference})
+    return {"folders": [{"path": str(path), "status": status} for path, status in folders.items()],
+            "summary": {"drifting": len(differences), "shared": shared,
+                        "folders": sum(status == "scanned" for status in folders.values())},
+            "drift": differences, "error": error}
+
+
+def drift(home, as_json):
+    """Print installed skill drift and return the scan status."""
+    report = drift_report(home)
+    if as_json:
+        print(json.dumps(report, indent=2))
+    else:
+        for folder in report["folders"]:
+            if folder["status"] != "error":
+                print(f"{folder['status']}: {folder['path']}")
+        for difference in report["drift"]:
+            print(f"{difference['name']}:")
+            for copy in difference["copies"]:
+                for location in copy["locations"]:
+                    print(f"  {copy['digest'][:12]}  {location}")
+            print(f"  first difference: {difference['first_difference']}")
+        summary = report["summary"]
+        print(f"drift: {summary['drifting']} of {summary['shared']} shared skill names differ across "
+              f"{summary['folders']} folders")
+        if report["error"] is not None:
+            print(f"drift error: {report['error']}", file=sys.stderr)
+    if report["error"] is not None:
+        return 2
+    return int(bool(report["drift"]))
 
 
 def git(args, cwd=None):
@@ -361,9 +582,8 @@ def fixture_repo(root, dirname="src", skills=("alpha", "beta"), install_set=None
 
 
 def quiet(fn, *args):
-    import contextlib
-    import io
-    with contextlib.redirect_stdout(io.StringIO()):
+    """Run a selftest operation without printing its stdout."""
+    with redirect_stdout(StringIO()):
         return fn(*args)
 
 
@@ -445,6 +665,152 @@ def selftest_cases(root):
     return cases + selftest_install_set_cases(root) + selftest_reader_cases(root)
 
 
+def fixture_skill(home, relative, content):
+    """Write a skill at a relative path under a fixture home."""
+    skill = home / relative
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(content, encoding="utf-8")
+    return skill
+
+
+def fixture_drift(home):
+    """Run the drift command against a fixture home and capture its JSON."""
+    os.environ["CODEX_HOME"] = str(home / ".codex")
+    output = StringIO()
+    with redirect_stdout(output):
+        status = drift(home, as_json=True)
+    return status, json.loads(output.getvalue())
+
+
+def fixture_first_difference(report):
+    """Read the first reported difference for a fixture with one drifting name."""
+    rows = report.get("drift", [])
+    return rows[0]["first_difference"] if len(rows) == 1 else None
+
+
+def selftest_drift_content(root):
+    """Check identical trees, changed bytes, and an extra relative path."""
+    home = root / "content"
+    left = fixture_skill(home, ".claude/skills/example", "left\n")
+    right = fixture_skill(home, ".agents/skills/example", "right\n")
+    status, report = fixture_drift(home)
+    cases = [("drift: different same-name copies exit 1",
+              status == 1 and fixture_first_difference(report) == "SKILL.md")]
+    (right / "SKILL.md").write_text("left\n", encoding="utf-8")
+    status, report = fixture_drift(home)
+    cases.append(("drift: identical copies exit 0",
+                  status == 0 and report.get("summary") == {"drifting": 0, "shared": 1, "folders": 2}))
+    for skill, content in ((left, "one\n"), (right, "two\n")):
+        (skill / "notes.md").write_text(content, encoding="utf-8")
+    status, report = fixture_drift(home)
+    cases.append(("drift: content-only edit exits 1",
+                  status == 1 and fixture_first_difference(report) == "notes.md"))
+    (right / "notes.md").write_text("one\n", encoding="utf-8")
+    (right / "extra.md").write_text("extra\n", encoding="utf-8")
+    status, report = fixture_drift(home)
+    cases.append(("drift: extra file exits 1 and names path",
+                  status == 1 and fixture_first_difference(report) == "extra.md"))
+    return cases
+
+
+def selftest_drift_locations(root):
+    """Check aliases, separately installed sets, and extra client folders."""
+    home = root / "aliases"
+    target = fixture_skill(home, "store/example", "same\n")
+    for relative in (".claude/skills", ".pi/agent/skills"):
+        folder = home / relative
+        folder.mkdir(parents=True)
+        make_link(folder / "example", target)
+    status, report = fixture_drift(home)
+    cases = [("drift: symlink aliases count as one copy",
+              status == 0 and report.get("summary") == {"drifting": 0, "shared": 0, "folders": 2})]
+
+    home = root / "extra-folders"
+    synced = [fixture_skill(home, f".claude/skills/synced/{name}/example", name) for name in ("one", "two")]
+    fixture_skill(home, ".copilot/skills/other", "copilot\n")
+    fixture_skill(home, ".codex/skills/.system/other", "system\n")
+    status, report = fixture_drift(home)
+    scanned = {row["path"] for row in report.get("folders", []) if row["status"] == "scanned"}
+    cases.append(("drift: each synced set scanned separately",
+                  status == 1 and {str(path.parent) for path in synced} <= scanned
+                  and any(row["name"] == "example" for row in report.get("drift", []))))
+    cases.append(("drift: Copilot and Codex system folders scanned",
+                  status == 1 and any(row["name"] == "other" for row in report.get("drift", []))))
+    return cases
+
+
+def selftest_drift_comparison(root):
+    """Check copy frequency, alias locations, and out-of-tree link handling."""
+    home = root / "comparison"
+    for folder, variant in ((".claude/skills", "one"), (".agents/skills", "one"),
+                            (".gemini/skills", "two"), (".copilot/skills", "two")):
+        skill = fixture_skill(home, f"{folder}/example", "same\n")
+        (skill / "second.md").write_text(variant, encoding="utf-8")
+    rare = fixture_skill(home, ".pi/agent/skills/example", "same\n")
+    (rare / "first.md").write_text("rare\n", encoding="utf-8")
+    aliases = (home / ".codex/skills/example", home / ".gemini/config/skills/example")
+    for alias in aliases:
+        alias.parent.mkdir(parents=True)
+        make_link(alias, rare)
+    status, report = fixture_drift(home)
+    cases = [("drift: first difference uses the two most common distinct copies",
+              status == 1 and fixture_first_difference(report) == "second.md")]
+    copies = [copy for row in report.get("drift", []) for copy in row["copies"]]
+    alias_locations = {str(path) for path in (rare, *aliases)}
+    cases.append(("drift: grouped copy retains all installed aliases",
+                  any(set(copy["locations"]) == alias_locations for copy in copies)))
+
+    home = root / "outside-link"
+    skill = fixture_skill(home, ".claude/skills/example", "same\n")
+    fixture_skill(home, ".agents/skills/example", "same\n")
+    outside = fixture_skill(home, "external", "outside\n")
+    make_link(skill / "outside", outside)
+    status, report = fixture_drift(home)
+    cases.append(("drift: links outside skill root excluded from hash",
+                  status == 0 and report.get("summary") == {"drifting": 0, "shared": 1, "folders": 2}))
+    return cases
+
+
+def selftest_drift_errors(root):
+    """Check absent folders, scan caps, and a file read failure."""
+    from unittest.mock import patch
+
+    home = root / "empty"
+    status, report = fixture_drift(home)
+    folders = report.get("folders", [])
+    cases = [("drift: absent folders listed and exit 0", status == 0 and len(folders) == 9
+              and all(row["status"] == "absent" for row in folders))]
+
+    home = root / "errors"
+    skill = fixture_skill(home, ".claude/skills/example", "example\n")
+    nested = skill / "nested"
+    nested.mkdir()
+    unreadable = nested.resolve() / "notes.md"
+    unreadable.write_text("notes\n", encoding="utf-8")
+    module = sys.modules[__name__]
+    for cap, limit in (("MAX_DRIFT_ENTRIES", 2), ("MAX_DRIFT_DEPTH", 0), ("MAX_FILES", 1)):
+        with patch.object(module, cap, limit, create=True):
+            status, report = fixture_drift(home)
+        error = report.get("error") or ""
+        cases.append((f"drift: {cap} exceeded exits 2 and names folder and cap",
+                      status == 2 and str(skill.resolve()) in error and f"{cap}={limit}" in error))
+
+    read_bytes = Path.read_bytes
+
+    def reject_file(path):
+        """Simulate a read failure for one fixture file on any platform."""
+        if path == unreadable:
+            raise PermissionError(f"permission denied: {path}")
+        return read_bytes(path)
+
+    with patch.object(Path, "read_bytes", reject_file):
+        status, report = fixture_drift(home)
+    error = report.get("error") or ""
+    cases.append(("drift: unreadable file exits 2 and names path",
+                  status == 2 and str(unreadable) in error and "permission denied" in error))
+    return cases
+
+
 def refused(call):
     try:
         call()
@@ -454,6 +820,7 @@ def refused(call):
 
 
 def selftest():
+    """Run the installer and drift fixtures for the available link modes."""
     keep = {name: os.environ.get(name) for name in ("CODEX_HOME", LINK_MODE_ENV)}
     modes = ["symlink", "junction"] if os.name == "nt" else ["symlink"]
     cases = []
@@ -461,7 +828,11 @@ def selftest():
         for mode in modes:
             os.environ[LINK_MODE_ENV] = mode
             with tempfile.TemporaryDirectory() as tmp:
-                cases += [(f"{mode}: {name}", ok) for name, ok in selftest_cases(Path(tmp))]
+                root = Path(tmp)
+                checked = (selftest_cases(root) + selftest_drift_content(root)
+                           + selftest_drift_locations(root) + selftest_drift_comparison(root)
+                           + selftest_drift_errors(root))
+                cases += [(f"{mode}: {name}", ok) for name, ok in checked]
         if os.name != "nt":
             os.environ[LINK_MODE_ENV] = "junction"
             cases.append(("junction mode refused off Windows", refused(lambda: make_link(Path("x"), Path("y")))))
@@ -472,11 +843,12 @@ def selftest():
     if bad:
         raise SystemExit(f"selftest failed: {bad}")
     print(f"selftest ok: {len(cases)} cases, link modes {', '.join(modes)} "
-          "(plan, install, collision, tamper, add, link, reinstall, uninstall, install-set)")
+          "(plan, install, collision, tamper, add, link, reinstall, uninstall, install-set, drift)")
     return 0
 
 
 def main(argv):
+    """Dispatch the requested installer command."""
     verb = argv[0] if argv else "plan"
     flags = {argv[i]: argv[i + 1] for i in range(1, len(argv) - 1) if argv[i].startswith("--") and argv[i] != "--apply"}
     apply, home = "--apply" in argv, Path(flags.get("--home") or Path.home())
@@ -486,6 +858,8 @@ def main(argv):
         return install(flags, home, verb == "install" and apply)
     if verb == "verify":
         return verify(home)
+    if verb == "drift":
+        return drift(home, "--json" in argv)
     if verb == "uninstall":
         return uninstall(home, apply)
     raise SystemExit(__doc__)

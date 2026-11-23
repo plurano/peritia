@@ -71,6 +71,13 @@ every link with its target, reports the install source, and fails on any change.
 `uninstall` removes the links and the store and reports how many Peritia paths
 remain (zero).
 
+`python3 tools/install_user_skills.py drift` compares same-name skills across
+installed client folders without changing any files. Each drifting name lists
+its locations and short SHA-256 digests, followed by the first path that differs
+between the two most common contents. The summary counts drifting names out of
+all shared names. Add `--json` for structured output. The exit status is 0 for
+agreement, 1 for drift, or 2 for a scan error.
+
 ## Census
 
 `python3 tools/census.py run --out census.tsv` creates a deterministic TSV
