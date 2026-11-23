@@ -21,7 +21,7 @@ _TOOLS_DIR = Path(__file__).resolve().parent
 if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
-import method_contract as mc  # noqa: E402
+import method_contract as mc
 
 EPITROP_FIXTURES = mc.EPITROP_DIR / "testdata" / "result"
 MAX_VENDORED_ENTRIES = 64  # bounds the directory entries consumed (HISS-02)
