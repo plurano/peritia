@@ -513,25 +513,32 @@ class ReceiptTest(unittest.TestCase):
         """Done claims without their inputs, verifier or cited evidence are refused."""
 
         def mark_required_input_missing(document: dict) -> None:
+            """Remove the initial state of charge and list it as missing."""
             document["inputs"].pop(0)
             document["missing"] = ["initial_soc"]
 
         def omit_required_input(document: dict) -> None:
+            """Remove the initial state of charge without listing it as missing."""
             document["inputs"].pop(0)
 
         def fail_verifier(document: dict) -> None:
+            """Set the verifier outcome to fail."""
             document["verifier"]["outcome"] = "fail"
 
         def skip_verifier(document: dict) -> None:
+            """Replace the verifier record with a not-run outcome."""
             document["verifier"] = {"outcome": "not-run"}
 
         def cite_unlisted_input_evidence(document: dict) -> None:
+            """Point the first input's evidence to a file absent from the result's evidence list."""
             document["inputs"][0]["evidence"] = ".slot/out/evidence/other.json"
 
         def cite_unlisted_verifier_log(document: dict) -> None:
+            """Point the verifier's evidence to a log absent from the result's evidence list."""
             document["verifier"]["evidence"] = ".slot/out/evidence/x.log"
 
         def omit_verifier_log(document: dict) -> None:
+            """Remove the verifier's evidence field."""
             del document["verifier"]["evidence"]
 
         cases = (
@@ -584,18 +591,23 @@ class ReceiptTest(unittest.TestCase):
         """Undeclared inputs, wrong units, doubled values and inputs both given and missing are refused."""
 
         def rename_input(document: dict) -> None:
+            """Rename the first input to the undeclared name pressure."""
             document["inputs"][0]["name"] = "pressure"
 
         def change_input_unit(document: dict) -> None:
+            """Set the unit of the second input to Cel."""
             document["inputs"][1]["unit"] = "Cel"
 
         def duplicate_input(document: dict) -> None:
+            """Append a copy of the first input."""
             document["inputs"].append(dict(document["inputs"][0]))
 
         def mark_given_input_missing(document: dict) -> None:
+            """List c_rate as missing while keeping its given value."""
             document["missing"] = ["c_rate"]
 
         def change_method(document: dict) -> None:
+            """Set the receipt's method to battery-dfn."""
             document["method"] = "battery-dfn"
 
         cases = (
