@@ -33,6 +33,12 @@ canonical SPDX text in `LICENSES/` for the ID declared in `ORIGIN.md`.
 A front matter `license` declaration must identify the same licence or point
 to the licence file.
 
+Keep vendored `LICENSE` files unchanged. Record reviewed upstream licence text
+variants in [`skills/licence-exceptions.yaml`](skills/licence-exceptions.yaml)
+with the file path, SPDX ID, SHA-256 hash of the original bytes, and the reason
+for accepting the variant. Use category D with an expiry 120 days after the
+entry date, and review the exception again when it expires.
+
 ## Using it
 
 Pin a release tag of this repository, the way you pin any upstream dependency,

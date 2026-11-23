@@ -1,0 +1,36 @@
+# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
+# SPDX-License-Identifier: EUPL-1.2
+
+exceptions:
+  - rule: skill-licence-text
+    path: skills/bernstein-run/LICENSE
+    spdx: Apache-2.0
+    sha256: ecfbf9d98e16db0a691d0e68707863a26f4053a3a9a6d667ce974a43631b563a
+    reason: The upstream Apache-2.0 text adds the word the before Licensor in the Contribution and Contributor definitions, uses any in place of those in section 4(d), and omits the optional appendix. Review again when the vendored skill or its LICENSE changes.
+    category: D
+    entered: "2026-11-24"
+    expires: "2027-03-24"
+  - rule: skill-licence-text
+    path: skills/brendangregg-use-tsa/LICENSE
+    spdx: MIT
+    sha256: 4f3989b6efd143f65c4f67eab07e0dcacddf9299a5c844512095df171485510b
+    reason: The complete MIT text is followed by an upstream note crediting Brendan Gregg's published methods and limiting the licence to the repository's own text, structure, and templates. Review again when the vendored skill or its LICENSE changes.
+    category: D
+    entered: "2026-11-24"
+    expires: "2027-03-24"
+  - rule: skill-licence-text
+    path: skills/jet-browser/LICENSE
+    spdx: Apache-2.0
+    sha256: 7c09f57b53ae342b5e28b7141e1ef426836bcc59f8bf90c79362258fe5a5dd51
+    reason: The Apache-2.0 terms are complete, and the appendix gives the completed boilerplate notice for the 2026 Jet Browser contributors with the instructions paragraph omitted. Review again when the vendored skill or its LICENSE changes.
+    category: D
+    entered: "2026-11-24"
+    expires: "2027-03-24"
+  - rule: skill-licence-text
+    path: skills/unsloth-finetuning/LICENSE
+    spdx: Apache-2.0
+    sha256: 40e0b458a68b557560def38b106a1a0da1aac57685536dcb882f1c78c647e4d3
+    reason: The Apache-2.0 terms are complete, and the upstream appendix places unsloth/*, tests/*, and scripts/* under Apache-2.0 and studio/* and unsloth_cli/* under AGPLv3. The skill includes no files from studio/ or unsloth_cli/, and its provenance declares Apache-2.0 and identifies this LICENSE as the licence source. Review again when the vendored skill or its LICENSE changes.
+    category: D
+    entered: "2026-11-24"
+    expires: "2027-03-24"

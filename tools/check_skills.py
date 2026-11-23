@@ -10,11 +10,15 @@ Usage: check_skills.py [ROOT] | check_skills.py selftest
 import io
 import os
 import re
+import stat
 import sys
 import tempfile
 import unittest
 from collections import Counter
 from contextlib import redirect_stdout
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
+from hashlib import sha256
 from pathlib import Path
 from unittest.mock import patch
 
@@ -24,11 +28,11 @@ import yaml
 try:
     from install_user_skills import read_install_set
     from licence_policy import LICENCE_POINTERS, candidate_licence_id
-    from licence_text import read_utf8, verify_licence
+    from licence_text import MAX_LICENCE_BYTES, read_utf8, verify_licence
 except ImportError:
     from tools.install_user_skills import read_install_set
     from tools.licence_policy import LICENCE_POINTERS, candidate_licence_id
-    from tools.licence_text import read_utf8, verify_licence
+    from tools.licence_text import MAX_LICENCE_BYTES, read_utf8, verify_licence
 
 COMMONMARK = MarkdownIt("commonmark")
 MAX_SKILLS = 5000  # bounds the directories read (HISS-02)
@@ -36,6 +40,10 @@ MAX_SKILL_ENTRIES = 1000  # bounds the entries walked in one skill (HISS-02)
 MAX_SKILL_MD_BYTES = 2 * 1024 * 1024
 MAX_ORIGIN_BYTES = 256 * 1024
 MAX_YAML_MAPPING_KEYS = 1000
+MAX_LICENCE_EXCEPTIONS = 128
+LICENCE_EXCEPTIONS_FILE = "skills/licence-exceptions.yaml"
+LICENCE_EXCEPTION_KEYS = frozenset({"rule", "path", "spdx", "sha256", "reason", "category", "entered", "expires"})
+LICENCE_EXCEPTION_DAYS = {"B": 3, "C": 10, "D": 120}
 AGENT_CONTROL_FILES = frozenset({
     "protocol.md", "agents.md", "claude.md", "gemini.md",
     ".cursorrules", ".windsurfrules", "copilot-instructions.md",
@@ -80,6 +88,119 @@ class _UniqueKeyLoader(yaml.SafeLoader):
         self.flatten_mapping(node)
         self._require_unique_keys(node)
         return super().construct_mapping(node, deep=deep)
+
+
+@dataclass(frozen=True)
+class _LicenceException:
+    """Identify the reviewed bytes and expiry for one skill licence."""
+
+    path: str
+    spdx: str
+    sha256: str
+    expires: date
+
+
+@dataclass
+class _LicenceScan:
+    """Track register entries left to check and the number of accepted pins."""
+
+    pending: dict[str, _LicenceException]
+    today: date
+    pinned: int = 0
+
+
+def _exception_fields(entry: object) -> dict[str, str]:
+    """Require exactly the allowed keys and a nonempty string for every value."""
+    if not isinstance(entry, dict):
+        raise TypeError("expected a mapping")
+    if unknown := entry.keys() - LICENCE_EXCEPTION_KEYS:
+        raise ValueError(f"unknown key(s): {', '.join(sorted(map(repr, unknown)))}")
+    if missing := LICENCE_EXCEPTION_KEYS - entry.keys():
+        raise ValueError(f"missing key(s): {', '.join(sorted(missing))}")
+    for key in sorted(LICENCE_EXCEPTION_KEYS):
+        value = entry[key]
+        if not isinstance(value, str):
+            raise TypeError(f"{key}: expected a string")
+        if not value.strip():
+            raise ValueError(f"{key}: expected a nonempty string")
+    return entry
+
+
+def _exception_date(entry: dict[str, str], key: str) -> date:
+    """Parse a register date in the exact YYYY-MM-DD format."""
+    value = entry[key]
+    if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value):
+        raise ValueError(f"{key}: expected a date in YYYY-MM-DD format")
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(f"{key}: invalid date {value!r}") from exc
+
+
+def _exception_expiry(entry: dict[str, str]) -> date:
+    """Apply the declared category's expiry interval."""
+    category = entry["category"]
+    entered = _exception_date(entry, "entered")
+    expires = _exception_date(entry, "expires")
+    if category == "A":
+        return expires
+    days = LICENCE_EXCEPTION_DAYS.get(category)
+    if days is None:
+        raise ValueError(f"category: expected A, B, C or D, found {category!r}")
+    try:
+        expected = entered + timedelta(days=days)
+    except OverflowError as exc:
+        raise ValueError(f"entered: {entered} leaves no expiry date for category {category}") from exc
+    if expires != expected:
+        raise ValueError(f"expires: category {category} requires {expected}, found {expires}")
+    return expires
+
+
+def _parse_licence_exception(raw: object) -> _LicenceException:
+    """Validate the rule, skill path, SPDX ID, byte hash and expiry."""
+    entry = _exception_fields(raw)
+    if entry["rule"] != "skill-licence-text":
+        raise ValueError("rule: expected skill-licence-text")
+    path = entry["path"]
+    match = re.fullmatch(r"skills/([^/\\]+)/LICENSE", path)
+    if not match or match[1] in {".", ".."} or not path.isprintable():
+        raise ValueError("path: expected skills/<name>/LICENSE")
+    spdx = entry["spdx"]
+    if candidate_licence_id(spdx) != spdx:
+        raise ValueError(f"spdx: expected a supported SPDX identifier, found {spdx!r}")
+    digest = entry["sha256"]
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise ValueError("sha256: expected 64 lowercase hexadecimal characters")
+    return _LicenceException(path, spdx, digest, _exception_expiry(entry))
+
+
+def _read_licence_exceptions(root: Path) -> dict[str, _LicenceException]:
+    """Read the optional register and index validated entries by skill licence path."""
+    try:
+        text = read_utf8(root / LICENCE_EXCEPTIONS_FILE, MAX_LICENCE_BYTES, refuse_links=True)
+    except FileNotFoundError:
+        return {}
+    try:
+        data = yaml.load(text, Loader=_UniqueKeyLoader)
+    except (yaml.YAMLError, RecursionError) as exc:
+        raise ValueError(f"invalid YAML: {' '.join(str(exc).split())}") from exc
+    if not isinstance(data, dict) or data.keys() != {"exceptions"}:
+        raise ValueError("expected a mapping with exactly the key exceptions")
+    entries = data["exceptions"]
+    if not isinstance(entries, list):
+        raise TypeError("exceptions: expected a list")
+    if len(entries) > MAX_LICENCE_EXCEPTIONS:
+        raise ValueError(f"exceptions: expected at most {MAX_LICENCE_EXCEPTIONS} entries, found {len(entries)}")
+    by_path = {}
+    for index, raw in enumerate(entries, 1):
+        try:
+            entry = _parse_licence_exception(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"entry {index}: {exc}") from exc
+        if entry.path in by_path:
+            raise ValueError(f"entry {index}: duplicate path {entry.path}")
+        by_path[entry.path] = entry
+    return by_path
 
 
 def _load_front_matter(text: str, loader: type[yaml.SafeLoader]) -> dict:
@@ -183,25 +304,77 @@ def _front_licence_problem(meta: dict, spdx: str) -> str | None:
     return None
 
 
+def _licence_sha256(path: Path) -> str:
+    """Hash the exact bytes of a bounded regular licence file."""
+    try:
+        if not stat.S_ISREG(path.lstat().st_mode):
+            raise ValueError("LICENSE is not a regular file")
+        with path.open("rb") as handle:
+            data = handle.read(MAX_LICENCE_BYTES + 1)
+    except OSError as exc:
+        raise ValueError(f"cannot read LICENSE ({exc.strerror or exc})") from exc
+    if len(data) > MAX_LICENCE_BYTES:
+        raise ValueError(f"LICENSE exceeds {MAX_LICENCE_BYTES // 1024} KiB")
+    return sha256(data).hexdigest()
+
+
+def _pinned_licence_problem(path: Path, spdx: str, entry: _LicenceException,
+                            today: date, difference: str) -> str | None:
+    """Refuse a reviewed variant when its SPDX ID, expiry or byte hash fails."""
+    if entry.spdx != spdx:
+        return f"{entry.path}: SPDX mismatch (recorded {entry.spdx}, declared {spdx})"
+    if today > entry.expires:
+        return f"{entry.path}: exception expired on {entry.expires}"
+    try:
+        found = _licence_sha256(path)
+    except ValueError as exc:
+        return f"{entry.path}: {exc}"
+    if found != entry.sha256:
+        return f"{entry.path}: hash mismatch (recorded {entry.sha256}, found {found}). {difference}"
+    return None
+
+
+def _licence_text_problem(skill: Path, template_dir: Path, spdx: str,
+                          scan: _LicenceScan | None, entry: _LicenceException | None) -> str | None:
+    """Check the canonical text first and consult a pin only for a body difference."""
+    path = skill / "LICENSE"
+    try:
+        verify_licence(path, template_dir, spdx)
+    except (ValueError, FileNotFoundError) as exc:
+        difference = str(exc)
+        if scan is None or entry is None or not difference.startswith(f"LICENSE differs from {spdx} at "):
+            return f"{skill.name}: {difference}"
+        if problem := _pinned_licence_problem(path, spdx, entry, scan.today, difference):
+            return problem
+        scan.pinned += 1
+    else:
+        if entry is not None:
+            return f"{entry.path}: LICENSE matches {spdx}; remove the exception"
+    return None
+
+
 def _licence_problem(skill: Path, declared: str, meta: dict, template_dir: Path,
-                     verified: Counter[str] | None) -> str | None:
+                     verified: Counter[str] | None, scan: _LicenceScan | None) -> str | None:
     """Report the first licence problem or record the verified SPDX ID."""
+    relative_path = f"skills/{skill.name}/LICENSE"
+    entry = scan.pending.pop(relative_path, None) if scan is not None else None
     spdx = candidate_licence_id(declared)
     if spdx is None:
         return f"{skill.name}/ORIGIN.md: licence {declared} not recognised"
     front_problem = _front_licence_problem(meta, spdx)
     if front_problem:
         return f"{skill.name}/SKILL.md: {front_problem}"
-    try:
-        verify_licence(skill / "LICENSE", template_dir, spdx)
-    except (ValueError, FileNotFoundError) as exc:
-        return f"{skill.name}: {exc}"
+    if problem := _licence_text_problem(skill, template_dir, spdx, scan, entry):
+        return problem
     if verified is not None:
         verified[spdx] += 1
     return None
 
 
-def skill_problems(skill: Path, *, template_dir: Path | None = None, verified: Counter[str] | None = None) -> list[str]:
+def skill_problems(
+    skill: Path, *, template_dir: Path | None = None, verified: Counter[str] | None = None,
+    licence_scan: _LicenceScan | None = None,
+) -> list[str]:
     """Problems of one skill directory, each naming the file and the rule."""
     out = []
     md, origin = skill / "SKILL.md", skill / "ORIGIN.md"
@@ -237,7 +410,7 @@ def skill_problems(skill: Path, *, template_dir: Path | None = None, verified: C
     if declared := rec.get("licence"):
         if template_dir is None:
             template_dir = skill.parent.parent / "LICENSES"
-        if problem := _licence_problem(skill, declared, meta, template_dir, verified):
+        if problem := _licence_problem(skill, declared, meta, template_dir, verified, licence_scan):
             out.append(problem)
     return out
 
@@ -292,17 +465,28 @@ def index_problems(root, skills=None):
     return problems
 
 
-def check(root):
+def check(root: Path, *, today: date | None = None) -> int:
     """Check the skill tree and report verified licence counts."""
-    skills = sorted(p for p in (root / "skills").iterdir() if p.is_dir())[:MAX_SKILLS] if (root / "skills").is_dir() else []
     verified: Counter[str] = Counter()
-    problems = [p for s in skills for p in skill_problems(s, verified=verified)]
-    problems += check_install_set(root)
-    problems.extend(index_problems(root, skills))
+    skills = []
+    scan = _LicenceScan({}, datetime.now(timezone.utc).date() if today is None else today)
+    try:
+        scan.pending = _read_licence_exceptions(root)
+    except (TypeError, ValueError) as exc:
+        problems = [f"{LICENCE_EXCEPTIONS_FILE}: {' '.join(str(exc).split())}"]
+    else:
+        skills_dir = root / "skills"
+        if skills_dir.is_dir():
+            skills = sorted(p for p in skills_dir.iterdir() if p.is_dir())[:MAX_SKILLS]
+        problems = [p for s in skills for p in skill_problems(s, verified=verified, licence_scan=scan)]
+        problems.extend(f"{path}: no applicable skill licence; remove the exception" for path in sorted(scan.pending))
+        problems.extend(check_install_set(root))
+        problems.extend(index_problems(root, skills))
     for p in problems:
         print(f"[FAIL] {p}")
     if verified:
         print("verified licences: " + ", ".join(f"{spdx}={count}" for spdx, count in sorted(verified.items())))
+    print(f"pinned licence texts: {scan.pinned}")
     print(f"skills: {len(skills)} checked, {len(problems)} problems")
     return 1 if problems else 0
 
@@ -500,9 +684,11 @@ def _selftest_licences(tmp, good_md, good_origin):
         write(planted, name, md, origin, licence_text=text)
         problems = skill_problems(planted / "skills" / name)
         if expected is None:
-            assert not problems, (name, problems)
+            if problems:
+                raise AssertionError((name, problems))
         else:
-            assert len(problems) == 1 and expected in problems[0], (name, expected, problems)
+            if len(problems) != 1 or expected not in problems[0]:
+                raise AssertionError((name, expected, problems))
             refused += 1
     print(f"licence selftest ok: {refused} planted defects refused, {len(cases) - refused} valid cases passed")
 
@@ -687,6 +873,166 @@ class _LicenceRegressionTests(unittest.TestCase):
         """Refuse a valid body that is one byte over the cap."""
         skill = self._plant(self.mit.ljust(256 * 1024 + 1), name="oversize")
         self._refused(skill, "256 KiB")
+
+    def _plant_licence_exception(self, body=None):
+        """Plant a skill, its index row and a reviewed exception entry."""
+        if body is None:
+            body = self.mit + "\nUpstream attribution note.\n"
+        skill = self._plant(body)
+        write_index(self.root, [{"skill": skill.name}])
+        return {
+            "rule": "skill-licence-text",
+            "path": f"skills/{skill.name}/LICENSE",
+            "spdx": "MIT",
+            "sha256": sha256(body.encode()).hexdigest(),
+            "reason": "The upstream text includes an attribution note.",
+            "category": "D",
+            "entered": "2026-11-24",
+            "expires": "2027-03-24",
+        }
+
+    def _write_licence_exceptions(self, entries):
+        """Write the checker input, preserving string dates in YAML."""
+        register = self.root / "skills" / "licence-exceptions.yaml"
+        register.write_text(yaml.safe_dump({"exceptions": entries}), encoding="utf-8")
+        return register
+
+    def _check_licence_exceptions(self, *messages, today=date(2027, 3, 23)):
+        """Expect either one refusal with the given details or one accepted pin."""
+        output = io.StringIO()
+        now = datetime(today.year, today.month, today.day, tzinfo=timezone.utc)
+        with (patch.object(sys.modules[__name__], "datetime", create=True) as clock,
+              redirect_stdout(output)):
+            clock.now.return_value = now
+            result = check(self.root)
+        report = output.getvalue()
+        self.assertEqual(result, int(bool(messages)), report)
+        if messages:
+            failures = [line for line in report.splitlines() if line.startswith("[FAIL]")]
+            self.assertEqual(len(failures), 1, report)
+            for message in messages:
+                self.assertIn(message, failures[0])
+        pinned = 0 if messages else 1
+        self.assertIn(f"pinned licence texts: {pinned}", report)
+
+    def test_pinned_licence_variant(self):
+        """Accept a reviewed variant with unchanged bytes."""
+        self._write_licence_exceptions([self._plant_licence_exception()])
+        self._check_licence_exceptions()
+
+    def test_pinned_licence_changed_byte(self):
+        """Report both hashes and the original word difference for a changed byte."""
+        entry = self._plant_licence_exception()
+        self._write_licence_exceptions([entry])
+        path = self.root / entry["path"]
+        changed = path.read_bytes().replace(b"Upstream", b"upstream", 1)
+        path.write_bytes(changed)
+        self._check_licence_exceptions(
+            entry["path"], "hash mismatch", entry["sha256"], sha256(changed).hexdigest(),
+            "LICENSE differs from MIT at word offset",
+        )
+
+    def test_pinned_licence_spdx_mismatch(self):
+        """Refuse a pin under a different SPDX licence."""
+        entry = self._plant_licence_exception()
+        self._write_licence_exceptions([entry | {"spdx": "Apache-2.0"}])
+        self._check_licence_exceptions(entry["path"], "SPDX mismatch", "Apache-2.0", "MIT")
+
+    def test_pinned_licence_expired(self):
+        """Refuse an exception the day after its expiry."""
+        entry = self._plant_licence_exception()
+        self._write_licence_exceptions([entry])
+        self._check_licence_exceptions(entry["path"], "expired", entry["expires"], today=date(2027, 3, 25))
+
+    def test_pinned_licence_expiry_boundary(self):
+        """Accept an exception through its expiry date."""
+        self._write_licence_exceptions([self._plant_licence_exception()])
+        self._check_licence_exceptions(today=date(2027, 3, 24))
+
+    def test_stale_licence_exception(self):
+        """Require removal when the file now matches the canonical licence."""
+        entry = self._plant_licence_exception()
+        self._write_licence_exceptions([entry])
+        (self.root / entry["path"]).write_text(self.mit, encoding="utf-8")
+        self._check_licence_exceptions(entry["path"], "remove the exception")
+
+    def test_licence_exception_missing_skill(self):
+        """Refuse a register entry for a skill that is absent."""
+        entry = self._plant_licence_exception(self.mit) | {"path": "skills/absent/LICENSE"}
+        self._write_licence_exceptions([entry])
+        self._check_licence_exceptions(entry["path"], "remove the exception")
+
+    def test_licence_exception_invalid_fields(self):
+        """Refuse unknown, missing, mistyped and invalid exception fields."""
+        entry = self._plant_licence_exception()
+        cases = (
+            ("unknown", entry | {"extra": "value"}, "extra", "unknown"),
+            ("missing", {k: v for k, v in entry.items() if k != "reason"}, "reason", "missing"),
+            ("type", entry | {"reason": ["text"]}, "reason", "string"),
+            ("blank-reason", entry | {"reason": " "}, "reason", "nonempty"),
+            ("rule", entry | {"rule": "another-rule"}, "rule", "skill-licence-text"),
+            ("path", entry | {"path": "skills/../LICENSE"}, "path", "skills/<name>/LICENSE"),
+            ("spdx-shape", entry | {"spdx": "mit"}, "spdx", "supported SPDX identifier"),
+            ("unknown-category", entry | {"category": "E"}, "category", "expected A, B, C or D"),
+            ("date", entry | {"entered": "20261124"}, "entered", "YYYY-MM-DD"),
+            ("impossible-date", entry | {"entered": "2026-11-31"}, "entered", "invalid date"),
+            ("category-arithmetic", entry | {"category": "B"}, "expires", "2026-11-27"),
+            ("category-overflow", entry | {"entered": "9999-12-31"}, "entered", "leaves no expiry date"),
+            ("hash-shape", entry | {"sha256": "A" * 64}, "sha256", "64 lowercase hexadecimal"),
+        )
+        for name, invalid, key, detail in cases:
+            with self.subTest(case=name):
+                self._write_licence_exceptions([invalid])
+                self._check_licence_exceptions("licence-exceptions.yaml", "entry 1", key, detail)
+
+    def test_licence_exception_invalid_structure(self):
+        """Reject a malformed register, document or entry with one diagnostic."""
+        self._plant_licence_exception()
+        register = self._write_licence_exceptions([])
+        cases = (
+            ("exceptions: [", "invalid YAML"),
+            ("extra: []", "exactly the key exceptions"),
+            ("exceptions: {}", "exceptions: expected a list"),
+            ("exceptions: [3]", "entry 1: expected a mapping"),
+        )
+        for body, detail in cases:
+            with self.subTest(detail=detail):
+                register.write_text(body, encoding="utf-8")
+                self._check_licence_exceptions("licence-exceptions.yaml", detail)
+
+    def test_pinned_licence_categories(self):
+        """Accept the category A date and the shorter category B and C intervals."""
+        entry = self._plant_licence_exception()
+        for category, expires in (("A", "2026-12-10"), ("B", "2026-11-27"), ("C", "2026-12-04")):
+            with self.subTest(category=category):
+                self._write_licence_exceptions([entry | {"category": category, "expires": expires}])
+                self._check_licence_exceptions(today=date(2026, 11, 27))
+
+    def test_licence_exception_duplicate_path(self):
+        """Reject multiple entries for one skill licence."""
+        entry = self._plant_licence_exception(self.mit)
+        self._write_licence_exceptions([entry, entry.copy()])
+        self._check_licence_exceptions("entry 2", entry["path"], "duplicate path")
+
+    def test_licence_exception_duplicate_yaml_key(self):
+        """Reject repeated YAML keys before validating an entry."""
+        entry = self._plant_licence_exception(self.mit)
+        register = self._write_licence_exceptions([entry])
+        with register.open("a", encoding="utf-8") as handle:
+            handle.write("  spdx: MIT\n")
+        self._check_licence_exceptions("licence-exceptions.yaml", "duplicate key 'spdx'")
+
+    def test_licence_exception_entry_cap(self):
+        """Reject an oversized list before validating its entries."""
+        entry = self._plant_licence_exception(self.mit)
+        self._write_licence_exceptions([entry, entry.copy()])
+        with patch.object(sys.modules[__name__], "MAX_LICENCE_EXCEPTIONS", 1, create=True):
+            self._check_licence_exceptions("licence-exceptions.yaml", "at most 1 entries")
+
+    def test_missing_licence_exception_register(self):
+        """Keep the ordinary body refusal when no register exists."""
+        entry = self._plant_licence_exception()
+        self._check_licence_exceptions(Path(entry["path"]).parent.name, "LICENSE differs from MIT at word offset")
 
 
 if __name__ == "__main__":
