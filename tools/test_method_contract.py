@@ -411,9 +411,8 @@ class ReceiptTest(unittest.TestCase):
         validator = mc._validators()["receipt"]
         validator.validate(_done())
         for document, reason in ((None, "is not of type 'object'"), ({}, "'method' is a required property")):
-            with self.subTest(document=document):
-                with self.assertRaisesRegex(ValidationError, reason):
-                    validator.validate(document)
+            with self.subTest(document=document), self.assertRaisesRegex(ValidationError, reason):
+                validator.validate(document)
         self.assertEqual(validator.schema, mc.read_document(mc.RECEIPT_SCHEMA_PATH))
 
     def test_patterns_refuse_a_trailing_newline(self) -> None:
@@ -489,19 +488,39 @@ class ReceiptTest(unittest.TestCase):
 
     def test_refuses_insufficient_evidence(self) -> None:
         """Done claims without their inputs, verifier or cited evidence are refused."""
-        cases = {
-            "required input missing": (lambda d: (d["inputs"].pop(0), d.update(missing=["initial_soc"])),
-                                       "the outcome must be blocked"),
-            "required input unaccounted": (lambda d: d["inputs"].pop(0), "neither given nor listed as missing"),
-            "verifier failed": (lambda d: d["verifier"].update(outcome="fail"), "needs a passing verifier"),
-            "verifier not run": (lambda d: d.update(verifier={"outcome": "not-run"}), "needs a passing verifier"),
-            "uncited evidence": (lambda d: d["inputs"][0].update(evidence=".slot/out/evidence/other.json"),
-                                 "which the result does not list"),
-            "verifier log not listed": (lambda d: d["verifier"].update(evidence=".slot/out/evidence/x.log"),
-                                        "verifier cites"),
-            "verifier ran without log": (lambda d: d["verifier"].pop("evidence"), "'evidence' is a required"),
-        }
-        for label, (mutate, says) in cases.items():
+
+        def mark_required_input_missing(document: dict) -> None:
+            document["inputs"].pop(0)
+            document["missing"] = ["initial_soc"]
+
+        def omit_required_input(document: dict) -> None:
+            document["inputs"].pop(0)
+
+        def fail_verifier(document: dict) -> None:
+            document["verifier"]["outcome"] = "fail"
+
+        def skip_verifier(document: dict) -> None:
+            document["verifier"] = {"outcome": "not-run"}
+
+        def cite_unlisted_input_evidence(document: dict) -> None:
+            document["inputs"][0]["evidence"] = ".slot/out/evidence/other.json"
+
+        def cite_unlisted_verifier_log(document: dict) -> None:
+            document["verifier"]["evidence"] = ".slot/out/evidence/x.log"
+
+        def omit_verifier_log(document: dict) -> None:
+            del document["verifier"]["evidence"]
+
+        cases = (
+            ("required input missing", mark_required_input_missing, "the outcome must be blocked"),
+            ("required input unaccounted", omit_required_input, "neither given nor listed as missing"),
+            ("verifier failed", fail_verifier, "needs a passing verifier"),
+            ("verifier not run", skip_verifier, "needs a passing verifier"),
+            ("uncited evidence", cite_unlisted_input_evidence, "which the result does not list"),
+            ("verifier log not listed", cite_unlisted_verifier_log, "verifier cites"),
+            ("verifier ran without log", omit_verifier_log, "'evidence' is a required"),
+        )
+        for label, mutate, says in cases:
             with self.subTest(label=label):
                 document = _done()
                 mutate(document)
@@ -540,14 +559,30 @@ class ReceiptTest(unittest.TestCase):
 
     def test_refuses_invalid_inputs(self) -> None:
         """Undeclared inputs, wrong units, doubled values and inputs both given and missing are refused."""
-        cases = {
-            "undeclared": (lambda d: d["inputs"][0].update(name="pressure"), "'pressure' is not declared"),
-            "wrong unit": (lambda d: d["inputs"][1].update(unit="Cel"), "is in Cel, the method reads K"),
-            "given twice": (lambda d: d["inputs"].append(dict(d["inputs"][0])), "given twice"),
-            "given and missing": (lambda d: d.update(missing=["c_rate"]), "both given and missing"),
-            "other method": (lambda d: d.update(method="battery-dfn"), "not battery-spm-constant-current"),
-        }
-        for label, (mutate, says) in cases.items():
+
+        def rename_input(document: dict) -> None:
+            document["inputs"][0]["name"] = "pressure"
+
+        def change_input_unit(document: dict) -> None:
+            document["inputs"][1]["unit"] = "Cel"
+
+        def duplicate_input(document: dict) -> None:
+            document["inputs"].append(dict(document["inputs"][0]))
+
+        def mark_given_input_missing(document: dict) -> None:
+            document["missing"] = ["c_rate"]
+
+        def change_method(document: dict) -> None:
+            document["method"] = "battery-dfn"
+
+        cases = (
+            ("undeclared", rename_input, "'pressure' is not declared"),
+            ("wrong unit", change_input_unit, "is in Cel, the method reads K"),
+            ("given twice", duplicate_input, "given twice"),
+            ("given and missing", mark_given_input_missing, "both given and missing"),
+            ("other method", change_method, "not battery-spm-constant-current"),
+        )
+        for label, mutate, says in cases:
             with self.subTest(label=label):
                 document = _done()
                 mutate(document)
