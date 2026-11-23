@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
 # SPDX-License-Identifier: EUPL-1.2
-"""Tests for the typed Epitrop slot result reader in method_contract.py.
+"""Tests for the typed method contract in method_contract.py.
 
 The Epitrop fixtures under contracts/epitrop/testdata/ are Epitrop's own result fixtures, replayed in both
 directions: a result Epitrop accepts reads here, and one it refuses is refused here with the reason Epitrop names.
+The battery method under contracts/testdata/ follows skills/battery-modeling. Its validity domain is the tested
+reference case of that skill, and its verifier program is a stand-in: the skill ships no helper script.
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import itertools
 import re
@@ -23,6 +26,7 @@ if str(_TOOLS_DIR) not in sys.path:
 
 import method_contract as mc  # noqa: E402
 
+TESTDATA = mc.CONTRACTS_DIR / "testdata"
 EPITROP_FIXTURES = mc.EPITROP_DIR / "testdata" / "result"
 MAX_VENDORED_ENTRIES = 64  # bounds the directory entries consumed (HISS-02)
 
@@ -42,6 +46,18 @@ def _done_document() -> dict:
     document = mc.parse_document(fixture["document"], fixture["id"])
     assert isinstance(document, dict)
     return document
+
+
+def _load(name: str) -> dict:
+    """Return a fresh copy of one battery fixture document."""
+    document = mc.read_document(TESTDATA / name)
+    assert isinstance(document, dict)
+    return copy.deepcopy(document)
+
+
+def _method() -> mc.Method:
+    """Return the typed battery method definition."""
+    return mc.method_from_document(_load("method-battery-spm.json"))
 
 
 class EpitropFixtureTest(unittest.TestCase):
@@ -159,6 +175,72 @@ class ResultTest(unittest.TestCase):
         with mock.patch.dict(validators, result=nested_validator):
             with self.assertRaisesRegex(mc.ContractError, "^result: nested too deep$"):
                 mc.result_from_document(document)
+
+
+class MethodDefinitionTest(unittest.TestCase):
+    """Reading method definitions."""
+
+    def test_reads_the_battery_method(self) -> None:
+        """The battery definition reads into typed fields."""
+        method = _method()
+        self.assertEqual(method.id, "battery-spm-constant-current")
+        self.assertEqual(method.version, "26.9.0.0")
+        self.assertEqual(method.result_class, "numerical-result")
+        self.assertEqual(method.input("c_rate"), mc.Input("c_rate", "constant-current rate per nominal capacity",
+                                                          "/h", True))
+        self.assertIsNone(method.input("voltage"))
+        self.assertIn(mc.Bound("c_rate", None, 0.5), method.validity_domain)
+
+    def test_refuses_schema_breaks(self) -> None:
+        """Unknown fields, moving versions, unknown result classes and open bounds are refused."""
+        breaks = {
+            "unknown field": lambda d: d.update(owner="x"),
+            "version range": lambda d: d["implementation"].update(version=">=26.9"),
+            "moving version": lambda d: d["implementation"].update(version="latest"),
+            "result class": lambda d: d.update(result_class="opinion"),
+            "bound with no end": lambda d: d["validity_domain"].append({"input": "step_duration"}),
+            "no inputs": lambda d: d.update(inputs=[]),
+            "empty verifier": lambda d: d["verifier"].update(command=[]),
+        }
+        for label, mutate in breaks.items():
+            with self.subTest(label=label):
+                document = _load("method-battery-spm.json")
+                mutate(document)
+                with self.assertRaises(mc.ContractError):
+                    mc.method_from_document(document)
+
+    def test_refuses_inconsistent_definitions(self) -> None:
+        """A bound on an undeclared input, an inverted bound and a doubled input are refused."""
+        cases = {
+            "undeclared input": (lambda d: d["validity_domain"].append({"input": "pressure", "max": 1}),
+                                 "undeclared input 'pressure'"),
+            "min above max": (lambda d: d["validity_domain"][0].update(min=0.9), "min above max"),
+            "input twice": (lambda d: d["inputs"].append(dict(d["inputs"][0])), "declared twice"),
+            "two bounds": (lambda d: d["validity_domain"].append({"input": "c_rate", "min": 0}), "two validity"),
+        }
+        for label, (mutate, says) in cases.items():
+            with self.subTest(label=label):
+                document = _load("method-battery-spm.json")
+                mutate(document)
+                with self.assertRaisesRegex(mc.ContractError, says):
+                    mc.method_from_document(document)
+
+    def test_input_count_boundary(self) -> None:
+        """Sixty-four inputs read; sixty-five are refused."""
+        document = _load("method-battery-spm.json")
+        extra = [{"name": f"x{index}", "quantity": "q", "unit": "1", "required": False} for index in range(59)]
+        document["inputs"] += extra
+        self.assertEqual(len(mc.method_from_document(document).inputs), 64)
+        document["inputs"].append({"name": "x59", "quantity": "q", "unit": "1", "required": False})
+        with self.assertRaises(mc.ContractError):
+            mc.method_from_document(document)
+
+    def test_point_bound_holds_only_at_its_point(self) -> None:
+        """A bound with min equal to max holds at that value and nowhere else."""
+        bound = mc.Bound("temperature", 298.15, 298.15)
+        self.assertTrue(bound.holds(298.15))
+        self.assertFalse(bound.holds(298.16))
+        self.assertFalse(bound.holds(298.14))
 
 
 class DocumentTest(unittest.TestCase):

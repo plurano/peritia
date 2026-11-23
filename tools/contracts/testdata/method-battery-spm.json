@@ -1,0 +1,38 @@
+{
+  "id": "battery-spm-constant-current",
+  "skill": "battery-modeling",
+  "task": "Predict the cell voltage of one Chen2020 LG M50 cell through a constant-current discharge, rest and charge protocol.",
+  "inputs": [
+    { "name": "initial_soc", "quantity": "initial state of charge", "unit": "1", "required": true },
+    { "name": "temperature", "quantity": "uniform cell temperature", "unit": "K", "required": true },
+    { "name": "c_rate", "quantity": "constant-current rate per nominal capacity", "unit": "/h", "required": true },
+    { "name": "step_duration", "quantity": "duration of one protocol step", "unit": "s", "required": true },
+    { "name": "until_voltage", "quantity": "voltage cutoff that ends a step early", "unit": "V", "required": false }
+  ],
+  "conventions": [
+    "Positive current discharges the cell; negative current charges it.",
+    "Current is the C-rate times the parameter set's nominal capacity of 5 A.h.",
+    "Times are seconds from the start of the experiment; temperatures are kelvin."
+  ],
+  "model": {
+    "name": "PyBaMM single particle model (SPM) with the Chen2020 parameter set",
+    "assumptions": [
+      "Isothermal at the given temperature.",
+      "One cell, no series string.",
+      "No aging, mechanics, lithium plating or pack control.",
+      "The single particle model's reduced electrolyte transport."
+    ]
+  },
+  "implementation": { "tool": "PyBaMM with the IDAKLU solver of pybammsolvers 0.10.0", "version": "26.9.0.0" },
+  "validity_domain": [
+    { "input": "initial_soc", "min": 0.8, "max": 0.8 },
+    { "input": "temperature", "min": 298.15, "max": 298.15 },
+    { "input": "c_rate", "max": 0.5 },
+    { "input": "until_voltage", "min": 2.5, "max": 4.2 }
+  ],
+  "verifier": {
+    "command": ["python3", "-I", "verify_convergence.py", "report.json"],
+    "acceptance": "Cell voltage moves by less than 5 mV when the solver tolerances tighten and when the mesh doubles."
+  },
+  "result_class": "numerical-result"
+}
