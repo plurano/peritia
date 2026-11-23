@@ -388,12 +388,12 @@ class OverlapResumeTests(unittest.TestCase):
 
     def test_smaller_k_excludes_historical_group_and_unjudged_pair(self):
         """Project both group edges and standalone summary onto the current top k."""
-        for same_use, old_groups, old_unjudged in ((True, 1, 0), (None, 0, 1)):
+        for same_use, old_groups, old_unjudged in ((True, 1, 0), (False, 0, 0), (None, 0, 1)):
             with self.subTest(same_use=same_use):
                 self.out.unlink(missing_ok=True)
 
-                def judge(prompt):
-                    """Give c2-c3 the only positive or unjudged judgment."""
+                def judge(prompt, *, same_use=same_use):
+                    """Use the selected judgment for c2-c3 and mark other pairs distinct."""
                     if "name: c1\n" in prompt:
                         return {"same_use": False, "reason": "distinct"}
                     return {} if same_use is None else {"same_use": same_use, "reason": "same"}
@@ -769,18 +769,19 @@ class OverlapEmbeddingIdentityTests(unittest.TestCase):
 class OverlapEmbeddingAndCacheTests(unittest.TestCase):
     def test_git_blob_id_matches_git_at_chunk_boundaries(self):
         """Match Git for empty and chunk-boundary blobs without reading local Git configuration."""
+        # Computed by feeding zero bytes of each size to git hash-object --no-filters --stdin.
+        blob_ids = {
+            0: "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+            65536: "c97c12f9b0a24bfc19c74a2b265a97c924137775",
+            65537: "939fd365a7bd709d2dcc70a2d87cff3a6cf1c347",
+        }
         with tempfile.TemporaryDirectory() as folder:
-            root = Path(folder)
-            path = root / "SKILL.md"
-            git_env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
-            git_env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
-            for size in (0, 65536, 65537):
+            path = Path(folder) / "SKILL.md"
+            for size, expected in blob_ids.items():
                 with self.subTest(size=size):
                     data = bytes(size)
                     path.write_bytes(data)
-                    expected = subprocess.run(["git", "hash-object", "--no-filters", "--", str(path)],
-                                              cwd=root, env=git_env, capture_output=True, check=True, timeout=10)
-                    self.assertEqual(overlap.git_blob_id(data), expected.stdout.decode().strip())
+                    self.assertEqual(overlap.git_blob_id(data), expected)
                     self.assertEqual(overlap._read_candidate_skill(path)[1], overlap.git_blob_id(data))
 
     def test_download_runner_sets_subprocess_options(self):

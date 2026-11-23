@@ -103,8 +103,8 @@ def _copy_original(
         return None
     named = set()
     for copy, original in ((a, b), (b, a)):
-        for field in AGGREGATOR_UPSTREAM_KEYS:
-            repo = parse_github_repo(metadata.get(copy, {}).get(field, ""))
+        for key in AGGREGATOR_UPSTREAM_KEYS:
+            repo = parse_github_repo(metadata.get(copy, {}).get(key, ""))
             if repo and repo.lower() == sources[original].lower():
                 named.add(original)
     if named:
