@@ -21,7 +21,10 @@ import check_skills
 
 REPO = Path(__file__).resolve().parent.parent
 MD = '---\nname: {name}\ndescription: Use when testing adoption.\n---\n\n# Example\n\nCheck the result.\n'
-LICENCE = 'MIT License\n\nCopyright (c) 2025 owner\n'
+LICENCE = (REPO / 'LICENSES/MIT.txt').read_text(encoding='utf-8').replace(
+    'Copyright (c) <year> <copyright holders>', 'Copyright (c) 2025 owner',
+)
+MIT_ZERO_LICENCE = (REPO / 'LICENSES/MIT-0.txt').read_text(encoding='utf-8')
 CANDIDATE_FIELDS = ['source', 'path', 'skill_name', 'verdict', 'licence', 'licence_evidence', 'functions']
 
 
@@ -449,7 +452,7 @@ class AdoptionTests(unittest.TestCase):
         self.assertTrue((self.root / 'skills/good').exists())
 
     def test_missing_licence_text_triggers_download_through_runner(self):
-        files = {'pack/demo/SKILL.md': MD.format(name='demo'), 'pack/demo/LICENSE': 'MIT-0\n'}
+        files = {'pack/demo/SKILL.md': MD.format(name='demo'), 'pack/demo/LICENSE': MIT_ZERO_LICENCE}
         pin = self.source(files)
         row = dict(source='owner/repo', path='pack/demo/SKILL.md', skill_name='demo',
                    verdict='candidate', licence='MIT-0', licence_evidence='folder', functions='testing')
@@ -468,7 +471,7 @@ class AdoptionTests(unittest.TestCase):
         self.assertTrue((self.root / 'LICENSES/MIT-0.txt').is_file())
 
     def test_failed_licence_download_fails_run(self):
-        files = {'pack/demo/SKILL.md': MD.format(name='demo'), 'pack/demo/LICENSE': 'MIT-0\n'}
+        files = {'pack/demo/SKILL.md': MD.format(name='demo'), 'pack/demo/LICENSE': MIT_ZERO_LICENCE}
         pin = self.source(files)
         row = dict(source='owner/repo', path='pack/demo/SKILL.md', skill_name='demo',
                    verdict='candidate', licence='MIT-0', licence_evidence='folder', functions='testing')

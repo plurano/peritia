@@ -23,6 +23,15 @@ except ImportError:
 COMMONMARK = MarkdownIt("commonmark")
 MAX_SKILLS = 5000  # bounds the directories read (HISS-02)
 MAX_SKILL_ENTRIES = 1000  # bounds the entries walked in one skill (HISS-02)
+MAX_LICENCE_CHARS = 4096
+LICENCE_FAMILIES = ("Apache-2.0", "CC0-1.0", "MIT-0", "MIT")
+FRONT_LICENCES = {
+    **{family: family for family in LICENCE_FAMILIES},
+    "MIT license": "MIT",
+    "Complete terms in LICENSE.txt": None,
+}
+MIT_GRANT = "Permission is hereby granted, free of charge"
+MIT_NOTICE = "The above copyright notice and this permission notice shall be included"
 AGENT_CONTROL_FILES = frozenset({
     "protocol.md", "agents.md", "claude.md", "gemini.md",
     ".cursorrules", ".windsurfrules", "copilot-instructions.md",
@@ -42,8 +51,8 @@ def fields(text):
     return {m.group("key"): m.group("value").strip() for m in FIELD.finditer(text)}
 
 
-def front_matter(text: str) -> dict[str, str]:
-    """Parse YAML front matter bounded at 100 fields, returning string mapping."""
+def front_matter(text: str, *, exact_license: bool = False) -> dict[str, str]:
+    """Parse up to 100 YAML fields and preserve the exact licence field when requested."""
     match = FRONT.match(text.replace("\r\n", "\n"))
     if not match:
         return {}
@@ -61,6 +70,9 @@ def front_matter(text: str) -> dict[str, str]:
             meta[str(k)] = v.strip()
         elif not isinstance(v, (list, dict, type(None))):
             meta[str(k)] = str(v)
+    if exact_license and "license" in data:
+        licence = data["license"]
+        meta["license"] = licence if isinstance(licence, str) else f"<{type(licence).__name__}>"
     return meta
 
 
@@ -112,6 +124,44 @@ def _skill_md_link_problems(skill: Path, text: str) -> list[str]:
     return out
 
 
+def licence_family(text: str) -> str | None:
+    """Identify the licence family from markers in the first 4096 characters."""
+    flat = " ".join(text[:MAX_LICENCE_CHARS].split())
+    if "Apache License" in flat and "Version 2.0" in flat:
+        return "Apache-2.0"
+    if "CC0 1.0 Universal" in flat or ("Creative Commons Legal Code" in flat and "CC0" in flat):
+        return "CC0-1.0"
+    if MIT_GRANT in flat:
+        return "MIT-0" if MIT_NOTICE not in flat else "MIT"
+    return None
+
+
+def _licence_problems(skill: Path, declared: str | None, front_license: str | None) -> list[str]:
+    """Check the licence file and front matter against the adapted skill's provenance."""
+    out = []
+    known_origin = declared in LICENCE_FAMILIES
+    if declared is not None and not known_origin:
+        out.append(f"{skill.name}/ORIGIN.md: licence {declared} not recognised")
+
+    licence = skill / "LICENSE"
+    if licence.is_file():
+        with licence.open(encoding="utf-8", errors="replace") as handle:
+            family = licence_family(handle.read(MAX_LICENCE_CHARS))
+        if family is None:
+            out.append(f"{skill.name}: LICENSE text matches no known licence")
+        elif known_origin and family != declared:
+            out.append(f"{skill.name}: LICENSE is {family}, ORIGIN.md declares {declared}")
+    else:
+        out.append(f"{skill.name}: the upstream LICENSE must sit beside an adapted skill")
+
+    if front_license is not None:
+        if front_license not in FRONT_LICENCES:
+            out.append(f"{skill.name}/SKILL.md: front matter license {front_license} not recognised")
+        elif known_origin and FRONT_LICENCES[front_license] not in (None, declared):
+            out.append(f"{skill.name}/SKILL.md: front matter license {front_license} disagrees with ORIGIN.md licence {declared}")
+    return out
+
+
 def skill_problems(skill):
     """Problems of one skill directory, each naming the file and the rule."""
     out = []
@@ -120,7 +170,7 @@ def skill_problems(skill):
         return [f"{skill.name}: SKILL.md missing"]
     text = md.read_text(encoding="utf-8")
     try:
-        meta = front_matter(text)
+        meta = front_matter(text, exact_license=True)
     except ValueError as exc:
         out.append(f"{skill.name}/SKILL.md: front matter is not valid YAML: {exc}")
         meta = {}
@@ -143,8 +193,7 @@ def skill_problems(skill):
             out.append(f"{skill.name}/ORIGIN.md: needs '{key}:'")
     if rec.get("commit") and not COMMIT.match(rec["commit"]):
         out.append(f"{skill.name}/ORIGIN.md: commit must be the full 40-hex SHA")
-    if not (skill / "LICENSE").is_file():
-        out.append(f"{skill.name}: the upstream LICENSE must sit beside an adapted skill")
+    out.extend(_licence_problems(skill, rec.get("licence"), meta.get("license")))
     return out
 
 
@@ -218,17 +267,29 @@ def write_index(root, rows):
     (d / "INDEX.tsv").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def write(root, name, skill_md, origin=None, licence=True):
+def _fixture_licence(spdx: str) -> str:
+    """Read the canonical licence text for a fixture."""
+    path = Path(__file__).resolve().parent.parent / "LICENSES" / f"{spdx}.txt"
+    try:
+        return path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"missing selftest licence text: {path}") from exc
+
+
+def write(root, name, skill_md, origin=None, licence=True, *, licence_text=None):
+    """Write a fixture skill with MIT text by default."""
     d = root / "skills" / name
     d.mkdir(parents=True, exist_ok=True)
     (d / "SKILL.md").write_text(skill_md, encoding="utf-8")
     if origin is not None:
         (d / "ORIGIN.md").write_text(origin, encoding="utf-8")
     if licence:
-        (d / "LICENSE").write_text("MIT License\n", encoding="utf-8")
+        text = _fixture_licence("MIT") if licence_text is None else licence_text
+        (d / "LICENSE").write_text(text, encoding="utf-8")
 
 
 def selftest():
+    """Exercise the skill checker against temporary fixtures."""
     good_md = "---\nname: {n}\ndescription: Use when checking a claim.\n---\n\n# x\n"
     good_origin = ("upstream: https://github.com/o/r\npath: skills/x\ncommit: " + "a" * 40 +
                    "\nlicence: MIT\nchanges: register rewritten\n")
@@ -272,6 +333,7 @@ def selftest():
         assert check(root) == 1, "an unknown skill in install-set.txt is refused"
         (root / "install-set.txt").unlink()
         _selftest_cases(Path(tmp), good_md, good_origin)
+        _selftest_licences(root, good_md, good_origin)
     return 0
 
 
@@ -340,6 +402,48 @@ def _selftest_workbench(tmp, good_md, good_origin):
     prose = skill_problems(prose_root / "skills" / "hive-prose")
     if prose:
         raise AssertionError(f"prose naming .hive refused: {prose}")
+
+
+def _selftest_licences(tmp, good_md, good_origin):
+    """Exercise licence text recognition and agreement between all declarations."""
+    mit = _fixture_licence("MIT")
+    apache = _fixture_licence("Apache-2.0")
+    mit_zero = _fixture_licence("MIT-0")
+    wrapped_mit = "\n".join(mit.split()) + "\n"
+    cases = (
+        ("carrier-licence", mit, "Apache-2.0", "Apache-2.0",
+         "LICENSE is MIT, ORIGIN.md declares Apache-2.0"),
+        ("apache-as-mit", apache, "MIT", None, "LICENSE is Apache-2.0, ORIGIN.md declares MIT"),
+        ("mit-zero-as-mit", mit_zero, "MIT", None, "LICENSE is MIT-0, ORIGIN.md declares MIT"),
+        ("mit-as-mit-zero", mit, "MIT-0", None, "LICENSE is MIT, ORIGIN.md declares MIT-0"),
+        ("unknown-text", "All rights reserved.\n", "MIT", None, "LICENSE text matches no known licence"),
+        ("unknown-origin", mit, "GPL-3.0", None, "ORIGIN.md: licence GPL-3.0 not recognised"),
+        ("front-mismatch", mit, "MIT", "Apache-2.0",
+         "front matter license Apache-2.0 disagrees with ORIGIN.md licence MIT"),
+        ("unknown-front", mit, "MIT", "BSD-ish", "front matter license BSD-ish not recognised"),
+        ("null-front", mit, "MIT", "null", "front matter license <NoneType> not recognised"),
+        ("padded-front", mit, "MIT", '" MIT "', "front matter license  MIT  not recognised"),
+        ("mit-alias", mit, "MIT", '"MIT license"', None),
+        ("license-pointer", apache, "Apache-2.0", "Complete terms in LICENSE.txt", None),
+        ("rewrapped-mit", wrapped_mit, "MIT", "MIT", None),
+        ("absent-front", mit_zero, "MIT-0", None, None),
+        ("cc-zero", _fixture_licence("CC0-1.0"), "CC0-1.0", '"CC0-1.0"', None),
+    )
+    refused = 0
+    for name, text, declared, front, expected in cases:
+        md = good_md.format(n=name)
+        if front is not None:
+            md = md.replace("\n---\n", f"\nlicense: {front}\n---\n", 1)
+        origin = good_origin.replace("licence: MIT\n", f"licence: {declared}\n")
+        planted = tmp / name
+        write(planted, name, md, origin, licence_text=text)
+        problems = skill_problems(planted / "skills" / name)
+        if expected is None:
+            assert not problems, (name, problems)
+        else:
+            assert len(problems) == 1 and expected in problems[0], (name, expected, problems)
+            refused += 1
+    print(f"licence selftest ok: {refused} planted defects refused, {len(cases) - refused} valid cases passed")
 
 
 if __name__ == "__main__":
