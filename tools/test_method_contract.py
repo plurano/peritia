@@ -13,12 +13,17 @@ from __future__ import annotations
 import copy
 import hashlib
 import itertools
+import json
 import re
 import sys
+import tempfile
 import unittest
 from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
+
+from jsonschema.exceptions import ValidationError
 
 _TOOLS_DIR = Path(__file__).resolve().parent
 if str(_TOOLS_DIR) not in sys.path:
@@ -189,24 +194,85 @@ class MethodDefinitionTest(unittest.TestCase):
         self.assertEqual(method.input("c_rate"), mc.Input("c_rate", "constant-current rate per nominal capacity",
                                                           "/h", True))
         self.assertIsNone(method.input("voltage"))
-        self.assertIn(mc.Bound("c_rate", None, 0.5), method.validity_domain)
+        self.assertIn(mc.Bound("c_rate", 0.5, 0.5), method.validity_domain)
+        self.assertIn(mc.Bound("step_duration", 120, 600), method.validity_domain)
+
+    def test_schema_root_validates_a_method(self) -> None:
+        """The root schema accepts a full method and refuses unrelated values."""
+        validator = mc._ContractValidator(mc.read_document(mc.METHOD_SCHEMA_PATH))
+        validator.validate(_load("method-battery-spm.json"))
+        for document, reason in ((None, "is not of type 'object'"), ({}, "'id' is a required property"),
+                                 ({"owner": "x"}, "'owner' was unexpected")):
+            with self.subTest(document=document):
+                with self.assertRaisesRegex(ValidationError, reason):
+                    validator.validate(document)
+
+    def test_patterns_refuse_a_trailing_newline(self) -> None:
+        """Version, unit and input name accept clean text and report the path of a final newline."""
+        document = _load("method-battery-spm.json")
+        step = next(item for item in document["inputs"] if item["name"] == "step_duration")
+        index = document["inputs"].index(step)
+        fields = (
+            (document["implementation"], "version", "26.9.0.0", "$.implementation.version"),
+            (step, "unit", "A", f"$.inputs[{index}].unit"),
+            (step, "name", "step_duration", f"$.inputs[{index}].name"),
+        )
+        for container, key, value, path in fields:
+            with self.subTest(path=path):
+                container[key] = value
+                self.assertIsInstance(mc.method_from_document(document), mc.Method)
+                container[key] = value + "\n"
+                with self.assertRaisesRegex(mc.ContractError, re.escape(path) + r": .* does not match"):
+                    mc.method_from_document(document)
+            container[key] = value
+
+    def test_accepts_normalized_versions_and_revisions(self) -> None:
+        """A normalized public release or a full lowercase revision identifies an exact version."""
+        document = _load("method-battery-spm.json")
+        versions = ("26.9.0.0", "1.0rc1", "2!1.0.post2.dev3", "abcdef0123" * 4, "1" * 64)
+        for version in versions:
+            with self.subTest(version=version):
+                document["implementation"]["version"] = version
+                self.assertEqual(mc.method_from_document(document).version, version)
+
+    def test_refuses_noncanonical_versions(self) -> None:
+        """Moving names, ranges, wildcards, noncanonical releases and short revisions fail."""
+        document = _load("method-battery-spm.json")
+        versions = ("latest", ">=26.9", "26.*", "v26.9.0.0", "2026-11-23", "01.2", "a" * 39)
+        for version in versions:
+            with self.subTest(version=version):
+                document["implementation"]["version"] = version
+                with self.assertRaisesRegex(mc.ContractError, r"\$\.implementation\.version: .* does not match"):
+                    mc.method_from_document(document)
+        document["implementation"]["version"] = "1" * 65
+        with self.assertRaisesRegex(mc.ContractError, r"\$\.implementation\.version: .* is too long"):
+            mc.method_from_document(document)
+
+    def test_command_requires_only_the_program_to_be_nonempty(self) -> None:
+        """A verifier needs a program and may pass an empty string argument."""
+        document = _load("method-battery-spm.json")
+        document["verifier"]["command"] = ["p", ""]
+        self.assertEqual(mc.method_from_document(document).verifier_command, ("p", ""))
+        for command, path in (([""], "$.verifier.command[0]"), ([], "$.verifier.command")):
+            with self.subTest(command=command):
+                document["verifier"]["command"] = command
+                with self.assertRaisesRegex(mc.ContractError, re.escape(path) + r": .* should be non-empty"):
+                    mc.method_from_document(document)
 
     def test_refuses_schema_breaks(self) -> None:
-        """Unknown fields, moving versions, unknown result classes and open bounds are refused."""
+        """Unknown fields and result classes, bounds with no end and missing inputs are refused."""
         breaks = {
-            "unknown field": lambda d: d.update(owner="x"),
-            "version range": lambda d: d["implementation"].update(version=">=26.9"),
-            "moving version": lambda d: d["implementation"].update(version="latest"),
-            "result class": lambda d: d.update(result_class="opinion"),
-            "bound with no end": lambda d: d["validity_domain"].append({"input": "step_duration"}),
-            "no inputs": lambda d: d.update(inputs=[]),
-            "empty verifier": lambda d: d["verifier"].update(command=[]),
+            "unknown field": (lambda d: d.update(owner="x"), r"\$: .*'owner' was unexpected"),
+            "result class": (lambda d: d.update(result_class="opinion"), r"\$\.result_class: 'opinion' is not one of"),
+            "bound with no end": (lambda d: d["validity_domain"].append({"input": "step_duration"}),
+                                  r"\$\.validity_domain\[\d+\]: .* is not valid under any of the given schemas"),
+            "no inputs": (lambda d: d.update(inputs=[]), r"\$\.inputs: \[\] should be non-empty"),
         }
-        for label, mutate in breaks.items():
+        for label, (mutate, reason) in breaks.items():
             with self.subTest(label=label):
                 document = _load("method-battery-spm.json")
                 mutate(document)
-                with self.assertRaises(mc.ContractError):
+                with self.assertRaisesRegex(mc.ContractError, reason):
                     mc.method_from_document(document)
 
     def test_refuses_inconsistent_definitions(self) -> None:
@@ -225,6 +291,25 @@ class MethodDefinitionTest(unittest.TestCase):
                 with self.assertRaisesRegex(mc.ContractError, says):
                     mc.method_from_document(document)
 
+    def test_refuses_nonfinite_bound_ends(self) -> None:
+        """Python dictionaries cannot bypass the finite-number requirement on either bound end."""
+        document = _load("method-battery-spm.json")
+        for end, value in (("min", float("nan")), ("max", float("inf")), ("min", float("-inf"))):
+            with self.subTest(end=end, value=value):
+                document["validity_domain"] = [{"input": "c_rate", end: value}]
+                with self.assertRaisesRegex(mc.ContractError, "validity bound of 'c_rate' has a non-finite end"):
+                    mc.method_from_document(document)
+
+    def test_refuses_boolean_bound_ends(self) -> None:
+        """A boolean is refused by schema validation and by the typed definition check."""
+        document = _load("method-battery-spm.json")
+        document["validity_domain"] = [{"input": "c_rate", "min": True}]
+        with self.assertRaisesRegex(mc.ContractError, r"\$\.validity_domain\[0\]\.min: True is not of type 'number'"):
+            mc.method_from_document(document)
+        method = mc.method_from_document(_load("method-battery-spm.json"))
+        malformed = replace(method, validity_domain=(mc.Bound("c_rate", True, None),))
+        self.assertEqual(mc._definition_reasons(malformed), ["validity bound of 'c_rate' has a non-finite end"])
+
     def test_input_count_boundary(self) -> None:
         """Sixty-four inputs read; sixty-five are refused."""
         document = _load("method-battery-spm.json")
@@ -232,7 +317,7 @@ class MethodDefinitionTest(unittest.TestCase):
         document["inputs"] += extra
         self.assertEqual(len(mc.method_from_document(document).inputs), 64)
         document["inputs"].append({"name": "x59", "quantity": "q", "unit": "1", "required": False})
-        with self.assertRaises(mc.ContractError):
+        with self.assertRaisesRegex(mc.ContractError, r"\$\.inputs: .* is too long"):
             mc.method_from_document(document)
 
     def test_point_bound_holds_only_at_its_point(self) -> None:
@@ -241,6 +326,28 @@ class MethodDefinitionTest(unittest.TestCase):
         self.assertTrue(bound.holds(298.15))
         self.assertFalse(bound.holds(298.16))
         self.assertFalse(bound.holds(298.14))
+
+
+class SchemaTest(unittest.TestCase):
+    """Failures while loading the local schemas."""
+
+    def test_schema_failure_names_the_file(self) -> None:
+        """Invalid schema syntax and missing IDs raise ContractError with the schema path."""
+        schema = mc.read_document(mc.METHOD_SCHEMA_PATH)
+        assert isinstance(schema, dict)
+        invalid = dict(schema, type="invalid")
+        missing_id = dict(schema)
+        del missing_id["$id"]
+        self.addCleanup(mc._validators.cache_clear)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "method.schema.json"
+            reason_prefix = "^" + re.escape(str(path)) + ": "
+            for broken, reason in ((invalid, "invalid schema:"), (missing_id, r"missing \$id")):
+                with self.subTest(reason=reason), mock.patch.object(mc, "METHOD_SCHEMA_PATH", path):
+                    path.write_text(json.dumps(broken), encoding="utf-8")
+                    mc._validators.cache_clear()
+                    with self.assertRaisesRegex(mc.ContractError, reason_prefix + reason):
+                        mc._validators()
 
 
 class DocumentTest(unittest.TestCase):

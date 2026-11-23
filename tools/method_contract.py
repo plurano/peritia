@@ -159,7 +159,7 @@ def parse_document(text: str | bytes, origin: str) -> object:
 
 
 def read_document(path: Path) -> object:
-    """Read and parse one contract document from path."""
+    """Read and parse one byte-capped document. Local repository schema reads have no deadline."""
     try:
         with path.open("rb") as handle:
             text = handle.read(MAX_DOCUMENT_BYTES + 1)
@@ -187,25 +187,24 @@ _ContractValidator = validators.extend(Draft202012Validator, validators={"patter
 def _validators() -> dict[str, Validator]:
     """Compile the method and Epitrop result validators once, refusing a broken schema."""
     schemas = {}
+    resources = []
     for path in (METHOD_SCHEMA_PATH, EPITROP_RESULT_SCHEMA_PATH):
         schema = read_document(path)
         if not isinstance(schema, dict):
             raise ContractError(f"{path}: not a JSON object")
         try:
             _ContractValidator.check_schema(schema)
+            schema_id = schema["$id"]
         except SchemaError as err:
             raise ContractError(f"{path}: invalid schema: {err.message}") from err
+        except KeyError as err:
+            raise ContractError(f"{path}: missing $id") from err
         schemas[path] = schema
-    method_schema = schemas[METHOD_SCHEMA_PATH]
-    result_schema = schemas[EPITROP_RESULT_SCHEMA_PATH]
-    registry = Registry().with_resources([
-        (method_schema["$id"], Resource.from_contents(method_schema)),
-        (result_schema["$id"], Resource.from_contents(result_schema)),
-    ])
-    base = method_schema["$id"]
+        resources.append((schema_id, Resource.from_contents(schema)))
+    registry = Registry().with_resources(resources)
     return {
-        "method": _ContractValidator({"$ref": f"{base}#/$defs/method"}, registry=registry),
-        "result": _ContractValidator(result_schema, registry=registry),
+        "method": _ContractValidator(schemas[METHOD_SCHEMA_PATH], registry=registry),
+        "result": _ContractValidator(schemas[EPITROP_RESULT_SCHEMA_PATH], registry=registry),
     }
 
 
@@ -257,7 +256,10 @@ def _definition_reasons(method: Method) -> list[str]:
     for bound in method.validity_domain:
         if method.input(bound.input) is None:
             reasons.append(f"validity bound names undeclared input {bound.input!r}")
-        if bound.min is not None and bound.max is not None and bound.min > bound.max:
+        if any(isinstance(end, bool) or (isinstance(end, float) and not math.isfinite(end))
+               for end in (bound.min, bound.max)):
+            reasons.append(f"validity bound of {bound.input!r} has a non-finite end")
+        elif bound.min is not None and bound.max is not None and bound.min > bound.max:
             reasons.append(f"validity bound of {bound.input!r} has min above max")
     return reasons
 

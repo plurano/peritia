@@ -3,6 +3,7 @@
   "$id": "https://github.com/plurano/peritia/tools/contracts/method.schema.json",
   "title": "Peritia method contract",
   "description": "A method definition states what one executable method computes, from which inputs, under which model and tool version, where its result holds and how it is checked. tools/method_contract.py adds the checks a schema cannot express.",
+  "$ref": "#/$defs/method",
   "$defs": {
     "name": {
       "description": "An input name: lower case, digits and underscores.",
@@ -20,7 +21,7 @@
       "maxLength": 2048
     },
     "unit": {
-      "description": "The unit symbol in UCUM case-sensitive form, for example A, A.h, s, K, or 1 for a dimensionless ratio.",
+      "description": "Lexical filter for a case-sensitive UCUM symbol (1 to 32 printable ASCII characters, excluding spaces). The loader does not parse UCUM.",
       "type": "string",
       "pattern": "^[!-~]{1,32}$"
     },
@@ -79,9 +80,10 @@
           "properties": {
             "tool": { "$ref": "#/$defs/text" },
             "version": {
-              "description": "An exact release: no range, wildcard or moving name.",
+              "description": "A normalized PEP 440 public version or a full 40-digit lowercase hexadecimal revision hash.",
               "type": "string",
-              "pattern": "^[0-9][0-9A-Za-z.+_-]{0,63}$"
+              "maxLength": 64,
+              "pattern": "^(?:(?:[1-9][0-9]*!)?(?:0|[1-9][0-9]*)(?:\\.(?:0|[1-9][0-9]*))*(?:(?:a|b|rc)(?:0|[1-9][0-9]*))?(?:\\.post(?:0|[1-9][0-9]*))?(?:\\.dev(?:0|[1-9][0-9]*))?|[0-9a-f]{40})$"
             }
           }
         },
@@ -97,7 +99,8 @@
               "type": "array",
               "minItems": 1,
               "maxItems": 64,
-              "items": { "type": "string", "minLength": 1, "maxLength": 4096 }
+              "prefixItems": [{ "type": "string", "minLength": 1 }],
+              "items": { "type": "string" }
             },
             "acceptance": { "$ref": "#/$defs/text" }
           }
