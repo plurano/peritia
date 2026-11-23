@@ -4,10 +4,10 @@
 """Typed reader for the Epitrop slot result, the result half of the Peritia method contract.
 
 The result's shape is Epitrop's own schema, vendored at the commit contracts/epitrop/vendor.json pins
-from https://github.com/tekmora/epitrop (EUPL-1.2). The schema decides shape; this module adds the one
-rule Epitrop's reader states outside its schema and that needs no workspace: a done result needs its
-head commit. Documents are parsed strictly: no NaN or Infinity, no number too large to hold, no key
-given twice.
+from https://github.com/tekmora/epitrop (EUPL-1.2). This module also mirrors the done-needs-head rule,
+the checks on evidence path text, and the integer representation of evidence line counts. Epitrop's
+workspace policy covers the run's unit id, the 64 KiB result-file cap, symlinks, and evidence file checks.
+Documents are parsed as strict UTF-8 JSON with finite numbers and unique keys.
 """
 from __future__ import annotations
 
@@ -15,11 +15,16 @@ import functools
 import itertools
 import json
 import math
+import posixpath
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from jsonschema import Draft202012Validator
+from jsonschema import Draft202012Validator, validators
+from jsonschema.exceptions import SchemaError, ValidationError
+from jsonschema.protocols import Validator
 from referencing import Registry, Resource
+from regress import Regex, RegressError
 
 CONTRACTS_DIR = Path(__file__).resolve().parent / "contracts"
 EPITROP_DIR = CONTRACTS_DIR / "epitrop"
@@ -27,6 +32,7 @@ EPITROP_RESULT_SCHEMA_PATH = EPITROP_DIR / "result.schema.json"
 MAX_DOCUMENT_BYTES = 1 << 20  # a contract document is small; refuse anything larger
 MAX_REPORTED_ERRORS = 16  # bounds the schema errors read from one document (HISS-02)
 DONE = "done"
+EVIDENCE_PREFIX = ".slot/out/evidence/"
 
 
 class ContractError(ValueError):
@@ -81,10 +87,21 @@ def parse_document(text: str | bytes, origin: str) -> object:
     """Parse one contract document from JSON text; origin names it in errors."""
     if len(text) > MAX_DOCUMENT_BYTES:
         raise ContractError(f"{origin}: larger than {MAX_DOCUMENT_BYTES} bytes")
+    if isinstance(text, str):
+        try:
+            size = len(text.encode("utf-8"))
+        except UnicodeEncodeError as err:
+            raise ContractError(f"{origin}: not a JSON document: {err}") from err
+        if size > MAX_DOCUMENT_BYTES:
+            raise ContractError(f"{origin}: larger than {MAX_DOCUMENT_BYTES} bytes")
     try:
+        if isinstance(text, bytes):
+            text = text.decode("utf-8")
         return json.loads(text, parse_constant=_refuse_constant, parse_float=_finite_float,
                           object_pairs_hook=_unique_keys)
-    except (ValueError, UnicodeDecodeError) as err:
+    except RecursionError as err:
+        raise ContractError(f"{origin}: nested too deep") from err
+    except ValueError as err:
         raise ContractError(f"{origin}: not a JSON document: {err}") from err
 
 
@@ -98,21 +115,44 @@ def read_document(path: Path) -> object:
     return parse_document(text, str(path))
 
 
+@functools.lru_cache(maxsize=32)
+def _compile_pattern(pattern: str) -> Regex:
+    """Compile a JSON Schema pattern with ECMA-262 semantics."""
+    return Regex(pattern)
+
+
+def _pattern(_validator: Validator, pattern: str, instance: object, _schema: object) -> Iterator[ValidationError]:
+    """Validate string instances using the JSON Schema regex dialect."""
+    if isinstance(instance, str) and _compile_pattern(pattern).find(instance) is None:
+        yield ValidationError(f"{instance!r} does not match {pattern!r}")
+
+
+_ContractValidator = validators.extend(Draft202012Validator, validators={"pattern": _pattern})
+
+
 @functools.cache
-def _validators() -> dict[str, Draft202012Validator]:
+def _validators() -> dict[str, Validator]:
     """Compile the Epitrop result validator once, refusing a broken schema."""
     result_schema = read_document(EPITROP_RESULT_SCHEMA_PATH)
     if not isinstance(result_schema, dict):
-        raise ContractError("a contract schema is not a JSON object")
-    Draft202012Validator.check_schema(result_schema)
+        raise ContractError(f"{EPITROP_RESULT_SCHEMA_PATH}: not a JSON object")
+    try:
+        _ContractValidator.check_schema(result_schema)
+    except SchemaError as err:
+        raise ContractError(f"{EPITROP_RESULT_SCHEMA_PATH}: invalid schema: {err.message}") from err
     registry = Registry().with_resources([(result_schema["$id"], Resource.from_contents(result_schema))])
-    return {"result": Draft202012Validator(result_schema, registry=registry)}
+    return {"result": _ContractValidator(result_schema, registry=registry)}
 
 
 def _checked(kind: str, document: object) -> dict:
     """Return document once it passes the kind's schema; else raise ContractError naming each error."""
-    errors = itertools.islice(_validators()[kind].iter_errors(document), MAX_REPORTED_ERRORS)
-    reasons = [f"{error.json_path}: {error.message}" for error in errors]
+    try:
+        errors = itertools.islice(_validators()[kind].iter_errors(document), MAX_REPORTED_ERRORS)
+        reasons = [f"{error.json_path}: {error.message}" for error in errors]
+    except RecursionError as err:
+        raise ContractError(f"{kind}: nested too deep") from err
+    except (RegressError, UnicodeError) as err:
+        raise ContractError(f"{kind}: cannot validate pattern: {err}") from err
     if reasons:
         raise ContractError(f"{kind}: " + "; ".join(reasons))
     if not isinstance(document, dict):
@@ -120,26 +160,38 @@ def _checked(kind: str, document: object) -> dict:
     return document
 
 
-def _typed_result(document: dict) -> SlotResult:
-    """Build the typed slot result from a document that passed Epitrop's result schema."""
-    return SlotResult(
-        unit=document["unit"],
-        outcome=document["outcome"],
-        head=document.get("head", ""),
-        summary=document["summary"],
-        evidence=tuple(Evidence(item["path"], item["sha256"], item["lines"])
-                       for item in document.get("evidence", ())),
-        questions=tuple(document.get("questions", ())),
-    )
+def _checked_evidence(entries: Sequence[dict]) -> tuple[Evidence, ...]:
+    """Check and convert the at most 32 evidence entries allowed by the schema."""
+    seen: set[str] = set()
+    evidence: list[Evidence] = []
+    for item in entries:
+        path = item["path"]
+        lines = item["lines"]
+        if path in seen:
+            raise ContractError(f"result: evidence {path!r} is listed twice")
+        seen.add(path)
+        if path.startswith("/") or path != posixpath.normpath(path):
+            raise ContractError(f"result: evidence {path!r} is not a clean relative path")
+        if not path.startswith(EVIDENCE_PREFIX):
+            raise ContractError(f"result: evidence {path!r} is not under {EVIDENCE_PREFIX}")
+        if type(lines) is not int:
+            raise ContractError(f"result: evidence {path!r} lines {lines} is not an integer")
+        evidence.append(Evidence(path, item["sha256"], lines))
+    return tuple(evidence)
 
 
 def result_from_document(document: object) -> SlotResult:
-    """Return the typed Epitrop slot result a document states, or raise ContractError.
-
-    Epitrop's reader also checks the run's unit id and each evidence file on disk; a result read here
-    is one that reader already accepted, so those checks stay in Epitrop.
-    """
-    result = _typed_result(_checked("result", document))
-    if result.outcome == DONE and not result.head:
+    """Validate the document and convert it to a typed Epitrop slot result."""
+    checked = _checked("result", document)
+    outcome = checked["outcome"]
+    head = checked.get("head", "")
+    if outcome == DONE and not head:
         raise ContractError("result: outcome done needs the head commit")
-    return result
+    return SlotResult(
+        unit=checked["unit"],
+        outcome=outcome,
+        head=head,
+        summary=checked["summary"],
+        evidence=_checked_evidence(checked.get("evidence", ())),
+        questions=tuple(checked.get("questions", ())),
+    )
