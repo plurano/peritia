@@ -9,9 +9,17 @@ version = 1
 
 # The root licence text and files that cannot carry a header of their own.
 [[annotations]]
-path = ["LICENSE", ".gitignore", "renovate.json", "tools/census-sources.json", "tools/eval-tasks.json", "install-set.txt", "requirements/tools.txt"]
+path = ["LICENSE", ".gitignore", "renovate.json", "tools/census-sources.json", "tools/eval-tasks.json", "install-set.txt", "requirements/tools.txt", "tools/contracts/epitrop/vendor.json"]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 Lusoris <lusoris@pm.me>"
+SPDX-License-Identifier = "EUPL-1.2"
+
+# Epitrop's slot result schema and result fixtures, copied unchanged at the commit
+# tools/contracts/epitrop/vendor.json pins; the terms are Epitrop's own REUSE.toml.
+[[annotations]]
+path = ["tools/contracts/epitrop/result.schema.json", "tools/contracts/epitrop/testdata/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 lusoris <lusoris@pm.me>"
 SPDX-License-Identifier = "EUPL-1.2"
 
 [[annotations]]

@@ -44,6 +44,7 @@ test: tools build
 	@$(BIN)/python -B tools/test_judge_groups.py
 	@$(BIN)/python -B tools/test_adopt_skills.py
 	@$(BIN)/python -B tools/test_llm_client.py
+	@$(BIN)/python -B tools/test_method_contract.py
 	@reuse lint
 
 build: tools
