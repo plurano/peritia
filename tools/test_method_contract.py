@@ -294,15 +294,19 @@ class MethodDefinitionTest(unittest.TestCase):
     def test_refuses_schema_breaks(self) -> None:
         """Unknown fields and result classes, bounds with no end and missing inputs are refused."""
         def add_unknown_field(document: dict) -> None:
+            """Add an unknown owner field to the document."""
             document["owner"] = "x"
 
         def set_unknown_result_class(document: dict) -> None:
+            """Set the document's result class to the unrecognized value 'opinion'."""
             document["result_class"] = "opinion"
 
         def add_bound_without_end(document: dict) -> None:
+            """Append a step duration bound with neither a minimum nor a maximum."""
             document["validity_domain"].append({"input": "step_duration"})
 
         def clear_inputs(document: dict) -> None:
+            """Replace the document's inputs with an empty list."""
             document["inputs"] = []
 
         breaks = (
@@ -322,15 +326,19 @@ class MethodDefinitionTest(unittest.TestCase):
     def test_refuses_inconsistent_definitions(self) -> None:
         """A bound on an undeclared input, an inverted bound and a doubled input are refused."""
         def add_undeclared_input_bound(document: dict) -> None:
+            """Append an upper bound for the undeclared pressure input."""
             document["validity_domain"].append({"input": "pressure", "max": 1})
 
         def invert_bound(document: dict) -> None:
+            """Raise the first bound's minimum above its maximum."""
             document["validity_domain"][0]["min"] = 0.9
 
         def duplicate_input(document: dict) -> None:
+            """Append a copy of the document's first input."""
             document["inputs"].append(dict(document["inputs"][0]))
 
         def add_second_bound(document: dict) -> None:
+            """Append a second validity bound for the c_rate input."""
             document["validity_domain"].append({"input": "c_rate", "min": 0})
 
         cases = (
