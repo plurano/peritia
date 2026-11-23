@@ -35,19 +35,33 @@ exceptions:
     path: .github/workflows/release.yml
     reason: adoption found the release workflows short of the declared supply chain (SLSA Build Level 3 declared, Level 0 measured; enforce_cosign without a cosign signing step; require_sbom without an SBOM step); raise them as docs/guides/releasing.md in Praetor describes, then remove this entry
     expires: "2027-01-13"
+    category: A
+    entered: "2026-10-15"
   - rule: declared-linters
     tool: gitleaks
     reason: adoption scaffolds no CI job for gitleaks declared by facet "security:high"; run it in a workflow, or remove this entry
     expires: "2027-01-13"
+    category: A
+    entered: "2026-10-15"
   - rule: declared-linters
     tool: semgrep
     reason: adoption scaffolds no CI job for semgrep declared by profile "template-seed", facet "agent:sandboxed"; run it in a workflow, or remove this entry
     expires: "2027-01-13"
+    category: A
+    entered: "2026-10-15"
   - rule: declared-linters
     tool: trivy
     reason: adoption scaffolds no CI job for trivy declared by facet "security:high"; run it in a workflow, or remove this entry
     expires: "2027-01-13"
-
+    category: A
+    entered: "2026-10-15"
+  - rule: HISS-12
+    path: skills/code-review-skill/reference/java.md
+    tool: generic-api-key
+    reason: line 180 of the vendored awesome-skills code-review reference holds the made-up key sk_live_12345 as its example of a hard-coded configuration value, not a credential; history keeps it in the squash commit on main and the merged intake branch, so one path entry covers both; re-judge when the vendored skill is updated
+    expires: "2027-02-21"
+    category: A
+    entered: "2026-11-23"
 # Standard overrides only increase strictness. The explicit review mode below
 # permits single-maintainer operation; all other gates stay enforced.
 overrides:
@@ -60,6 +74,5 @@ overrides:
     # retains the minimum.
     review_mode: single_maintainer
     dismiss_stale_reviews: true
-
     # Declared at its live value; the forge default is the stricter one.
     require_extra_approval_for_unattributed_changes: true
