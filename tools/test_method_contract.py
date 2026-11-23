@@ -59,7 +59,7 @@ def _load(name: str) -> dict:
     """Return a fresh copy of one battery fixture document."""
     document = mc.read_document(TESTDATA / name)
     if not isinstance(document, dict):
-        raise AssertionError(f"battery fixture {name} must contain an object")
+        raise TypeError(f"battery fixture {name} must contain an object")
     return copy.deepcopy(document)
 
 
@@ -293,14 +293,26 @@ class MethodDefinitionTest(unittest.TestCase):
 
     def test_refuses_schema_breaks(self) -> None:
         """Unknown fields and result classes, bounds with no end and missing inputs are refused."""
-        breaks = {
-            "unknown field": (lambda d: d.update(owner="x"), r"\$: .*'owner' was unexpected"),
-            "result class": (lambda d: d.update(result_class="opinion"), r"\$\.result_class: 'opinion' is not one of"),
-            "bound with no end": (lambda d: d["validity_domain"].append({"input": "step_duration"}),
-                                  r"\$\.validity_domain\[\d+\]: .* is not valid under any of the given schemas"),
-            "no inputs": (lambda d: d.update(inputs=[]), r"\$\.inputs: \[\] should be non-empty"),
-        }
-        for label, (mutate, reason) in breaks.items():
+        def add_unknown_field(document: dict) -> None:
+            document["owner"] = "x"
+
+        def set_unknown_result_class(document: dict) -> None:
+            document["result_class"] = "opinion"
+
+        def add_bound_without_end(document: dict) -> None:
+            document["validity_domain"].append({"input": "step_duration"})
+
+        def clear_inputs(document: dict) -> None:
+            document["inputs"] = []
+
+        breaks = (
+            ("unknown field", add_unknown_field, r"\$: .*'owner' was unexpected"),
+            ("result class", set_unknown_result_class, r"\$\.result_class: 'opinion' is not one of"),
+            ("bound with no end", add_bound_without_end,
+             r"\$\.validity_domain\[\d+\]: .* is not valid under any of the given schemas"),
+            ("no inputs", clear_inputs, r"\$\.inputs: \[\] should be non-empty"),
+        )
+        for label, mutate, reason in breaks:
             with self.subTest(label=label):
                 document = _load("method-battery-spm.json")
                 mutate(document)
@@ -309,14 +321,25 @@ class MethodDefinitionTest(unittest.TestCase):
 
     def test_refuses_inconsistent_definitions(self) -> None:
         """A bound on an undeclared input, an inverted bound and a doubled input are refused."""
-        cases = {
-            "undeclared input": (lambda d: d["validity_domain"].append({"input": "pressure", "max": 1}),
-                                 "undeclared input 'pressure'"),
-            "min above max": (lambda d: d["validity_domain"][0].update(min=0.9), "min above max"),
-            "input twice": (lambda d: d["inputs"].append(dict(d["inputs"][0])), "declared twice"),
-            "two bounds": (lambda d: d["validity_domain"].append({"input": "c_rate", "min": 0}), "two validity"),
-        }
-        for label, (mutate, says) in cases.items():
+        def add_undeclared_input_bound(document: dict) -> None:
+            document["validity_domain"].append({"input": "pressure", "max": 1})
+
+        def invert_bound(document: dict) -> None:
+            document["validity_domain"][0]["min"] = 0.9
+
+        def duplicate_input(document: dict) -> None:
+            document["inputs"].append(dict(document["inputs"][0]))
+
+        def add_second_bound(document: dict) -> None:
+            document["validity_domain"].append({"input": "c_rate", "min": 0})
+
+        cases = (
+            ("undeclared input", add_undeclared_input_bound, "undeclared input 'pressure'"),
+            ("min above max", invert_bound, "min above max"),
+            ("input twice", duplicate_input, "declared twice"),
+            ("two bounds", add_second_bound, "two validity"),
+        )
+        for label, mutate, says in cases:
             with self.subTest(label=label):
                 document = _load("method-battery-spm.json")
                 mutate(document)
