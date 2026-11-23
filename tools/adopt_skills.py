@@ -11,11 +11,11 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
-from dataclasses import dataclass
 import io
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -23,6 +23,7 @@ import tempfile
 import tomllib
 import urllib.parse
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 import census
@@ -30,8 +31,9 @@ import check_skills
 import overlap
 from candidates import LICENSE_FILENAMES, MAX_ROWS, find_folder_licence_file, normalize_name
 from census import LiveReader, SourceReadError
-from judge_groups import collapse_copies, get_skill_text, is_existing_skill, load_sources
 from check_skills import front_matter_or_empty
+from input_identity import provider_id, resolve_base_urls
+from judge_groups import collapse_copies, get_skill_text, is_existing_skill, load_sources
 
 MAX_FILES = 200
 MAX_BYTES = 2 * 1024 * 1024
@@ -916,18 +918,41 @@ def _copy_item(member: str, candidate: dict | None, text: str, skills_dir: Path)
     candidate = candidate or {}
     blob_id = candidate.get('blob_id', '').strip()
     if not blob_id and text:
-        blob_id = overlap.git_blob_id(text.encode('utf-8'))
+        blob_id = overlap.git_blob_id(text.encode())
     return overlap.item_from_skill(member, blob_id, candidate.get('skill_name', ''), text)
 
 
-def resolve_copies(group_rows, checkouts, root, pins, all_candidates, cache, sources,
-                   embed_model, base_url, embed_dims):
+@dataclass(frozen=True)
+class CopyEmbeddingInputs:
+    """Cache identity for grouped adoption."""
+
+    cache: Path | None
+    model: str
+    endpoint: str
+    dims: int | None
+
+    def refill_command(self) -> str:
+        """Show which overlap command populates the needed cache."""
+        args = ['overlap', 'run', '--cache', str(self.cache or 'embed-cache.json'),
+                '--embed-model', self.model or 'MODEL']
+        if self.endpoint:
+            args += ['--base-url', provider_id(self.endpoint)]
+        if self.dims is not None:
+            args += ['--embed-dims', str(self.dims)]
+        return shlex.join(args)
+
+    def require_cache(self) -> Path:
+        """Require a cache and model only when grouped adoption reads embeddings."""
+        if self.cache is None or not self.model:
+            raise ValueError(f'--include-grouped requires --cache and --embed-model; run {self.refill_command()}')
+        return self.cache
+
+
+def resolve_copies(group_rows, checkouts, root, pins, all_candidates, sources, embedding: CopyEmbeddingInputs):
     """Resolve grouped copies using provenance and embeddings bound to the current inputs."""
-    if cache is None:
-        raise ValueError('--include-grouped requires --cache')
-    cache_path = Path(cache)
+    cache_path = embedding.require_cache()
     if not cache_path.is_file():
-        raise ValueError(f'embedding cache not found: {cache_path}')
+        raise ValueError(f'embedding cache not found: {cache_path}; run {embedding.refill_command()}')
     ranks = _copy_ranks(sources)
     cand_by_cid = {candidate_id(r): r for r in all_candidates}
     all_members = {m.strip() for grow in group_rows for m in grow['members'].split(',') if m.strip()}
@@ -938,7 +963,11 @@ def resolve_copies(group_rows, checkouts, root, pins, all_candidates, cache, sou
         text = get_member_skill_text(m, checkouts, skills_dir, pins)
         metadata[m] = front_matter_or_empty(text)
         items[m] = _copy_item(m, cand_by_cid.get(m), text, skills_dir)
-    embeddings = overlap.load_embeddings(cache_path, list(items.values()), embed_model, base_url or '', embed_dims)
+    try:
+        embeddings = overlap.load_embeddings(cache_path, list(items.values()), embedding.model, embedding.endpoint,
+                                             embedding.dims, require_namespace=True)
+    except overlap.MissingEmbeddingNamespace as error:
+        raise ValueError(f'{error}; run {embedding.refill_command()}') from error
 
     copies_map = {}
     for grow in group_rows:
@@ -1002,7 +1031,7 @@ def evaluate(row, grouped, order, pins, checkouts, root, staging, occupied, appl
 
 def default_download_runner(args, *, cwd=None):
     """Download licence text with the adoption command deadline."""
-    proc = subprocess.run(args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=TIMEOUT)
+    proc = subprocess.run(args, cwd=cwd, capture_output=True, check=False, timeout=TIMEOUT)
     if proc.returncode != 0:
         detail = proc.stderr.decode('utf-8', errors='replace').strip()[:500]
         spdx_id = args[-1] if args else 'unknown'
@@ -1057,11 +1086,15 @@ def resolve_report_path(report: Path | None, root: Path) -> Path | None:
 def run(candidates, groups, census, checkouts, root=Path('.'), *, apply=False,
         reader=default_reader, gate=markdown_gate, hiss_gate=hiss_gate,
         report=None, runner=None, download_runner=None,
-        include_grouped=False, cache=None, sources=None, embed_model=None, base_url=None, embed_dims=None):
+        include_grouped=False, cache=None, sources=None, embed_model=None, base_url=None, embed_dims=None,
+        embed_base_url=None):
     """Preview or apply adoption using the selected overlap cache namespace."""
-    embed_model = embed_model or os.environ.get('PERITIA_LLM_EMBED_MODEL')
-    if cache is not None and not embed_model:
-        raise ValueError('--cache requires --embed-model (or set PERITIA_LLM_EMBED_MODEL)')
+    _, embed_endpoint = resolve_base_urls(base_url, embed_base_url)
+    embedding = CopyEmbeddingInputs(Path(cache) if cache is not None else None,
+                                    embed_model or os.environ.get('PERITIA_LLM_EMBED_MODEL', ''),
+                                    embed_endpoint, embed_dims)
+    if include_grouped:
+        embedding.require_cache()
     if download_runner is not None:
         runner = download_runner
     if runner is None:
@@ -1077,8 +1110,7 @@ def run(candidates, groups, census, checkouts, root=Path('.'), *, apply=False,
 
     copies_map = {}
     if include_grouped:
-        copies_map = resolve_copies(group_rows, checkouts, root, pins, all_candidates, cache, sources,
-                                    embed_model, base_url, embed_dims)
+        copies_map = resolve_copies(group_rows, checkouts, root, pins, all_candidates, sources, embedding)
 
     reuse, credits = initial_metadata(root)
     occupied = {path.name for path in (root / 'skills').iterdir() if path.is_dir()} if (root / 'skills').exists() else set()
@@ -1110,8 +1142,8 @@ def run(candidates, groups, census, checkouts, root=Path('.'), *, apply=False,
     return rows, summary(rows, selected)
 
 
-def main(argv=None):
-    """Parse adoption options and print the report for the requested run."""
+def _parse_args(argv=None):
+    """Validate adoption CLI inputs, including any explicitly supplied endpoints."""
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('candidates', 'groups', 'census', 'checkouts'):
         parser.add_argument('--' + name, required=True, type=Path)
@@ -1122,17 +1154,28 @@ def main(argv=None):
     parser.add_argument('--cache', type=Path, default=None, help='embedding cache JSON path (required by --include-grouped)')
     parser.add_argument('--embed-model', default=os.environ.get('PERITIA_LLM_EMBED_MODEL'),
                         help='model for cached embeddings (PERITIA_LLM_EMBED_MODEL)')
-    parser.add_argument('--base-url', default=os.environ.get('PERITIA_LLM_BASE_URL'),
-                        help='provider URL for cached embeddings (PERITIA_LLM_BASE_URL)')
+    parser.add_argument('--base-url', help='default provider URL (PERITIA_LLM_BASE_URL)')
+    parser.add_argument('--embed-base-url', help='embedding endpoint (defaults to --base-url)')
     parser.add_argument('--embed-dims', type=int, help='dimension of the cached embedding vectors')
     args = parser.parse_args(argv)
-    if args.cache is not None and not args.embed_model:
-        parser.error('--cache requires --embed-model (or set PERITIA_LLM_EMBED_MODEL)')
+    try:
+        args.base_url, args.embed_base_url = resolve_base_urls(args.base_url, args.embed_base_url)
+        if args.include_grouped:
+            CopyEmbeddingInputs(args.cache, args.embed_model or '', args.embed_base_url,
+                                args.embed_dims).require_cache()
+    except ValueError as error:
+        parser.error(str(error))
+    return args
+
+
+def main(argv=None):
+    """Print the requested adoption report or a contextual error."""
+    args = _parse_args(argv)
     try:
         rows, totals = run(args.candidates, args.groups, args.census, args.checkouts, args.root,
                            apply=args.apply, report=args.report,
                            include_grouped=args.include_grouped, cache=args.cache, embed_model=args.embed_model,
-                           base_url=args.base_url, embed_dims=args.embed_dims)
+                           base_url=args.base_url, embed_dims=args.embed_dims, embed_base_url=args.embed_base_url)
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
         print(f'adopt-skills: {error}', file=sys.stderr)
         return 1

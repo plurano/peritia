@@ -9,12 +9,41 @@ import os
 import urllib.request
 from typing import Any
 
+from input_identity import validate_base_url
+
+DEFAULT_CHAT_TEMPERATURE = 0.0
+DEFAULT_CHAT_SEED = 1
+
+
+def _generation_parameters(temperature: float | None, seed: int | None) -> dict[str, Any]:
+    """Resolve the same generation defaults for structured and plain chat."""
+    return {
+        "temperature": DEFAULT_CHAT_TEMPERATURE if temperature is None else temperature,
+        "seed": DEFAULT_CHAT_SEED if seed is None else seed,
+        "stream": False,
+    }
+
+
+def structured_request_parameters(
+    schema: dict[str, Any], schema_name: str, *, temperature: float | None = None, seed: int | None = None,
+) -> dict[str, Any]:
+    """Return the effective structured generation settings used by transport and resume keys."""
+    return {
+        **_generation_parameters(temperature, seed),
+        "response_format": {
+            "type": "json_schema",
+            # The server guides output; callers check the returned structure.
+            "json_schema": {"name": schema_name, "strict": False, "schema": schema},
+        },
+    }
+
 
 class LLMClient:
     """OpenAI-compatible HTTP API client for chat completions and embeddings."""
 
     def __init__(self, base_url: str, timeout: float = 300.0, api_key: str | None = None) -> None:
-        self.base_url = base_url.rstrip("/")
+        """Store a validated endpoint and request settings."""
+        self.base_url = validate_base_url(base_url).rstrip("/")
         self.timeout = timeout
         self.api_key = api_key
 
@@ -36,30 +65,15 @@ class LLMClient:
         messages: list[dict[str, Any]],
         schema: dict[str, Any] | None = None,
         schema_name: str = "answer",
-        temperature: float = 0.0,
-        seed: int = 1,
+        temperature: float | None = None,
+        seed: int | None = None,
     ) -> str:
-        """Calls /chat/completions and returns the choices[0].message.content string."""
-        body: dict[str, Any] = {
-            "model": model,
-            "messages": messages,
-            "temperature": temperature,
-            "seed": seed,
-            "stream": False,
-        }
-        if schema is not None:
-            body["response_format"] = {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": schema_name,
-                    # strict mode on OpenAI demands additionalProperties
-                    # false and every property required; the label and
-                    # judge schemas carry neither, so the server guides
-                    # the answer and the callers refuse a malformed one.
-                    "strict": False,
-                    "schema": schema,
-                },
-            }
+        """Call /chat/completions and return the first choice's message content."""
+        if schema is None:
+            settings = _generation_parameters(temperature, seed)
+        else:
+            settings = structured_request_parameters(schema, schema_name, temperature=temperature, seed=seed)
+        body = {"model": model, "messages": messages, **settings}
         reply = self._post("/chat/completions", body)
         if not isinstance(reply, dict):
             raise ValueError(f"expected JSON object reply, got {type(reply).__name__}")
@@ -83,10 +97,10 @@ class LLMClient:
         messages: list[dict[str, Any]],
         schema: dict[str, Any],
         schema_name: str = "answer",
-        temperature: float = 0.0,
-        seed: int = 1,
+        temperature: float | None = None,
+        seed: int | None = None,
     ) -> Any:
-        """Calls /chat/completions with schema and returns parsed JSON content."""
+        """Call /chat/completions with a schema and return parsed JSON content."""
         content = self.chat(
             model=model,
             messages=messages,

@@ -6,12 +6,15 @@ import csv
 import io
 import json
 import math
+import os
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
+import adopt_skills
 import overlap
 
 CANDIDATES_HEADER = [
@@ -360,7 +363,7 @@ class OverlapResumeTests(unittest.TestCase):
         self.candidates = write_candidates(self.folder, self.rows)
         self.judge_calls = []
 
-    def run_overlap(self, model="first", *, same_use=True, unjudged_skill=None, **kwargs):
+    def run_overlap(self, model="first", *, same_use=True, unjudged_skill=None, embed_fn=None, **kwargs):
         """Run overlap with three identical vectors and record the judge prompts."""
         self.judge_calls.clear()
 
@@ -377,11 +380,92 @@ class OverlapResumeTests(unittest.TestCase):
             skills_dir=self.folder / "skills",
             overlap_out=self.out,
             groups_out=self.groups,
-            embed_fn=lambda texts: [[1.0, 0.0] for _ in texts],
+            embed_fn=embed_fn or (lambda texts: [[1.0, 0.0] for _ in texts]),
             judge_fn=judge,
             judge_model=model,
             **kwargs,
         )
+
+    def test_smaller_k_excludes_historical_group_and_unjudged_pair(self):
+        """Project both group edges and standalone summary onto the current top k."""
+        for same_use, old_groups, old_unjudged in ((True, 1, 0), (None, 0, 1)):
+            with self.subTest(same_use=same_use):
+                self.out.unlink(missing_ok=True)
+
+                def judge(prompt):
+                    """Give c2-c3 the only positive or unjudged judgment."""
+                    if "name: c1\n" in prompt:
+                        return {"same_use": False, "reason": "distinct"}
+                    return {} if same_use is None else {"same_use": same_use, "reason": "same"}
+
+                with patch("overlap.judge_one", wraps=overlap.judge_one) as requested:
+                    overlap.run(self.candidates, self.checkouts, self.folder / "skills", self.out, self.groups,
+                                lambda texts: [[1.0, 0.0] for _ in texts], judge, "judge", k=2)
+                    self.assertEqual(requested.call_count, 3)
+                self.assertIn(f"groups: {old_groups}", overlap.summary(self.out, self.groups, self.candidates))
+                self.assertIn(f"unjudged pairs: {old_unjudged}", overlap.summary(self.out, self.groups, self.candidates))
+                before = self.out.read_bytes()
+                self.assertEqual(self.run_overlap(model="judge", k=1), (2, 0))
+                self.assertEqual(self.judge_calls, [])
+                self.assertEqual(self.out.read_bytes(), before)
+                self.assertIn("unjudged pairs: 0", overlap.summary(self.out, self.groups, self.candidates))
+
+    def test_new_embedding_model_projects_retained_pair_geometry(self):
+        """Use current cosine and rank for a pair previously cached at rank two."""
+        cache = self.folder / "embed.json"
+        self.assertEqual(self.run_overlap(k=2, cache_path=cache, embed_model="before"), (3, 1))
+        retained = ("s:c2/SKILL.md", "s:c3/SKILL.md")
+        history = overlap.load_done_pairs(self.out)
+        self.assertEqual((history[retained]["cosine"], history[retained]["rank"]), ("1.0000", "2"))
+        before = self.out.read_bytes()
+        with patch.object(overlap, "build_groups", wraps=overlap.build_groups) as build:
+            self.assertEqual(self.run_overlap(k=1, cache_path=cache, embed_model="after",
+                                              embed_fn=lambda _: [[0, 1], [1, 0], [0.8, 0.6]]), (2, 1))
+        rows = {(r["a"], r["b"]): r for r in build.call_args.args[0]}
+        self.assertNotIn(("s:c1/SKILL.md", "s:c2/SKILL.md"), rows)
+        self.assertEqual((rows[retained]["cosine"], rows[retained]["rank"]), ("0.8000", "1"))
+        self.assertEqual(self.judge_calls, [])
+        self.assertEqual(self.out.read_bytes(), before)
+
+    def test_embedding_model_change_at_fixed_k_drops_old_edge(self):
+        """Exclude a former edge even when only the embedding model changes."""
+        cache = self.folder / "embed.json"
+        self.assertEqual(self.run_overlap(k=1, cache_path=cache, embed_model="before"), (2, 1))
+        old_edge = "s:c1/SKILL.md|s:c2/SKILL.md"
+        self.assertIn(old_edge, self.groups.read_text())
+        before = self.out.read_bytes()
+        self.assertEqual(self.run_overlap(k=1, cache_path=cache, embed_model="after",
+                                          embed_fn=lambda _: [[0, 1], [1, 0], [0.8, 0.6]]), (2, 1))
+        self.assertNotIn(old_edge, self.groups.read_text())
+        self.assertEqual(len(self.judge_calls), 1)
+        self.assertNotIn("name: c1\n", self.judge_calls[0])
+        self.assertTrue(self.out.read_bytes().startswith(before))
+
+    def test_pair_user_prompt_change_rejudges_unchanged_blobs(self):
+        """Invalidate a judgment when only its rendered user prompt changes."""
+        self.run_overlap()
+        render = overlap.make_judge_prompt
+        with patch.object(overlap, "make_judge_prompt", side_effect=lambda a, b: render(a, b) + " changed"):
+            self.assertEqual(self.run_overlap(same_use=False), (3, 0))
+        self.assertEqual(len(self.judge_calls), 3)
+
+    def test_structured_temperature_changes_pair_identity(self):
+        """Reuse judgments until the client changes its default temperature."""
+        self.run_overlap()
+        self.run_overlap()
+        self.assertEqual(self.judge_calls, [])
+        with patch("llm_client.DEFAULT_CHAT_TEMPERATURE", 0.1, create=True):
+            self.run_overlap()
+            self.assertEqual(len(self.judge_calls), 3)
+            self.run_overlap()
+            self.assertEqual(self.judge_calls, [])
+
+    def test_pair_history_over_cap_is_refused(self):
+        """Detect excess pair history before reusing any rows."""
+        self.run_overlap()
+        with (patch.object(overlap, "MAX_PAIRS", 2),
+              self.assertRaisesRegex(ValueError, r"overlap\.tsv.*cap.*2")):
+            overlap.load_done_pairs(self.out)
 
     def test_resume_skips_judged_pairs(self):
         """Reuse all three judgments when inputs match and preserve the TSV bytes."""
@@ -573,6 +657,101 @@ class OverlapEmbeddingIdentityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "--embed-dims"):
             overlap.get_embeddings([self.item], self.embed, self.cache, model="embed")
 
+    def test_changed_preprocessing_uses_new_namespace(self):
+        """Call embeddings again when only the preprocessing version changes."""
+        overlap.get_embeddings([self.item], self.embed, self.cache, model="embed")
+        self.embed_calls.clear()
+        with patch.object(overlap, "EMBED_PREPROCESSING", "other-preprocessing"):
+            overlap.get_embeddings([self.item], self.embed, self.cache, model="embed")
+        self.assertEqual(self.embed_calls, ["name1: desc1"])
+        self.assertEqual(len(self.load_cache_json()["namespaces"]), 2)
+
+    def test_invalid_namespace_keys_and_dimensions_are_skipped(self):
+        """Warn about invalid metadata before inferring the one valid dimension."""
+        overlap.get_embeddings([self.item], self.embed, self.cache, model="embed")
+        data = self.load_cache_json()
+        valid = next(iter(data["namespaces"].values()))
+        space = overlap.EmbeddingSpace(valid["model"], valid["provider"], valid["preprocessing"])
+        damaged = {"bad-key": valid, space.key(2.0): valid | {"dims": 2.0},
+                   space.key(True): valid | {"dims": True}}
+        data["namespaces"].update(damaged)
+        self.cache.write_text(json.dumps(data))
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            self.assertEqual(overlap.load_embeddings(self.cache, [self.item], "embed", ""),
+                             {"b1": [0.1, 0.2, 0.3]})
+        for key in damaged:
+            self.assertIn(key, stderr.getvalue())
+
+    def test_bool_embedding_dims_refused(self):
+        """Reject Boolean values passed directly to the dimensions option."""
+        with self.assertRaisesRegex(ValueError, "--embed-dims"):
+            overlap.get_embeddings([self.item], self.embed, self.cache, model="embed", embed_dims=True)
+
+    def test_overlap_cli_reports_malformed_cached_vector(self):
+        """Report a malformed vector with its cache path and blob, even when unused."""
+        self.write_damaged_cache()
+        args = ["run", "--candidates", str(write_candidates(self.cache.parent, [])),
+                "--skills-dir", str(self.cache.parent / "skills"), "--out", str(self.cache.parent / "out.tsv"),
+                "--groups", str(self.cache.parent / "groups.tsv"), "--cache", str(self.cache), "--base-url", "https://embed.test/v1",
+                "--embed-model", "embed", "--judge-model", "judge"]
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            self.assertEqual(overlap.main(args), 1)
+        self.assertIn(str(self.cache), stderr.getvalue())
+        self.assertIn("b1", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+
+    def write_damaged_cache(self):
+        """Write a selected namespace containing one invalid vector value."""
+        overlap.get_embeddings([self.item], self.embed, self.cache, model="embed", provider="https://embed.test/v1")
+        data = self.load_cache_json()
+        next(iter(data["namespaces"].values()))["vectors"]["b1"]["vector"] = {"bad": True}
+        self.cache.write_text(json.dumps(data))
+
+    def test_adoption_cli_reports_malformed_cached_vector(self):
+        """Use the separate embedding endpoint and report malformed data without a traceback."""
+        self.write_damaged_cache()
+        args = ["--candidates", "unused", "--groups", "unused", "--census", "unused",
+                "--checkouts", str(self.cache.parent), "--root", str(self.cache.parent),
+                "--include-grouped", "--cache", str(self.cache), "--base-url", "https://chat.test/v1",
+                "--embed-base-url", "https://embed.test/v1", "--embed-model", "embed"]
+        stderr = io.StringIO()
+        with (patch.object(adopt_skills, "inputs", return_value=([], {}, {}, {}, [], {}, [])),
+              redirect_stderr(stderr)):
+            self.assertEqual(adopt_skills.main(args), 1)
+        self.assertIn(str(self.cache), stderr.getvalue())
+        self.assertIn("b1", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_grouped_adoption_refuses_missing_or_incompatible_namespace(self):
+        """Point grouped adoption to the cache-producing command when its space is unavailable."""
+        overlap.get_embeddings([self.item], self.embed, self.cache, model="other-model",
+                               provider="https://embed.test/v1")
+        for cache in (self.cache, None, self.cache.with_name("missing.json")):
+            with (self.subTest(cache=cache),
+                  self.assertRaisesRegex(ValueError, r"overlap run --cache .* --embed-model embed"),
+                  patch.object(adopt_skills, "inputs", return_value=([], {}, {}, {}, [], {}, []))):
+                adopt_skills.run(None, None, None, self.cache.parent, self.cache.parent, include_grouped=True,
+                                 cache=cache, embed_model="embed", embed_base_url="https://embed.test/v1")
+
+    def test_adoption_shared_endpoint_default_and_unused_cache(self):
+        """Use the environment for grouped runs and ignore a cache for ungrouped runs."""
+        root = self.cache.parent
+        (root / "REUSE.toml").write_text("")
+        (root / "CREDITS.md").write_text("")
+        overlap.get_embeddings([self.item], self.embed, self.cache, model="embed", provider="https://embed.test/v1")
+        with (patch.object(adopt_skills, "inputs", return_value=([], {}, {}, {}, [], {}, [])),
+              patch.dict(os.environ, {"PERITIA_LLM_BASE_URL": "https://embed.test/v1",
+                                      "PERITIA_LLM_EMBED_MODEL": ""})):
+            self.assertEqual(adopt_skills.run(None, None, None, root, root, cache=self.cache)[0], [])
+            self.assertEqual(adopt_skills.run(None, None, None, root, root, include_grouped=True,
+                                              cache=self.cache, embed_model="embed")[0], [])
+            args = ["--candidates", "unused", "--groups", "unused", "--census", "unused",
+                    "--checkouts", str(root), "--root", str(root), "--cache", str(self.cache)]
+            with patch("sys.stdout", new_callable=io.StringIO):
+                self.assertEqual(adopt_skills.main(args), 0)
+
     def test_legacy_cache_preserves_unbound_vectors_without_reusing_them(self):
         """Re-embed a legacy entry and preserve the old vector as unbound history."""
         legacy = {"b1": [9.0, 9.0, 9.0]}
@@ -588,6 +767,36 @@ class OverlapEmbeddingIdentityTests(unittest.TestCase):
 
 
 class OverlapEmbeddingAndCacheTests(unittest.TestCase):
+    def test_git_blob_id_matches_git_at_chunk_boundaries(self):
+        """Match Git for empty and chunk-boundary blobs without reading local Git configuration."""
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            path = root / "SKILL.md"
+            git_env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+            git_env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+            for size in (0, 65536, 65537):
+                with self.subTest(size=size):
+                    data = bytes(size)
+                    path.write_bytes(data)
+                    expected = subprocess.run(["git", "hash-object", "--no-filters", "--", str(path)],
+                                              cwd=root, env=git_env, capture_output=True, check=True, timeout=10)
+                    self.assertEqual(overlap.git_blob_id(data), expected.stdout.decode().strip())
+                    self.assertEqual(overlap._read_candidate_skill(path)[1], overlap.git_blob_id(data))
+
+    def test_download_runner_sets_subprocess_options(self):
+        """Capture both streams, apply a deadline and handle process status locally."""
+        result = subprocess.CompletedProcess(["reuse", "download", "MIT"], 0, b"licence", b"")
+        with patch.object(adopt_skills.subprocess, "run", Mock(return_value=result)) as run:
+            self.assertEqual(adopt_skills.default_download_runner(result.args), b"licence")
+        run.assert_called_once_with(result.args, cwd=None, capture_output=True, check=False,
+                                    timeout=adopt_skills.TIMEOUT)
+
+    def test_overlap_cli_rejects_invalid_endpoint(self):
+        """Reject unbound URL components during argument parsing."""
+        for url in ("https://host.test/v1?x=1", "https://host.test/v1#x", "//host.test/v1"):
+            with self.subTest(url=url), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                overlap.parse_args(["run", "--base-url", url, "--embed-model", "embed", "--judge-model", "judge"])
+
     def test_batching_never_exceeds_64(self):
         """Split a hundred input texts into batches of sixty-four or fewer."""
         items = [
@@ -649,7 +858,16 @@ class OverlapEmbeddingAndCacheTests(unittest.TestCase):
 
 
 class OverlapSummaryTests(unittest.TestCase):
+    def test_fingerprinted_history_without_pair_snapshot_is_refused(self):
+        """Avoid reporting historical ranks as if they were the current run."""
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "overlap.tsv"
+            path.write_text("\t".join(overlap.OVERLAP_FIELDS) + "\n")
+            with self.assertRaisesRegex(ValueError, "current pair snapshot missing"):
+                overlap.summary(path, path.with_name("groups.tsv"))
+
     def test_summary_reports_all_five_metrics(self):
+        """Retain the summary metrics for legacy overlap and group outputs."""
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             out_overlap = tmp / "overlap.tsv"
@@ -660,8 +878,9 @@ class OverlapSummaryTests(unittest.TestCase):
                 {"blob_id": "b3", "source": "s", "path": "c3/SKILL.md", "verdict": "candidate"},
             ])
 
+            legacy_fields = [field for field in overlap.OVERLAP_FIELDS if field != "judge_fp"]
             with out_overlap.open("w", newline="", encoding="utf-8") as handle:
-                writer = csv.DictWriter(handle, fieldnames=overlap.OVERLAP_FIELDS, delimiter="\t", lineterminator="\n")
+                writer = csv.DictWriter(handle, fieldnames=legacy_fields, delimiter="\t", lineterminator="\n")
                 writer.writeheader()
                 writer.writerow({"a": "s:c1/SKILL.md", "b": "s:c2/SKILL.md", "same_use": "true"})
                 writer.writerow({"a": "s:c2/SKILL.md", "b": "s:c3/SKILL.md", "same_use": "unjudged"})

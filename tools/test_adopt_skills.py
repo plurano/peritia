@@ -560,12 +560,9 @@ class AdoptionTests(unittest.TestCase):
             'members': f'{orig_cand["source"]}:{orig_cand["path"]},{copy_cand["source"]}:{copy_cand["path"]}',
         }]
         cache_file = self.embedding_cache({'orig_blob': [1.0, 0.0], 'copy_blob': [0.99, math.sqrt(1 - 0.99**2)]})
-        stderr = io.StringIO()
-        with redirect_stderr(stderr):
-            other_rows, _ = self.invoke(apply=False, include_grouped=True, cache=cache_file, embed_model='other-model')
-        self.assertEqual([row['verdict'] for row in other_rows], ['adopted', 'adopted'])
-        self.assertIn('other-model', stderr.getvalue())
-        self.assertIn(str(cache_file), stderr.getvalue())
+        with self.assertRaisesRegex(ValueError, r'overlap run --cache .* --embed-model other-model') as error:
+            self.invoke(apply=False, include_grouped=True, cache=cache_file, embed_model='other-model')
+        self.assertIn(str(cache_file), str(error.exception))
         rows, _ = self.invoke(apply=True, include_grouped=True, cache=cache_file)
         self.assertEqual(len(rows), 2)
         # Anthropics original adopted
@@ -732,10 +729,10 @@ class AdoptionTests(unittest.TestCase):
         dirs = [p.name for p in (self.root / 'skills').iterdir() if p.is_dir()]
         self.assertEqual(dirs, ['demo'])
 
-    def test_cli_cache_requires_embed_model(self):
-        """Reject a cache argument without an embedding model before inspecting inputs."""
+    def test_cli_grouped_cache_requires_embed_model(self):
+        """Reject grouped adoption without an embedding model before inspecting inputs."""
         argv = ['--candidates', 'candidates.tsv', '--groups', 'groups.tsv', '--census', 'census.tsv',
-                '--checkouts', 'checkouts', '--cache', 'cache.json']
+                '--checkouts', 'checkouts', '--cache', 'cache.json', '--include-grouped']
         stderr = io.StringIO()
         with (patch.dict('os.environ', {'PERITIA_LLM_EMBED_MODEL': ''}), redirect_stderr(stderr),
               self.assertRaises(SystemExit) as error):

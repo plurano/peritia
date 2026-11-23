@@ -7,18 +7,19 @@ import io
 import json
 import math
 import re
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr
-from unittest.mock import Mock, patch
 from pathlib import Path
-import sys
+from unittest.mock import Mock, patch
 
 _TOOLS_DIR = Path(__file__).resolve().parent
 if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
 import classify
+import input_identity
 import judge_groups
 import overlap
 
@@ -346,6 +347,39 @@ class EndToEndAndResumeTests(unittest.TestCase):
             self.assertTrue((existing / "SKILL.md").exists())
             self.assertEqual(chat.call_count, 9)
 
+    def test_distinct_embed_endpoint_selects_cached_copies(self):
+        """Resolve embeddings at a separate endpoint for direct and CLI callers."""
+        with tempfile.TemporaryDirectory() as folder:
+            paths, members, cache = setup_copy_env(Path(folder))
+            groups, tasks, candidates, verdicts, trials, checkouts, skills = paths
+            row = judge_groups.run(groups, tasks, checkouts, skills, verdicts, trials, candidates,
+                                   chat_fn=Mock(return_value="hello"), judge_fn=Mock(return_value=8.0),
+                                   cache_path=cache, embed_model="embed-model", base_url="https://chat.test/v1",
+                                   embed_base_url="http://127.0.0.1:9999/v1")[0]
+            self.assertEqual(json.loads(row["copies"]), {members[1]: f"copy-of:{members[0]}"})
+            args = judge_groups.parse_args(["run", "--base-url", "https://chat.test/v1", "--model", "answer",
+                                            "--judge-model", "judge", "--embed-base-url", "https://embed.test/v1"])
+            self.assertEqual(args.embed_base_url, "https://embed.test/v1")
+
+    def test_cli_reports_malformed_cached_vector(self):
+        """Return a cache path and blob for a malformed vector without a traceback."""
+        with tempfile.TemporaryDirectory() as folder:
+            paths, _, cache = setup_copy_env(Path(folder))
+            groups, tasks, candidates, verdicts, trials, checkouts, skills = paths
+            data = json.loads(cache.read_text())
+            next(iter(data["namespaces"].values()))["vectors"]["original"]["vector"] = "damaged"
+            cache.write_text(json.dumps(data))
+            args = ["run", "--groups", str(groups), "--eval-tasks", str(tasks), "--candidates", str(candidates),
+                    "--checkouts", str(checkouts), "--skills-dir", str(skills), "--out", str(verdicts),
+                    "--trials-out", str(trials), "--cache", str(cache), "--base-url", "http://127.0.0.1:9999/v1",
+                    "--model", "answer", "--judge-model", "judge", "--embed-model", "embed-model"]
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                self.assertEqual(judge_groups.main(args), 1)
+            self.assertIn(str(cache), stderr.getvalue())
+            self.assertIn("original", stderr.getvalue())
+            self.assertNotIn("Traceback", stderr.getvalue())
+
     def test_other_embedding_model_does_not_infer_copy(self):
         """Warn and retain both members when a cache belongs to another model."""
         with tempfile.TemporaryDirectory() as folder:
@@ -385,10 +419,12 @@ class TrialIdentityTests(unittest.TestCase):
         )
         self.chat = Mock(return_value="hello world")
         self.judge = Mock(return_value=8.0)
-        self.options = dict(groups_tsv=groups, eval_tasks_json=self.tasks, checkouts=self.checkouts,
-                            skills_dir=skills, verdicts_out=self.verdicts, trials_out=self.trials,
-                            candidates_tsv=candidates, chat_fn=self.chat, judge_fn=self.judge,
-                            k=2, model="model-one", judge_model="judge-one", base_url="", temperature=0.7)
+        self.options = {
+            "groups_tsv": groups, "eval_tasks_json": self.tasks, "checkouts": self.checkouts,
+            "skills_dir": skills, "verdicts_out": self.verdicts, "trials_out": self.trials,
+            "candidates_tsv": candidates, "chat_fn": self.chat, "judge_fn": self.judge,
+            "k": 2, "model": "model-one", "judge_model": "judge-one", "base_url": "", "temperature": 0.7,
+        }
 
     def first_run(self):
         """Write twelve trials and clear the counters so the next run is measurable."""
@@ -414,6 +450,124 @@ class TrialIdentityTests(unittest.TestCase):
         data["classes"]["coding"][0][field] = value
         self.tasks.write_text(json.dumps(data), encoding="utf-8")
 
+    def test_identical_answers_still_record_each_slot(self):
+        """Persist six logical slots per seed and reuse inference across them."""
+        (self.checkouts / "cand-2").write_text("cand-1")
+        data = json.loads(self.tasks.read_text())
+        for task in data["classes"]["coding"]:
+            task["prompt"] = "Identical prompt"
+        self.tasks.write_text(json.dumps(data))
+        verdicts = judge_groups.run(**self.options)
+        self.assert_calls(2, 2)
+        records = self.new_rows()
+        self.assertEqual(len(records), 12)
+        self.assertEqual({(r["group_id"], r["member"], r["task_id"], r["trial"]) for r in records},
+                         {("1", f"cand-{m}", f"code-{t}", s)
+                          for m in (1, 2) for t in range(3) for s in (1, 2)})
+        scores = json.loads(verdicts[0]["scores"])
+        self.assertEqual({member: score["pass_pow_k"] for member, score in scores.items()},
+                         {"cand-1": 1.0, "cand-2": 1.0})
+        before = self.trials.read_bytes()
+        self.chat.reset_mock()
+        self.judge.reset_mock()
+        self.assertEqual(judge_groups.run(**self.options), verdicts)
+        self.assert_calls(0, 0)
+        self.assertEqual(self.trials.read_bytes(), before)
+
+    def test_changing_grader_version_regrades_without_judging(self):
+        """Bind local grades to the grader version independently from the judge."""
+        before = self.first_run()
+        with (patch.object(judge_groups, "GRADER_VERSION", "next"),
+              patch.object(judge_groups, "grade_answer", wraps=judge_groups.grade_answer) as grade):
+            judge_groups.run(**self.options)
+        self.assertEqual(grade.call_count, 12)
+        self.assert_calls(0, 0)
+        self.assertEqual(len(self.new_rows(before)), 12)
+
+    def test_unknown_trial_version_never_resumes(self):
+        """Keep fingerprinted records from an unsupported version without using them."""
+        self.first_run()
+        records = self.new_rows()
+        for record in records:
+            record["record_version"] = 99
+        before = "".join(json.dumps(row) + "\n" for row in records).encode()
+        self.trials.write_bytes(before)
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            judge_groups.run(**self.options)
+        self.assert_calls(12, 12)
+        self.assertEqual(len(self.new_rows(before)), 12)
+        self.assertIn("unsupported trial records", stderr.getvalue())
+
+    def test_trial_history_over_cap_is_refused(self):
+        """Refuse an overlong history before invoking either model."""
+        self.first_run()
+        with (patch.object(judge_groups, "MAX_TRIAL_ROWS", 1, create=True),
+              self.assertRaisesRegex(ValueError, r"trials\.jsonl.*cap.*1")):
+            judge_groups.run(**self.options)
+        self.assert_calls(0, 0)
+
+    def test_answer_layout_preserves_existing_identity(self):
+        """Keep the answer identity when the actual baseline message layout is unchanged."""
+        expected = input_identity.fingerprint("answer", {
+            "skill_text_sha256": input_identity.text_sha256("skill"),
+            "task_prompt_sha256": input_identity.text_sha256("task"),
+            "model": "model", "provider": "provider", "temperature": 0.7, "seed": 1,
+            "chat_shape": "system=skill,user=task",
+        })
+        self.assertEqual(judge_groups.answer_fingerprint("skill", "task", "model", "provider", 0.7, 1), expected)
+
+    def test_answer_shape_fingerprint_matches_sent_messages(self):
+        """Change the sent roles and require new answer identities."""
+        self.first_run()
+        client = Mock()
+        judge_groups.JudgeHarness(client, "model", "judge").chat("skill", "task", 0.7, 1)
+        client.chat.assert_called_once_with("model", [{"role": "system", "content": "skill"},
+                                                      {"role": "user", "content": "task"}],
+                                            temperature=0.7, seed=1)
+        changed = [{"role": "user", "content": "skill"}, {"role": "system", "content": "task"}]
+        with patch.object(judge_groups, "answer_messages", return_value=changed, create=True):
+            judge_groups.run(**self.options)
+            judge_groups.JudgeHarness(client, "model", "judge").chat("skill", "task", 0.7, 1)
+        self.assert_calls(12, 12)
+        self.assertEqual(client.chat.call_args.args[1], changed)
+
+    def test_judge_binds_answer_hash(self):
+        """Change the cached answer while keeping the rendered judge prompt fixed."""
+        with patch.object(judge_groups, "make_judge_prompt", return_value="constant judge prompt"):
+            self.first_run()
+            records = self.new_rows()
+            records[0]["answer"] = "edited actual answer"
+            self.trials.write_text("".join(json.dumps(row) + "\n" for row in records))
+            judge_groups.run(**self.options)
+        self.assert_calls(0, 1)
+
+    def test_structured_temperature_changes_rubric_identity(self):
+        """Rejudge existing answers when only the client default temperature changes."""
+        self.first_run()
+        with patch("llm_client.DEFAULT_CHAT_TEMPERATURE", 0.1, create=True):
+            judge_groups.run(**self.options)
+            self.assert_calls(0, 12)
+            self.judge.reset_mock()
+            judge_groups.run(**self.options)
+            self.assert_calls(0, 0)
+
+    def test_judge_system_prompt_changes_rubric_identity(self):
+        """Rejudge existing answers after a judge system prompt edit."""
+        self.first_run()
+        with patch.object(judge_groups, "JUDGE_SYSTEM_PROMPT", "changed judge instruction"):
+            judge_groups.run(**self.options)
+        self.assert_calls(0, 12)
+
+    def test_judge_schema_changes_rubric_identity(self):
+        """Rejudge existing answers after a judge schema edit."""
+        self.first_run()
+        schema = judge_groups.judge_schema()
+        schema["properties"]["reason"]["maxLength"] += 1
+        with patch.object(judge_groups, "judge_schema", return_value=schema):
+            judge_groups.run(**self.options)
+        self.assert_calls(0, 12)
+
     def test_resume_skips_done_trials(self):
         """Reuse matching trials with no append and neither model called."""
         before = self.first_run()
@@ -436,7 +590,7 @@ class TrialIdentityTests(unittest.TestCase):
     def test_changed_provider_runs_all_trials(self):
         """Invalidate answers when the endpoint changes, even with injected callables."""
         before = self.first_run()
-        base = "https://user:password@provider.test:123/v1/?key=hidden#fragment"
+        base = "https://fixture-user:fixture-pass@provider.test:123/v1/"
         judge_groups.run(**(self.options | {"base_url": base}))
         self.assert_calls(12, 12)
         self.assertEqual({rec["provider"] for rec in self.new_rows(before)}, {"https://provider.test:123/v1"})
@@ -511,7 +665,7 @@ class TrialIdentityTests(unittest.TestCase):
             row = judge_groups.run(**self.options)[0]
         self.assert_calls(12, 12)
         self.assertEqual(stderr.getvalue().splitlines(),
-                         [f"1 legacy trial records ignored (no input fingerprint): {self.trials}"])
+                         [f"1 legacy or unsupported trial records ignored (expected record version 2 and input fingerprints): {self.trials}"])
         self.assertEqual({rec["model"] for rec in self.new_rows(legacy)}, {"model-one"})
         self.assertEqual(row["model"], "model-one")
         self.assertNotIn("old-model", self.verdicts.read_text())
@@ -531,8 +685,8 @@ class TrialIdentityTests(unittest.TestCase):
 
     def test_answer_fingerprint_binds_every_answer_input(self):
         """Distinguish each changed answer input while keeping other inputs fixed."""
-        values = dict(skill_text="skill", task_prompt="task", model="model", provider="provider",
-                      temperature=0.7, seed=1)
+        values = {"skill_text": "skill", "task_prompt": "task", "model": "model", "provider": "provider",
+                  "temperature": 0.7, "seed": 1}
         base = judge_groups.answer_fingerprint(**values)
         for key, value in (("skill_text", "edited"), ("task_prompt", "new prompt"), ("model", "different"),
                            ("provider", "elsewhere"), ("temperature", 0.70000001), ("seed", 2)):

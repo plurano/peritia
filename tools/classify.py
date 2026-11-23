@@ -28,8 +28,15 @@ from typing import Any, Callable, Iterable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from input_identity import canonical_json, fingerprint, open_fingerprinted_tsv, provider_id, text_sha256
-from llm_client import LLMClient
+from input_identity import (
+    bounded_history,
+    fingerprint,
+    open_fingerprinted_tsv,
+    provider_id,
+    text_sha256,
+    validate_base_url,
+)
+from llm_client import LLMClient, structured_request_parameters
 
 FUNCTIONS = {
     "coding": "writes or changes program code",
@@ -67,6 +74,7 @@ MAX_LABELS = 3
 MAX_SKILL_CHARS = 2400
 MAX_ROWS = 200_000
 ATTEMPTS = 2
+LABEL_SCHEMA_NAME = "skill_labels"
 OUTPUT_FIELDS = ["blob_id", "source", "path", "skill_name", "functions", "domains", "model", "status", "input_fp"]
 
 SYSTEM_PROMPT = (
@@ -165,7 +173,7 @@ class SkillClassifier:
             {"role": "user", "content": skill_prompt(text)},
         ]
         return self.client.chat_json(
-            self.model, messages, schema=label_schema(), schema_name="skill_labels"
+            self.model, messages, schema=label_schema(), schema_name=LABEL_SCHEMA_NAME
         )
 
 
@@ -184,7 +192,9 @@ def classify_one(ask: Callable[[str], Any], text: str) -> tuple[list[str], list[
 def latest_classifications(output: Path) -> dict[str, dict[str, str]]:
     """Read the latest classification row per blob, including legacy summaries."""
     with output.open(newline="", encoding="utf-8") as handle:
-        return {row["blob_id"]: row for row in csv.DictReader(handle, delimiter="\t")}
+        rows = csv.DictReader(handle, delimiter="\t")
+        return {row["blob_id"]: row for row in bounded_history(output, rows, MAX_ROWS)
+                if row.get("blob_id") and None not in row and None not in row.values()}
 
 
 def read_skill_input(checkouts: Path, item: Item) -> str | None:
@@ -202,10 +212,10 @@ def run(items: list[Item], checkouts: Path, output: Path, ask: Callable[[str], A
         "model": model,
         "provider": provider_id(provider),
         "system_prompt_sha256": text_sha256(SYSTEM_PROMPT),
-        "schema_sha256": text_sha256(canonical_json(label_schema())),
+        "request": structured_request_parameters(label_schema(), LABEL_SCHEMA_NAME),
     }
     counts: Counter = Counter()
-    handle, writer = open_fingerprinted_tsv(output, OUTPUT_FIELDS, "input_fp")
+    handle, writer = open_fingerprinted_tsv(output, OUTPUT_FIELDS, "input_fp", max_rows=MAX_ROWS)
     with handle:
         done = {blob: row.get("input_fp") for blob, row in latest_classifications(output).items()}
         for item in items:
@@ -251,6 +261,7 @@ def summary(output: Path) -> str:
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
+    """Parse classifier commands and validate the selected model endpoint."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     commands = parser.add_subparsers(dest="command", required=True)
     go = commands.add_parser("run", help="classify every unique census row not yet in the output")
@@ -270,6 +281,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     if args.command == "run":
         if not args.base_url:
             parser.error("missing --base-url (or set PERITIA_LLM_BASE_URL)")
+        try:
+            validate_base_url(args.base_url)
+        except ValueError as error:
+            parser.error(str(error))
         if not args.model:
             parser.error("missing --model (or set PERITIA_LLM_MODEL)")
     return args
@@ -278,9 +293,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def main(argv: list[str]) -> int:
     """Run the classifier or print the classification summary."""
     args = parse_args(argv)
-    if args.command == "summary":
-        print(summary(args.out))
-        return 0
+    try:
+        if args.command == "summary":
+            print(summary(args.out))
+            return 0
+        return _run_cli(args)
+    except (OSError, ValueError) as error:
+        print(f"classify: {error}", file=sys.stderr)
+        return 1
+
+
+def _run_cli(args: argparse.Namespace) -> int:
+    """Classify census inputs and print the number of successful and failed requests."""
     client = LLMClient(args.base_url, args.timeout, api_key=os.environ.get("PERITIA_LLM_API_KEY"))
     classifier = SkillClassifier(client, args.model)
     counts = run(unique_items(args.census), args.checkouts, args.out, classifier.ask, args.model,

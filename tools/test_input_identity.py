@@ -1,16 +1,19 @@
-#!/usr/bin/env python3
 # SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
 # SPDX-License-Identifier: EUPL-1.2
 """Exercise the shared input fingerprint and TSV migration contracts."""
 import csv
 import hashlib
 import io
+import os
 import tempfile
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
+from unittest.mock import patch
 
+import input_identity
 from input_identity import fingerprint, open_fingerprinted_tsv, provider_id, text_sha256
+from llm_client import LLMClient
 
 
 class InputIdentityTests(unittest.TestCase):
@@ -19,20 +22,144 @@ class InputIdentityTests(unittest.TestCase):
     def test_canonical_fingerprint(self):
         """Hash canonical Unicode JSON independent of input key order."""
         serialized = '{"kind":"example","name":"café","temperature":0.7,"version":1}'
-        expected = "sha256:" + hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+        expected = "sha256:" + hashlib.sha256(serialized.encode()).hexdigest()
         self.assertEqual(fingerprint("example", {"temperature": 0.7, "name": "café"}), expected)
         self.assertEqual(fingerprint("example", {"name": "café", "temperature": 0.7}), expected)
         self.assertNotEqual(fingerprint("example", {"temperature": 0.70000001, "name": "café"}), expected)
         self.assertNotEqual(fingerprint("other", {"temperature": 0.7, "name": "café"}), expected)
-        self.assertEqual(text_sha256("café"), hashlib.sha256("café".encode("utf-8")).hexdigest())
+        self.assertEqual(text_sha256("café"), hashlib.sha256("café".encode()).hexdigest())
 
-    def test_provider_removes_unbound_url_parts(self):
-        """Keep the endpoint identity and discard user info, query and fragment."""
+    def test_structured_client_sends_effective_generation_defaults(self):
+        """Check the structured request settings at the transport boundary."""
+        client = LLMClient("https://example.test/v1")
+        schema = {"type": "object"}
+        messages = [{"role": "user", "content": "request"}]
+        reply = {"choices": [{"message": {"content": "{}"}}]}
+        with (patch("llm_client.DEFAULT_CHAT_TEMPERATURE", 0.25, create=True),
+              patch("llm_client.DEFAULT_CHAT_SEED", 42, create=True),
+              patch.object(client, "_post", return_value=reply) as post):
+            self.assertEqual(client.chat_json("model", messages, schema, "test_schema"), {})
+        post.assert_called_once_with("/chat/completions", {
+            "model": "model", "messages": messages, "temperature": 0.25, "seed": 42, "stream": False,
+            "response_format": {"type": "json_schema",
+                                "json_schema": {"name": "test_schema", "strict": False, "schema": schema}},
+        })
+
+    def test_provider_strips_userinfo(self):
+        """Keep the endpoint identity while stripping userinfo."""
         self.assertEqual(provider_id(None), "")
         self.assertEqual(provider_id(""), "")
-        self.assertEqual(provider_id("https://u:p@Example.test:123/v1//?key=hidden#fragment"),
+        self.assertEqual(provider_id("https://u:p@Example.test:123/v1//"),
                          "https://example.test:123/v1")
         self.assertEqual(provider_id("http://[::1]:8000/"), "http://[::1]:8000")
+
+    def test_invalid_provider_urls_are_redacted(self):
+        """Refuse queries, fragments and scheme-less endpoints without leaking userinfo."""
+        urls = (("https:", "?x=1"), (" https:", "?x=1"), ("https:", "#x"), ("", ""), ("https:", "?"))
+        for prefix, suffix in urls:
+            with self.subTest(prefix=prefix, suffix=suffix):
+                url = f"{prefix}//fixture-user:fixture-pass@example.test/v1{suffix}"
+                with self.assertRaisesRegex(ValueError, "example.test/v1") as error:
+                    provider_id(url)
+                self.assertNotIn("fixture-user", str(error.exception))
+                self.assertNotIn("fixture-pass", str(error.exception))
+
+    def test_torn_tsv_tail_is_separated(self):
+        """Preserve a partial row and start the next record on a new line."""
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "rows.tsv"
+            original = b"id\tfp\ntorn"
+            path.write_bytes(original)
+            handle, writer = open_fingerprinted_tsv(path, ["id", "fp"], "fp")
+            with handle:
+                writer.writerow({"id": "next", "fp": "valid"})
+            self.assertEqual(path.read_bytes(), original + b"\nnext\tvalid\n")
+
+    def test_migration_works_without_hard_links(self):
+        """Archive legacy data on a filesystem without hard-link support."""
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "rows.tsv"
+            original = b"id\nold\n"
+            path.write_bytes(original)
+            with patch("os.link", side_effect=OSError("hard links unsupported")):
+                handle, _ = open_fingerprinted_tsv(path, ["id", "fp"], "fp")
+                handle.close()
+            self.assertEqual(path.with_name("rows.legacy-1.tsv").read_bytes(), original)
+            self.assertEqual(path.read_bytes(), b"id\tfp\n")
+
+    def test_stale_migrator_retains_completed_migration(self):
+        """Detect a migration completed since the legacy header was read."""
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "rows.tsv"
+            archive = path.with_name("rows.legacy-1.tsv")
+            original = b"id\nlegacy\n"
+            current = b"id\tfp\ncurrent\tvalue\n"
+            path.write_bytes(original)
+            migrate = input_identity._archive_legacy_tsv
+
+            def race(*args):
+                """Simulate another writer completing the migration first."""
+                archive.write_bytes(original)
+                path.write_bytes(current)
+                return migrate(*args)
+
+            with (patch.object(input_identity, "_archive_legacy_tsv", side_effect=race),
+                  self.assertRaisesRegex(ValueError, r"rows\.tsv.*rows\.legacy-2\.tsv")):
+                open_fingerprinted_tsv(path, ["id", "fp"], "fp")
+            self.assertEqual(archive.read_bytes(), original)
+            self.assertEqual(path.read_bytes(), current)
+
+    def test_migration_checks_archived_header_after_replace(self):
+        """Preserve the bytes if another writer wins between checking and replacing."""
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "rows.tsv"
+            archive = path.with_name("rows.legacy-1.tsv")
+            competing_archive = path.with_name("rows.legacy-2.tsv")
+            original = b"id\nlegacy\n"
+            current = b"id\tfp\ncurrent\tvalue\n"
+            path.write_bytes(original)
+            replace = os.replace
+
+            def race(source, destination):
+                """Complete another migration just before the first replacement."""
+                competing_archive.write_bytes(original)
+                path.write_bytes(current)
+                replace(source, destination)
+
+            with (patch("os.replace", side_effect=race),
+                  self.assertRaisesRegex(ValueError, r"rows\.tsv.*rows\.legacy-1\.tsv")):
+                open_fingerprinted_tsv(path, ["id", "fp"], "fp")
+            self.assertEqual(archive.read_bytes(), current)
+            self.assertEqual(competing_archive.read_bytes(), original)
+
+    def test_rename_error_preserves_published_archive(self):
+        """Keep archived bytes when a filesystem reports an ambiguous rename outcome."""
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "rows.tsv"
+            archive = path.with_name("rows.legacy-1.tsv")
+            original = b"id\nlegacy\n"
+            path.write_bytes(original)
+            replace = os.replace
+
+            def ambiguous_result(source, destination):
+                """Move the data, then simulate an error reported after publication."""
+                replace(source, destination)
+                raise OSError("rename acknowledgement lost")
+
+            with (patch("os.replace", side_effect=ambiguous_result),
+                  self.assertRaisesRegex(OSError, r"rows\.tsv.*rows\.legacy-1\.tsv")):
+                open_fingerprinted_tsv(path, ["id", "fp"], "fp")
+            self.assertEqual(archive.read_bytes(), original)
+
+    def test_legacy_count_is_bounded(self):
+        """Reject excess legacy rows before modifying the source file."""
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "rows.tsv"
+            original = b"id\na\nb\n"
+            path.write_bytes(original)
+            with self.assertRaisesRegex(ValueError, r"rows\.tsv.*cap.*1"):
+                open_fingerprinted_tsv(path, ["id", "fp"], "fp", max_rows=1)
+            self.assertEqual(path.read_bytes(), original)
 
     def test_legacy_is_preserved_and_fresh_header_appends(self):
         """Archive the exact legacy bytes at the first free suffix and append current rows."""

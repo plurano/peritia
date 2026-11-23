@@ -21,35 +21,33 @@ import re
 import sys
 import urllib.error
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from classify import FUNCTIONS, latest_classifications
-from census import load_sources
 from candidates import AGGREGATOR_UPSTREAM_KEYS, parse_github_repo
+from census import load_sources
 from check_skills import front_matter_or_empty
-from input_identity import canonical_json, fingerprint, provider_id, text_sha256
-from llm_client import LLMClient
-from overlap import (
-    Item, cosine_similarity, load_candidates, load_embeddings, load_existing_skills,
-    normalize_name,
-)
+from classify import FUNCTIONS, latest_classifications
+from input_identity import append_separator, bounded_history, fingerprint, provider_id, resolve_base_urls, text_sha256
+from llm_client import LLMClient, structured_request_parameters
+from overlap import Item, cosine_similarity, load_candidates, load_embeddings, load_existing_skills, normalize_name
 
 DEFAULT_MODEL = os.environ.get("PERITIA_LLM_MODEL")
 DEFAULT_JUDGE_MODEL = os.environ.get("PERITIA_LLM_JUDGE_MODEL")
 DEFAULT_K = 3
 DEFAULT_TEMPERATURE = 0.7
-DEFAULT_BASE_URL = os.environ.get("PERITIA_LLM_BASE_URL")
 DEFAULT_TIMEOUT = 300.0
 MAX_SKILL_CHARS = 6000
 ATTEMPTS = 2
 GRADER_FLAGS = re.IGNORECASE
 GRADER_VERSION = f"regex-search-v1:{GRADER_FLAGS.name}"
 TRIAL_RECORD_VERSION = 2
+MAX_TRIAL_ROWS = 500_000
+RUBRIC_SCHEMA_NAME = "judge_rubric"
 
 VERDICTS_FIELDS = ["group_id", "verdict", "decided_by", "kept", "dropped", "scores", "model", "judge_model",
                    "copies", "primary_class"]
@@ -295,43 +293,93 @@ def load_groups(groups_tsv: Path) -> list[dict[str, Any]]:
     return groups
 
 
-def load_done_trials(trials_path: Path) -> dict[str, dict[str, Any]]:
-    """Index the latest versioned trial for each answer identity."""
-    done: dict[str, dict[str, Any]] = {}
+TrialSlot = tuple[str, str, str, int]
+
+
+def _slot(record: dict[str, Any]) -> TrialSlot:
+    """Identify the logical trial slot described by a record."""
+    return record["group_id"], record["member"], record["task_id"], record["trial"]
+
+
+@dataclass
+class TrialHistory:
+    """Index independently reusable answers and evaluations alongside current slot evidence."""
+
+    answers: dict[str, str] = field(default_factory=dict)
+    grades: dict[tuple[str, str, str], tuple[bool, list[str]]] = field(default_factory=dict)
+    judgments: dict[str, float] = field(default_factory=dict)
+    slots: dict[TrialSlot, dict[str, Any]] = field(default_factory=dict)
+
+    def remember(self, record: dict[str, Any]) -> None:
+        """Index a complete record for reuse within the current run."""
+        self.answers[record["answer_fp"]] = record["answer"]
+        self.grades[(record["answer_fp"], record["answer_sha256"], record["grade_fp"])] = (
+            record["pass"], record["failed_assertions"],
+        )
+        self.judgments[record["judge_fp"]] = record["rubric_score"]
+        self.slots[_slot(record)] = record
+
+
+def load_done_trials(trials_path: Path) -> TrialHistory:
+    """Read complete supported trials under a physical history cap."""
+    history = TrialHistory()
     if not trials_path.exists():
-        return done
+        return history
     legacy = 0
     with trials_path.open(encoding="utf-8") as handle:
-        for line in handle:
+        for line in bounded_history(trials_path, handle, MAX_TRIAL_ROWS):
             try:
                 record = json.loads(line)
             except json.JSONDecodeError:
                 continue
             if not isinstance(record, dict):
                 continue
-            if record.get("record_version") != TRIAL_RECORD_VERSION or not all(
-                record.get(key) for key in ("answer_fp", "grade_fp", "judge_fp")
-            ):
+            if not _supported_trial(record):
                 legacy += 1
                 continue
-            if isinstance(record["answer_fp"], str) and isinstance(record.get("answer"), str):
-                done[record["answer_fp"]] = record
+            history.remember(record)
     if legacy:
-        print(f"{legacy} legacy trial records ignored (no input fingerprint): {trials_path}", file=sys.stderr)
-    return done
+        print(f"{legacy} legacy or unsupported trial records ignored "
+              f"(expected record version {TRIAL_RECORD_VERSION} and input fingerprints): {trials_path}",
+              file=sys.stderr)
+    return history
+
+
+def _supported_trial(record: dict[str, Any]) -> bool:
+    """Require a supported version and the fields reused by the evaluator."""
+    version = record.get("record_version")
+    return (
+        isinstance(version, int) and version == TRIAL_RECORD_VERSION
+        and isinstance(record.get("answer"), str)
+        and all(isinstance(record.get(key), str) and record[key]
+                for key in ("answer_fp", "answer_sha256", "grade_fp", "judge_fp"))
+        and all(isinstance(record.get(key), str) for key in ("group_id", "member", "task_id"))
+        and isinstance(record.get("trial"), int) and not isinstance(record["trial"], bool)
+        and isinstance(record.get("pass"), bool)
+        and isinstance(record.get("failed_assertions"), list)
+        and isinstance(record.get("rubric_score"), (float, int))
+    )
 
 
 def append_trial(trials_path: Path, record: dict[str, Any]) -> None:
     """Append one trial without overwriting a partial or unterminated previous line."""
     trials_path.parent.mkdir(parents=True, exist_ok=True)
-    payload = (json.dumps(record) + "\n").encode("utf-8")
+    payload = (json.dumps(record) + "\n").encode()
     with trials_path.open("a+b") as handle:
-        if handle.tell():
-            handle.seek(-1, os.SEEK_END)
-            if handle.read(1) != b"\n":
-                payload = b"\n" + payload
-        handle.write(payload)
-        handle.flush()
+        handle.write(append_separator(handle) + payload)
+
+
+def answer_messages(skill_text: str, task_prompt: str) -> list[dict[str, str]]:
+    """Build the exact message layout used for answer generation."""
+    return [{"role": "system", "content": skill_text}, {"role": "user", "content": task_prompt}]
+
+
+def _answer_chat_shape() -> str | list[dict[str, str]]:
+    """Encode actual message layout while preserving fingerprints for existing trials."""
+    messages = answer_messages("skill", "task")
+    if any(message.keys() != {"role", "content"} for message in messages):
+        return messages
+    return ",".join(f"{message['role']}={message['content']}" for message in messages)
 
 
 class JudgeHarness:
@@ -348,13 +396,12 @@ class JudgeHarness:
         self.judge_model = judge_model
 
     def chat(self, system_prompt: str, user_prompt: str, temperature: float = DEFAULT_TEMPERATURE, seed: int = 1) -> str:
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ]
+        """Generate an answer from the skill instructions and task prompt."""
+        messages = answer_messages(system_prompt, user_prompt)
         return self.client.chat(self.model, messages, temperature=temperature, seed=seed)
 
     def judge(self, prompt: str) -> float:
+        """Request an advisory rubric score with bounded retries."""
         messages = [
             {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
@@ -362,7 +409,7 @@ class JudgeHarness:
         for _ in range(ATTEMPTS):
             try:
                 content = self.client.chat_json(
-                    self.judge_model, messages, schema=judge_schema(), schema_name="judge_rubric"
+                    self.judge_model, messages, schema=judge_schema(), schema_name=RUBRIC_SCHEMA_NAME
                 )
                 if isinstance(content, dict) and "score" in content:
                     score = float(content["score"])
@@ -459,7 +506,7 @@ def answer_fingerprint(
         "provider": provider,
         "temperature": temperature,
         "seed": seed,
-        "chat_shape": "system=skill,user=task",
+        "chat_shape": _answer_chat_shape(),
     })
 
 
@@ -477,7 +524,7 @@ class TrialRunner:
     """Resume or evaluate trials against the inputs for this run."""
 
     path: Path
-    done: dict[str, dict[str, Any]]
+    history: TrialHistory
     chat: Callable[[str, str, float, int], str]
     judge: Callable[[str], float]
     model: str
@@ -494,26 +541,34 @@ class TrialRunner:
             "provider": self.provider,
             "judge_system_prompt_sha256": text_sha256(JUDGE_SYSTEM_PROMPT),
             "judge_prompt_sha256": text_sha256(prompt),
-            "judge_schema_sha256": text_sha256(canonical_json(judge_schema())),
+            "request": structured_request_parameters(judge_schema(), RUBRIC_SCHEMA_NAME),
         })
 
     def evaluate(self, group_id: str, member: str, skill_text: str, task: Task, seed: int) -> dict[str, Any]:
         """Reuse the matching answer and refresh only grades with changed inputs."""
         answer_fp = answer_fingerprint(skill_text, task.prompt, self.model, self.provider, self.temperature, seed)
-        cached = self.done.get(answer_fp, {})
-        answer = cached["answer"] if cached else self.chat(skill_text, task.prompt, self.temperature, seed)
+        current = self.history.slots.get((group_id, member, task.id, seed), {})
+        if current.get("answer_fp") == answer_fp:
+            answer = current["answer"]
+        else:
+            answer = self.history.answers.get(answer_fp)
+            if answer is None:
+                answer = self.chat(skill_text, task.prompt, self.temperature, seed)
         answer_hash = text_sha256(answer)
         grade_fp = _grade_fingerprint(task)
         prompt = make_judge_prompt(task.prompt, task.rubric, answer)
         judge_fp = self.judge_fingerprint(answer_fp, answer_hash, prompt)
-
-        regrade = cached.get("grade_fp") != grade_fp or cached.get("answer_sha256") != answer_hash
-        rejudge = cached.get("judge_fp") != judge_fp
-        if regrade:
-            passed, failed = grade_answer(answer, task.must_match, task.must_not_match)
-        else:
-            passed, failed = cached["pass"], cached["failed_assertions"]
-        score = self.judge(prompt) if rejudge else cached["rubric_score"]
+        if (current.get("answer_fp"), current.get("answer_sha256"), current.get("grade_fp"), current.get("judge_fp")) == (
+            answer_fp, answer_hash, grade_fp, judge_fp,
+        ):
+            return current
+        grade = self.history.grades.get((answer_fp, answer_hash, grade_fp))
+        if grade is None:
+            grade = grade_answer(answer, task.must_match, task.must_not_match)
+        passed, failed = grade
+        score = self.history.judgments.get(judge_fp)
+        if score is None:
+            score = self.judge(prompt)
         record = {
             "group_id": group_id, "member": member, "task_id": task.id,
             "trial": seed, "seed": seed, "answer_length": len(answer),
@@ -523,9 +578,8 @@ class TrialRunner:
             "answer_sha256": answer_hash, "answer_fp": answer_fp, "grade_fp": grade_fp,
             "judge_fp": judge_fp, "provider": self.provider, "temperature": self.temperature,
         }
-        if regrade or rejudge:
-            append_trial(self.path, record)
-            self.done[answer_fp] = record
+        append_trial(self.path, record)
+        self.history.remember(record)
         return record
 
 
@@ -613,7 +667,7 @@ def run(
     judge_fn: Callable[[str], float] | None = None,
     model: str | None = DEFAULT_MODEL,
     judge_model: str | None = DEFAULT_JUDGE_MODEL,
-    base_url: str | None = DEFAULT_BASE_URL,
+    base_url: str | None = None,
     timeout: float = DEFAULT_TIMEOUT,
     k: int = DEFAULT_K,
     temperature: float = DEFAULT_TEMPERATURE,
@@ -622,10 +676,12 @@ def run(
     sources_path: Path = DEFAULT_SOURCES,
     embed_model: str | None = None,
     embed_dims: int | None = None,
+    embed_base_url: str | None = None,
 ) -> list[dict[str, Any]]:
     """Evaluate groups and write their verdicts and newly computed trials."""
     if k < 1:
         raise ValueError("k must be positive")
+    base_url, embed_base_url = resolve_base_urls(base_url, embed_base_url)
     groups = load_groups(groups_tsv)
     if limit is not None:
         groups = groups[:limit]
@@ -639,11 +695,10 @@ def run(
     candidates = load_candidates(candidates_tsv, checkouts) if candidates_tsv is not None else []
     items = {item.item_id: item for item in candidates + load_existing_skills(skills_dir)}
 
-    if chat_fn is None or judge_fn is None:
-        base_url = base_url or os.environ.get("PERITIA_LLM_BASE_URL")
     provider = provider_id(base_url)
     embeddings = load_embeddings(cache_path, list(items.values()),
-                                 embed_model or os.environ.get("PERITIA_LLM_EMBED_MODEL", ""), provider, embed_dims)
+                                 embed_model or os.environ.get("PERITIA_LLM_EMBED_MODEL", ""),
+                                 embed_base_url, embed_dims)
     model_str = model or os.environ.get("PERITIA_LLM_MODEL") or ""
     judge_model_str = judge_model or os.environ.get("PERITIA_LLM_JUDGE_MODEL") or ""
     chat_fn, judge_fn = _init_callables(base_url, model_str, judge_model_str, timeout, chat_fn, judge_fn)
@@ -706,6 +761,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     run_cmd.add_argument("--cache", type=Path, default=None, help="overlap stage embedding cache")
     run_cmd.add_argument("--embed-model", default=os.environ.get("PERITIA_LLM_EMBED_MODEL"),
                          help="embedding model name (PERITIA_LLM_EMBED_MODEL)")
+    run_cmd.add_argument("--embed-base-url", help="embedding endpoint (defaults to --base-url)")
     run_cmd.add_argument("--embed-dims", type=int, help="select the embedding vector dimensions")
     run_cmd.add_argument("--sources", type=Path, default=DEFAULT_SOURCES, help="ranked source manifest")
     run_cmd.add_argument("--checkouts", type=Path, default=Path("checkouts"), help="folder of checkouts")
@@ -715,7 +771,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     run_cmd.add_argument("--trials-out", type=Path, default=Path("trials.jsonl"), help="output trials JSONL")
     run_cmd.add_argument("--model", default=DEFAULT_MODEL, help="model name for answering tasks (PERITIA_LLM_MODEL)")
     run_cmd.add_argument("--judge-model", default=DEFAULT_JUDGE_MODEL, help="model name for rubric judging (PERITIA_LLM_JUDGE_MODEL)")
-    run_cmd.add_argument("--base-url", default=DEFAULT_BASE_URL, help="OpenAI-compatible base URL (PERITIA_LLM_BASE_URL)")
+    run_cmd.add_argument("--base-url", help="OpenAI-compatible base URL (PERITIA_LLM_BASE_URL)")
     run_cmd.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="request timeout in seconds")
     run_cmd.add_argument("-k", "--k", type=int, default=DEFAULT_K, help="trials per task")
     run_cmd.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE, help="temperature for generation")
@@ -728,6 +784,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     if args.command == "run":
         if args.cache is not None and not args.embed_model:
             parser.error("--cache requires --embed-model (or set PERITIA_LLM_EMBED_MODEL)")
+        try:
+            args.base_url, args.embed_base_url = resolve_base_urls(args.base_url, args.embed_base_url)
+        except ValueError as error:
+            parser.error(str(error))
         if not args.base_url:
             parser.error("missing --base-url (or set PERITIA_LLM_BASE_URL)")
         if not args.model:
@@ -743,6 +803,17 @@ def main(argv: list[str]) -> int:
     if args.command == "summary":
         print(summary(args.verdicts))
         return 0
+    try:
+        _run_cli(args)
+    except (OSError, ValueError) as error:
+        print(f"judge-groups: {error}", file=sys.stderr)
+        return 1
+    print(summary(args.out))
+    return 0
+
+
+def _run_cli(args: argparse.Namespace) -> None:
+    """Pass parsed group and model inputs to the evaluator."""
     run(
         groups_tsv=args.groups,
         eval_tasks_json=args.eval_tasks,
@@ -755,6 +826,7 @@ def main(argv: list[str]) -> int:
         cache_path=args.cache,
         embed_model=args.embed_model,
         embed_dims=args.embed_dims,
+        embed_base_url=args.embed_base_url,
         sources_path=args.sources,
         model=args.model,
         judge_model=args.judge_model,
@@ -764,8 +836,6 @@ def main(argv: list[str]) -> int:
         temperature=args.temperature,
         limit=args.limit,
     )
-    print(summary(args.out))
-    return 0
 
 
 if __name__ == "__main__":

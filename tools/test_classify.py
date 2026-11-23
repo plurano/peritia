@@ -152,6 +152,20 @@ class RunTests(unittest.TestCase):
         self.assertEqual(self.classify(), [])
         self.assertEqual(self.out.read_bytes(), original)
 
+    def test_structured_temperature_changes_classification_identity(self):
+        """Reuse a classification until the client changes its default temperature."""
+        self.classify()
+        self.assertEqual(self.classify(), [])
+        with patch("llm_client.DEFAULT_CHAT_TEMPERATURE", 0.1, create=True):
+            self.assertEqual(self.classify(), ["x", "y"])
+            self.assertEqual(self.classify(), [])
+
+    def test_run_rejects_query_in_provider_before_inference(self):
+        """Refuse a provider URL whose query could differ from the identity."""
+        with self.assertRaisesRegex(ValueError, r"models\.invalid/v1"):
+            self.classify(provider="https://models.invalid/v1?x=1")
+        self.assertFalse(self.out.exists())
+
     def test_changed_model_asks_for_each_item(self):
         """Append current model rows and report each blob once."""
         self.classify()

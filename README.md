@@ -98,10 +98,12 @@ speaks the OpenAI-compatible chat completions and embeddings API.
 `<folder>` holds one checkout per source, named `<owner>__<name>`, at the census
 pin. The answer is constrained to the label lists by a JSON schema and checked
 again; a skill whose answer fails twice is written with status `error`, never
-guessed. Classification resume checks the latest row for
-each blob against the model, serving endpoint, classifier prompt, label schema,
-and exact text sent. A changed fingerprint appends a row. Legacy TSVs are
-archived beside the output and the run starts fresh. [Classification tests](tools/test_classify.py)
+guessed. Classification resume checks the latest row for each blob against
+the model, serving endpoint, classifier prompt, exact text sent, and effective
+structured request settings. A changed fingerprint appends a revision.
+Classification summaries and candidate selection use the same latest row for
+each blob. Oversized histories fail with the file name and row cap.
+[Classification tests](tools/test_classify.py)
 `python3 tools/classify.py summary --out classified.tsv` counts the labels and
 names the domains no skill serves.
 
@@ -131,23 +133,26 @@ adoption candidate, skills it may overlap among other candidates and skills
 already in `skills/`. It ranks the k nearest neighbours by cosine similarity
 using embeddings from an embedding model plus any item with the same normalised
 name, and lets a chat model judge per pair whether they serve the same use.
-Overlap resume checks the current skill blobs, judge model,
-serving endpoint, prompts, and schema. It appends judgments for changed inputs
-and archives legacy TSVs before starting fresh. Failed judgments are recorded as
-unjudged. Connected components over matching pairs are grouped in
-`groups.tsv`, identifying overlap-free candidates and groups containing an
-existing skill. `python3 tools/overlap.py summary --overlap overlap.tsv --groups
-groups.tsv --candidates candidates.tsv` reports counts of candidates,
-overlap-free candidates, groups, groups with an existing skill, and unjudged
-pairs. [Overlap tests](tools/test_overlap.py)
+Overlap resume checks the current skill blobs, judge model, serving endpoint,
+prompts, and effective structured request settings. It appends judgments for
+changed inputs and records failed judgments as unjudged. Each run builds
+`groups.tsv` and writes the current candidate pairs with their current cosine
+and rank to `groups.tsv.pairs.tsv`. A change to k or to the embedding space can
+drop an edge while its judgment stays in `overlap.tsv`.
+`python3 tools/overlap.py summary --overlap overlap.tsv --groups groups.tsv
+--candidates candidates.tsv` uses the current pair snapshot to count unjudged
+pairs alongside candidate and group totals. [Overlap tests](tools/test_overlap.py)
 
 The optional embedding cache is JSON with `version: 2` and `namespaces`. Each
 namespace is keyed by model, endpoint, preprocessing, and dimensions. Its
 `vectors` map stores the embedding and input text hash for each blob. Legacy
 vectors are preserved under `legacy_unbound` when saved and are ineligible for
 reuse. Select the model with `--embed-model` or `PERITIA_LLM_EMBED_MODEL` and
-the endpoint with `--base-url` or `PERITIA_LLM_BASE_URL`. Use `--embed-dims` to
-assert vector length or select between cached lengths for the same inputs.
+the embedding endpoint for overlap with `--base-url` or `PERITIA_LLM_BASE_URL`.
+Base URLs require a scheme and host and reject queries and fragments.
+Use `--embed-dims` to assert vector length or select between cached lengths.
+Invalid namespace keys or dimensions are skipped with a warning. Malformed
+vectors in a selected namespace fail with the cache path and blob ID.
 [Embedding cache tests](tools/test_overlap.py) cover reuse and migration.
 
 `python3 -B tools/judge_groups.py run --groups groups.tsv --candidates candidates.tsv
@@ -168,16 +173,46 @@ Rubric scores remain advisory and never select a verdict. `verdicts.tsv` records
 `copies` as a JSON mapping of member to `copy-of:<original>`, `primary_class`,
 `decided_by`, kept and dropped skills, and scores. Existing skills under `skills/`
 are never dropped; losing or being identified as a copy yields `replace-proposed`
-for human review. Trial resume reuses the stored answer
-when the skill text, task prompt, model, endpoint, temperature, and seed match.
-Changed assertions trigger local grading. Changed rubrics or judge inputs
-trigger model judging. Legacy trial lines stay in `trials.jsonl` and are skipped.
-The cache uses the embedding flags above, including `--embed-dims` when multiple
-lengths match. `python3 -B tools/judge_groups.py summary --verdicts verdicts.tsv` reports
-counts per verdict, kept and dropped skills, and models used.
+for human review. Trial resume reuses an answer when the skill text, task
+prompt, chat message layout, model, endpoint, temperature, and seed match.
+Changed assertions or grader versions trigger local grading. Changed rubrics
+or judge requests trigger model judging. Each group, member, task ID, and
+trial has its own record, including slots that reuse the same answer. A
+current slot is reused without another model call or append.
+Legacy and unsupported records stay in `trials.jsonl` and are skipped.
+The embedding endpoint defaults to the chat endpoint, including its
+`PERITIA_LLM_BASE_URL` fallback. Pass `--embed-base-url` when the cache was
+produced at a different endpoint and `--embed-dims` when multiple lengths match.
+`python3 -B tools/judge_groups.py summary --verdicts verdicts.tsv` reports counts
+per verdict, kept and dropped skills, and models used.
 [Trial resume tests](tools/test_judge_groups.py)
 
-`python3 -B tools/adopt_skills.py --candidates candidates.tsv --groups groups.tsv --census census.tsv --checkouts <folder> --root .` previews adoption in census order; add `--apply` to write accepted skills, upstream attribution in `REUSE.toml` and `CREDITS.md`, and rebuild `skills/INDEX.tsv`, downloading missing licence texts into `LICENSES/` with `reuse`. `--include-grouped` requires `--cache <embed-cache.json>` and the embedding model via `--embed-model` or `PERITIA_LLM_EMBED_MODEL`. Set `--base-url` to the embedding endpoint and select `--embed-dims` when multiple lengths match. Adoption reads `tools/census-sources.json` ranks to adopt group members: `judge_groups.collapse_copies` resolves copy pairs, refusing copies with reason `copy-of:<original candidate>` while surviving members run the same gates as overlap-free candidates; an original refused by a gate does not promote its copy. Without `--include-grouped`, grouped candidates wait for the group judge. `--report <path>` writes `adopt-report.tsv` there; without it no report file is written, and the repository root is refused as a report location. Each skill comes from its census pin, with its licence text and an `ORIGIN.md`; collisions receive an owner suffix. Opening code fences without an info string in Markdown files get language `text` and record that in `ORIGIN.md`. Folders exceeding 200 files or 2 MiB, symlinks, unsafe paths, missing licence text, and failures of the skill checker, repository markdown gate, or HISS gate (staging the skill alone in a temporary root with `.standards.yaml` and `.standards-baseline.json` under `praetorctl baseline --verify --all-violations`) are refused individually; markdown and HISS refusals report the failing rule IDs and file. A missing `praetorctl` binary fails the run. `skills/INDEX.tsv` lists every directory under `skills/` with columns `skill`, `source` (`owner/repo` from `ORIGIN.md` or `peritia`), `functions`, `domains` (from `--candidates` for census skills, `;`-separated, empty otherwise), and `overlap_group` (the group ID from `--groups`, empty otherwise), keeping values for existing skills not named by census inputs. Both modes print the same report and counts per primary function class; previews leave the repository and supplied checkout sparse patterns unchanged, fetching missing candidate blobs at their pin to evaluate every candidate.
+Migration: Callers that read `--cache` need `--embed-model` or its environment
+equivalent. Group judging and grouped adoption need `--embed-base-url` when
+embeddings come from a different endpoint. Cache v2 quarantines legacy vectors
+under `legacy_unbound`. Classification and overlap archive legacy TSVs as
+`*.legacy-N.tsv` and append revisions to the fingerprinted TSVs. Rerun overlap
+to produce the current pair snapshot. Trial JSONL appends v2 records and
+preserves older lines. In Python, use `load_embeddings` in place of
+`load_cache` and `latest_classifications` in place of `done_blobs`.
+`get_embeddings` takes a cache path and embedding identity, and
+`resolve_copies` takes a `CopyEmbeddingInputs` object for cache identity.
+`load_done_trials` returns a `TrialHistory` with separate reuse and slot indexes.
+
+`python3 -B tools/adopt_skills.py --candidates candidates.tsv --groups groups.tsv --census census.tsv --checkouts <folder> --root .` previews adoption in census order. Add `--apply` to write accepted skills, upstream attribution in `REUSE.toml` and `CREDITS.md`, and rebuild `skills/INDEX.tsv`, downloading missing licence texts into `LICENSES/` with `reuse`.
+
+`--include-grouped` reads a compatible namespace from `--cache` and requires
+`--embed-model` or `PERITIA_LLM_EMBED_MODEL`. Use `--embed-base-url` and
+`--embed-dims` as in group judging. If the namespace is missing or incompatible,
+populate it with `python3 tools/overlap.py run --cache <path> --embed-model <name>`
+using the embedding endpoint and dimensions. Without `--include-grouped`,
+grouped candidates wait for the group judge and adoption needs no cache or
+embedding model. Grouped adoption reads `tools/census-sources.json` ranks and
+refuses copies as `copy-of:<original candidate>`. Surviving members run the
+same checks as overlap-free candidates. An original refused by a check does
+not promote its copy.
+
+`--report <path>` writes `adopt-report.tsv` there; without it no report file is written, and the repository root is refused as a report location. Each skill comes from its census pin, with its licence text and an `ORIGIN.md`; collisions receive an owner suffix. Opening code fences without an info string in Markdown files get language `text` and record that in `ORIGIN.md`. Folders exceeding 200 files or 2 MiB, symlinks, unsafe paths, missing licence text, and failures of the skill checker, repository markdown gate, or HISS gate (staging the skill alone in a temporary root with `.standards.yaml` and `.standards-baseline.json` under `praetorctl baseline --verify --all-violations`) are refused individually; markdown and HISS refusals report the failing rule IDs and file. A missing `praetorctl` binary fails the run. `skills/INDEX.tsv` lists every directory under `skills/` with columns `skill`, `source` (`owner/repo` from `ORIGIN.md` or `peritia`), `functions`, `domains` (from `--candidates` for census skills, `;`-separated, empty otherwise), and `overlap_group` (the group ID from `--groups`, empty otherwise), keeping values for existing skills not named by census inputs. Both modes print the same report and counts per primary function class; previews leave the repository and supplied checkout sparse patterns unchanged, fetching missing candidate blobs at their pin to evaluate every candidate.
 
 ## Credits
 
