@@ -463,6 +463,39 @@ class OverlapGroupAndJudgeTests(unittest.TestCase):
             self.assertIn("groups: 1", rep)
             self.assertIn("unjudged pairs: 0", rep)  # dropped-c4 unjudged pair is ignored
 
+    def test_self_pair_excluded_from_groups(self):
+        """A same_use pair of one item with itself forms no group."""
+        item_q = overlap.Item("q", "bq", "q", "desc q")
+        item_x = overlap.Item("x", "bx", "x", "desc x")
+        item_y = overlap.Item("y", "by", "y", "desc y")
+        all_items = [item_q, item_x, item_y]
+        rows = [
+            {"a": "q", "b": "q", "same_use": "true"},
+            {"a": "x", "b": "y", "same_use": "true"},
+        ]
+        groups = overlap.build_groups(rows, all_items)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["members"], "x,y")
+        self.assertNotIn("q", groups[0]["members"].split(","))
+
+    def test_groups_ordered_by_smallest_member(self):
+        """Groups sort by their smallest member, not by the order of the rows."""
+        item_b = overlap.Item("b", "bb", "b", "desc b")
+        item_c = overlap.Item("c", "bc", "c", "desc c")
+        item_y = overlap.Item("y", "by", "y", "desc y")
+        item_z = overlap.Item("z", "bz", "z", "desc z")
+        all_items = [item_b, item_c, item_y, item_z]
+        rows = [
+            {"a": "y", "b": "z", "same_use": "true"},
+            {"a": "b", "b": "c", "same_use": "true"},
+        ]
+        groups = overlap.build_groups(rows, all_items)
+        self.assertEqual(len(groups), 2)
+        self.assertEqual(groups[0]["group_id"], "1")
+        self.assertEqual(groups[0]["members"], "b,c")
+        self.assertEqual(groups[1]["group_id"], "2")
+        self.assertEqual(groups[1]["members"], "y,z")
+
 
 class OverlapEmbeddingAndCacheTests(unittest.TestCase):
     def test_embeddings_cache_hit_makes_no_call(self):

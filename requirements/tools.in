@@ -2,3 +2,4 @@
 # SPDX-License-Identifier: EUPL-1.2
 pyyaml
 markdown-it-py
+networkx
