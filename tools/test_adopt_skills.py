@@ -12,8 +12,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import threading
-import time
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
@@ -28,7 +26,6 @@ import tomllib
 import adopt_skills as adopt
 import census
 import check_skills
-import input_identity
 import overlap
 
 REPO = Path(__file__).resolve().parent.parent
@@ -521,7 +518,7 @@ class AdoptionTests(unittest.TestCase):
         self.assertTrue((self.root / 'skills/good').exists())
 
     def test_missing_licence_text_triggers_download_through_runner(self):
-        """Download a missing licence into staging with reuse download -o before root changes."""
+        """Verify missing licence text triggers a download through the runner on apply."""
         files = {'pack/demo/SKILL.md': MD.format(name='demo'), 'pack/demo/LICENSE': 'MIT-0\n'}
         pin = self.source(files)
         row = dict(source='owner/repo', path='pack/demo/SKILL.md', skill_name='demo',
@@ -531,43 +528,24 @@ class AdoptionTests(unittest.TestCase):
 
         commands = []
         def fake_runner(cmd, *, cwd=None):
-            """Check the staged download target and write the licence text there."""
+            """Record the command and write a mock downloaded licence file into LICENSES."""
             commands.append((list(cmd), cwd))
-            self.assertEqual(cwd.parent, self.root)
-            self.assertTrue(cwd.name.startswith('.adopt-publish-'))
-            self.assertFalse((self.root / 'skills/demo').exists())
-            self.assertFalse((self.root / 'LICENSES/MIT-0.txt').exists())
-            out_path = Path(cmd[cmd.index('-o') + 1])
-            self.assertEqual(out_path, cwd / 'LICENSES/MIT-0.txt')
-            out_path.write_text('Downloaded MIT-0\n', encoding='utf-8')
+            (cwd / 'LICENSES' / f'{cmd[-1]}.txt').write_text('Downloaded MIT-0')
             return b'Downloaded'
 
         rows, _ = self.invoke(apply=True, runner=fake_runner)
         self.assertEqual(rows[0]['verdict'], 'adopted')
-        self.assertEqual(len(commands), 1)
-        cmd, stage_cwd = commands[0]
-        self.assertEqual(cmd, ['reuse', 'download', '-o', str(stage_cwd / 'LICENSES/MIT-0.txt'), 'MIT-0'])
-        self.assertFalse(stage_cwd.exists())
-        self.assertEqual([p.name for p in self.root.iterdir() if p.name.startswith('.adopt-publish-')], [])
-        self.assertEqual((self.root / 'LICENSES/MIT-0.txt').read_text(encoding='utf-8'), 'Downloaded MIT-0\n')
-        self.assertTrue((self.root / 'skills/demo').is_dir())
-        self.assertIn('demo\towner/repo\ttesting\t\t', (self.root / 'skills/INDEX.tsv').read_text(encoding='utf-8'))
-        self.assertEqual(check_skills.check(self.root), 0)
+        self.assertEqual(commands, [(['reuse', 'download', 'MIT-0'], self.root)])
+        self.assertTrue((self.root / 'LICENSES/MIT-0.txt').is_file())
 
     def test_failed_licence_download_fails_run(self):
-        """Keep existing skills, metadata, index and licences byte-identical when download fails."""
-        self.fixture()
-        self.invoke(apply=True)
-        before = snapshot(self.root)
-        self.candidates, self.census = [], []
-        pin = self.source({'pack/extra/SKILL.md': MD.format(name='extra'), 'pack/extra/LICENSE': 'MIT-0\n'},
-                          source='other/repo')
-        self.candidates.append({
-            'source': 'other/repo', 'path': 'pack/extra/SKILL.md',
-            'skill_name': 'extra', 'verdict': 'candidate', 'licence': 'MIT-0',
-            'licence_evidence': 'folder', 'functions': 'testing',
-        })
-        self.census.append({'source': 'other/repo', 'path': 'pack/extra/SKILL.md', 'pin': pin})
+        """Verify a failed licence download causes adoption to fail with ValueError."""
+        files = {'pack/demo/SKILL.md': MD.format(name='demo'), 'pack/demo/LICENSE': 'MIT-0\n'}
+        pin = self.source(files)
+        row = dict(source='owner/repo', path='pack/demo/SKILL.md', skill_name='demo',
+                   verdict='candidate', licence='MIT-0', licence_evidence='folder', functions='testing')
+        self.candidates.append(row)
+        self.census.append({'source': 'owner/repo', 'path': 'pack/demo/SKILL.md', 'pin': pin})
 
         def failing_runner(cmd, *, cwd=None):
             raise subprocess.CalledProcessError(1, cmd, stderr=b'network error')
@@ -575,169 +553,6 @@ class AdoptionTests(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             self.invoke(apply=True, runner=failing_runner)
         self.assertIn('MIT-0', str(ctx.exception))
-        self.assertIn('network error', str(ctx.exception))
-        self.assertEqual(snapshot(self.root), before)
-
-    def test_timed_out_licence_download_leaves_root_unchanged(self):
-        """Keep root byte-identical with no staging leftovers and name the deadline on timeout."""
-        self.fixture()
-        self.invoke(apply=True)
-        before = snapshot(self.root)
-        self.candidates, self.census = [], []
-        pin = self.source({'pack/extra/SKILL.md': MD.format(name='extra'), 'pack/extra/LICENSE': 'MIT-0\n'},
-                          source='other/repo')
-        self.candidates.append({
-            'source': 'other/repo', 'path': 'pack/extra/SKILL.md',
-            'skill_name': 'extra', 'verdict': 'candidate', 'licence': 'MIT-0',
-            'licence_evidence': 'folder', 'functions': 'testing',
-        })
-        self.census.append({'source': 'other/repo', 'path': 'pack/extra/SKILL.md', 'pin': pin})
-
-        def timeout_runner(cmd, *, cwd=None):
-            """Simulate a timed-out licence download."""
-            raise subprocess.TimeoutExpired(cmd, adopt.TIMEOUT)
-
-        with self.assertRaises(ValueError) as ctx:
-            self.invoke(apply=True, runner=timeout_runner)
-        self.assertIn('MIT-0', str(ctx.exception))
-        self.assertIn(f'{adopt.TIMEOUT} seconds', str(ctx.exception))
-        self.assertEqual(snapshot(self.root), before)
-
-    def test_present_licence_skips_download_and_writes_index(self):
-        """Skip downloads when LICENSES already holds the text or no licence is missing."""
-        (self.root / 'LICENSES').mkdir()
-        (self.root / 'LICENSES/MIT.txt').write_text('Existing MIT text\n', encoding='utf-8')
-        self.fixture()
-
-        def unexpected_runner(cmd, *, cwd=None):
-            """Fail if a download is attempted for a licence already present."""
-            self.fail(f'unexpected download runner call: {cmd}')
-
-        rows, _ = self.invoke(apply=True, runner=unexpected_runner)
-        self.assertEqual(rows[0]['verdict'], 'adopted')
-        self.assertEqual((self.root / 'LICENSES/MIT.txt').read_text(encoding='utf-8'), 'Existing MIT text\n')
-        self.assertIn('demo\towner/repo\ttesting;coding\t\t',
-                      (self.root / 'skills/INDEX.tsv').read_text(encoding='utf-8'))
-        (self.root / 'skills/INDEX.tsv').unlink()
-        adopt.publish(self.root, self.base, [], 'version = 1\n', '# Credits\n', runner=unexpected_runner)
-        self.assertIn('demo\towner/repo\t\t\t', (self.root / 'skills/INDEX.tsv').read_text(encoding='utf-8'))
-        self.assertEqual([p.name for p in self.root.iterdir() if p.name.startswith('.adopt-publish-')], [])
-
-    def test_default_download_runner_enforces_deadline_and_maps_errors(self):
-        """Pass TIMEOUT to the command runner and map non-zero exit or timeout to ValueError."""
-        cmd = ['reuse', 'download', '-o', str(self.base / 'MIT-0.txt'), 'MIT-0']
-        ok = subprocess.CompletedProcess(cmd, 0, stdout=b'ok', stderr=b'')
-        with patch.object(adopt.subprocess, 'run', return_value=ok) as mocked:
-            self.assertEqual(adopt.default_download_runner(cmd, cwd=self.root), b'ok')
-        self.assertEqual(mocked.call_args.kwargs['timeout'], adopt.TIMEOUT)
-        self.assertEqual(mocked.call_args.kwargs['cwd'], self.root)
-
-        bad = subprocess.CompletedProcess(cmd, 1, stdout=b'', stderr=b'bad spdx identifier\n')
-        with (patch.object(adopt.subprocess, 'run', return_value=bad),
-              self.assertRaisesRegex(ValueError, r'licence download failed for MIT-0: bad spdx identifier')):
-            adopt.default_download_runner(cmd, cwd=self.root)
-
-        expired = subprocess.TimeoutExpired(cmd, adopt.TIMEOUT)
-        timed_out = rf'licence download failed for MIT-0: timed out after {adopt.TIMEOUT} seconds'
-        with (patch.object(adopt.subprocess, 'run', side_effect=expired),
-              self.assertRaisesRegex(ValueError, timed_out)):
-            adopt.default_download_runner(cmd, cwd=self.root)
-
-    def _two_mit0_candidates(self):
-        """Populate two MIT-0 candidates and return a deterministic download runner and call log."""
-        pin = self.source({
-            'pack/first/SKILL.md': MD.format(name='first'), 'pack/first/LICENSE': 'MIT-0\n',
-            'pack/second/SKILL.md': MD.format(name='second'), 'pack/second/LICENSE': 'MIT-0\n',
-        })
-        for name, dom in (('first', 'science'), ('second', 'dev')):
-            self.candidates.append({
-                'source': 'owner/repo', 'path': f'pack/{name}/SKILL.md',
-                'skill_name': name, 'verdict': 'candidate', 'licence': 'MIT-0',
-                'licence_evidence': 'folder', 'functions': 'testing', 'domains': dom,
-            })
-            self.census.append({'source': 'owner/repo', 'path': f'pack/{name}/SKILL.md', 'pin': pin})
-        downloads = []
-
-        def fake_runner(cmd, *, cwd=None):
-            """Write a deterministic licence file into the staged output target."""
-            self.assertIsNotNone(cwd)
-            downloads.append(list(cmd))
-            Path(cmd[cmd.index('-o') + 1]).write_text('MIT-0 text\n', encoding='utf-8')
-            return b'ok'
-
-        return fake_runner, downloads
-
-    def test_crash_between_publish_renames_and_next_apply_repairs(self):
-        """Roll back root byte-identical on a mid-publish failure and retry both accepted and withdrawn."""
-        fake_runner, downloads = self._two_mit0_candidates()
-        (self.root / '.adopt-skills.lock').touch()
-        before_empty = snapshot(self.root)
-        real_replace = os.replace
-
-        def fail_second_skill(src, dst):
-            """Fail right after installing the first skill directory."""
-            if Path(dst) == self.root / 'skills/second':
-                raise OSError('simulated crash between skill renames')
-            real_replace(src, dst)
-
-        with (patch.object(adopt.os, 'replace', side_effect=fail_second_skill),
-              self.assertRaisesRegex(OSError, 'simulated crash between skill renames')):
-            self.invoke(apply=True, runner=fake_runner)
-        self.assertEqual(snapshot(self.root), before_empty)
-        self.assertEqual(len(downloads), 1)
-
-        def refuse_second(_root, _staging, skill):
-            """Simulate withdrawing or refusing the second skill on retry."""
-            if skill.name == 'second':
-                raise adopt.Refused('markdown: withdrawn')
-
-        rows_withdrawn, _ = self.invoke(apply=True, runner=fake_runner, gate=refuse_second)
-        self.assertEqual([r['verdict'] for r in rows_withdrawn], ['adopted', 'refused'])
-        self.assertEqual(len(downloads), 2)
-        self.assertEqual(check_skills.check(self.root), 0)
-        for rel in ('REUSE.toml', 'CREDITS.md', 'skills/INDEX.tsv'):
-            self.assertNotIn('second', (self.root / rel).read_text(encoding='utf-8'))
-
-        rows_accepted, _ = self.invoke(apply=True, runner=fake_runner)
-        self.assertEqual([r['verdict'] for r in rows_accepted], ['present', 'adopted'])
-        self.assertEqual(len(downloads), 2)
-        self.assertEqual(check_skills.check(self.root), 0)
-        index_lines = (self.root / 'skills/INDEX.tsv').read_text(encoding='utf-8').splitlines()
-        self.assertIn('first\towner/repo\ttesting\tscience\t', index_lines)
-        self.assertIn('second\towner/repo\ttesting\tdev\t', index_lines)
-
-    def test_crash_rollback_restores_populated_root_byte_identical(self):
-        """Restore pre-existing metadata, index and skills byte-identical when a later batch fails mid-commit."""
-        fake_runner, _ = self._two_mit0_candidates()
-        self.candidates = [self.candidates[0]]
-        self.census = [self.census[0]]
-        self.invoke(apply=True, runner=fake_runner)
-        before_populated = snapshot(self.root)
-
-        pin_extra = self.source({
-            'pack/two/SKILL.md': MD.format(name='two'), 'pack/two/LICENSE': 'MIT-0\n',
-            'pack/three/SKILL.md': MD.format(name='three'), 'pack/three/LICENSE': 'MIT-0\n',
-        }, source='other/repo')
-        for name in ('two', 'three'):
-            self.candidates.append({
-                'source': 'other/repo', 'path': f'pack/{name}/SKILL.md',
-                'skill_name': name, 'verdict': 'candidate', 'licence': 'MIT-0',
-                'licence_evidence': 'folder', 'functions': 'testing', 'domains': 'ops',
-            })
-            self.census.append({'source': 'other/repo', 'path': f'pack/{name}/SKILL.md', 'pin': pin_extra})
-
-        real_replace = os.replace
-
-        def fail_three(src, dst):
-            """Fail on the final rename after overwriting metadata and installing skill two."""
-            if Path(dst) == self.root / 'skills/three':
-                raise OSError('simulated crash on three')
-            real_replace(src, dst)
-
-        with (patch.object(adopt.os, 'replace', side_effect=fail_three),
-              self.assertRaisesRegex(OSError, 'simulated crash on three')):
-            self.invoke(apply=True, runner=fake_runner)
-        self.assertEqual(snapshot(self.root), before_populated)
 
     def test_report_path_written_and_root_refused(self):
         self.fixture()
@@ -1328,142 +1143,6 @@ class AdoptionTests(unittest.TestCase):
         self.assertEqual(adopt._pinned_member_text(self.base / 'absent', pin, 'pack/cap/SKILL.md'), '')
         self.assertEqual(adopt._pinned_member_text(checkout, '', 'pack/cap/SKILL.md'), '')
 
-    def test_silent_missing_licence_file_raises_and_leaves_root_unchanged(self):
-        """Fail before touching root when the download runner exits cleanly without writing LICENSES/<id>.txt."""
-        (self.root / 'LICENSES').mkdir()
-        (self.root / 'LICENSES/MIT.txt').write_text('Existing MIT\n', encoding='utf-8')
-        self.fixture()
-        self.invoke(apply=True)
-        before = snapshot(self.root)
-
-        self.candidates, self.census = [], []
-        pin = self.source({'pack/extra/SKILL.md': MD.format(name='extra'), 'pack/extra/LICENSE': 'MIT-0\n'},
-                          source='other/repo')
-        self.candidates.append({
-            'source': 'other/repo', 'path': 'pack/extra/SKILL.md',
-            'skill_name': 'extra', 'verdict': 'candidate', 'licence': 'MIT-0',
-            'licence_evidence': 'folder', 'functions': 'testing',
-        })
-        self.census.append({'source': 'other/repo', 'path': 'pack/extra/SKILL.md', 'pin': pin})
-
-        def silent_noop_runner(_cmd, *, cwd=None):
-            """Return without creating the requested output file."""
-            self.assertTrue(cwd.is_dir())
-            return b'ok'
-
-        with self.assertRaisesRegex(ValueError, r'licence download failed for MIT-0: MIT-0\.txt not written'):
-            self.invoke(apply=True, runner=silent_noop_runner)
-        self.assertEqual(snapshot(self.root), before)
-
-        direct_root = self.base / 'direct-root'
-        direct_root.mkdir()
-        direct_before = snapshot(direct_root)
-        reuse_doc = 'version = 1\n\n[[annotations]]\npath = ["skills/x/**"]\nSPDX-FileCopyrightText = "2025 x"\nSPDX-License-Identifier = "MIT-0"\n'
-        with self.assertRaisesRegex(ValueError, r'licence download failed for MIT-0: MIT-0\.txt not written'):
-            adopt.sync_licences(direct_root, reuse_doc, runner=silent_noop_runner)
-        self.assertEqual(snapshot(direct_root), direct_before)
-
-    def _concurrent_apply_fixtures(self):
-        """Prepare two independent single-skill apply inputs sharing self.root."""
-        (self.root / 'LICENSES').mkdir()
-        (self.root / 'LICENSES/MIT.txt').write_text(LICENCE, encoding='utf-8')
-        pin1 = self.source({'pack/first/SKILL.md': MD.format(name='first'), 'pack/first/LICENSE': LICENCE},
-                           source='owner/first')
-        pin2 = self.source({'pack/second/SKILL.md': MD.format(name='second'), 'pack/second/LICENSE': LICENCE},
-                           source='other/second')
-        groups = self.base / 'concurrent-groups.tsv'
-        tsv(groups, ['members'], [])
-        paths = {}
-        for idx, (name, repo, pin) in enumerate((('first', 'owner/first', pin1), ('second', 'other/second', pin2)), 1):
-            cand_path = self.base / f'cand-{idx}.tsv'
-            cen_path = self.base / f'cen-{idx}.tsv'
-            tsv(cand_path, CANDIDATE_FIELDS, [{
-                'source': repo, 'path': f'pack/{name}/SKILL.md', 'skill_name': name,
-                'verdict': 'candidate', 'licence': 'MIT', 'licence_evidence': 'folder', 'functions': 'testing',
-            }])
-            tsv(cen_path, ['source', 'path', 'pin'], [{'source': repo, 'path': f'pack/{name}/SKILL.md', 'pin': pin}])
-            paths[name] = (cand_path, cen_path)
-        return groups, paths
-
-    def test_concurrent_applies_serialize_under_output_lock(self):
-        """Serialize overlapping --apply runs so the second builds upon the first's metadata and index."""
-        groups, paths = self._concurrent_apply_fixtures()
-        t1_in_gate, release_t1, t2_past_inputs = threading.Event(), threading.Event(), threading.Event()
-        real_inputs = adopt.inputs
-        errors = []
-
-        def gate_t1(_root, _staging, _skill):
-            """Hold the first apply mid-run while the second apply attempts to acquire the lock."""
-            t1_in_gate.set()
-            self.assertTrue(release_t1.wait(timeout=5.0))
-
-        def tracked_inputs(cand_file, group_file, cen_file):
-            """Signal when the second apply reaches the lock acquisition boundary."""
-            parsed = real_inputs(cand_file, group_file, cen_file)
-            if cand_file == paths['second'][0]:
-                t2_past_inputs.set()
-            return parsed
-
-        def worker(name, gate_fn):
-            """Run one apply worker and record any unexpected failure."""
-            try:
-                cand_file, cen_file = paths[name]
-                adopt.run(cand_file, groups, cen_file, self.checkouts, self.root, apply=True,
-                          gate=gate_fn, hiss_gate=passing_gate)
-            except (OSError, ValueError, RuntimeError) as exc:
-                errors.append(exc)
-
-        with patch.object(adopt, 'inputs', side_effect=tracked_inputs):
-            first_thread = threading.Thread(target=worker, args=('first', gate_t1))
-            second_thread = threading.Thread(target=worker, args=('second', passing_gate))
-            first_thread.start()
-            self.assertTrue(t1_in_gate.wait(timeout=5.0))
-            second_thread.start()
-            self.assertTrue(t2_past_inputs.wait(timeout=5.0))
-            time.sleep(0.05)
-            release_t1.set()
-            first_thread.join(timeout=5.0)
-            second_thread.join(timeout=5.0)
-
-        self.assertEqual(errors, [])
-        self.assertTrue((self.root / '.adopt-skills.lock').is_file())
-        self.assertEqual(check_skills.check(self.root), 0)
-        for name in ('first', 'second'):
-            self.assertTrue((self.root / 'skills' / name).is_dir())
-            self.assertIn(f'skills/{name}/**', (self.root / 'REUSE.toml').read_text(encoding='utf-8'))
-            self.assertIn(f'`{name}`', (self.root / 'CREDITS.md').read_text(encoding='utf-8'))
-            self.assertIn(f'{name}\t', (self.root / 'skills/INDEX.tsv').read_text(encoding='utf-8'))
-
-    def test_apply_lock_timeout_and_preview_without_lock(self):
-        """Allow preview while locked elsewhere, fail --apply on lock timeout leaving root unchanged, and ignore lock in Git."""
-        (self.root / 'LICENSES').mkdir()
-        (self.root / 'LICENSES/MIT.txt').write_text(LICENCE, encoding='utf-8')
-        self.fixture()
-        with input_identity.output_lock(self.root / '.adopt-skills'):
-            before = snapshot(self.root)
-            preview_rows, _ = self.invoke(apply=False)
-            self.assertEqual(preview_rows[0]['verdict'], 'adopted')
-            self.assertEqual(snapshot(self.root), before)
-
-            with (patch.object(input_identity, 'LOCK_WAIT_SECONDS', 0.02),
-                  patch.object(input_identity, 'LOCK_POLL_SECONDS', 0.005)):
-                with self.assertRaisesRegex(TimeoutError, r'\.adopt-skills\.lock.*timed out'):
-                    self.invoke(apply=True)
-                self.assertEqual(snapshot(self.root), before)
-
-                stderr = io.StringIO()
-                argv = ['--candidates', str(self.base / 'candidates.tsv'),
-                        '--groups', str(self.base / 'groups.tsv'),
-                        '--census', str(self.base / 'census.tsv'),
-                        '--checkouts', str(self.checkouts), '--root', str(self.root), '--apply']
-                with redirect_stderr(stderr):
-                    rc = adopt.main(argv)
-                self.assertEqual(rc, 1)
-                self.assertIn('.adopt-skills.lock', stderr.getvalue())
-                self.assertEqual(snapshot(self.root), before)
-
-        adopt.command(['git', 'check-ignore', '-q', '.adopt-skills.lock'], cwd=REPO)
-
     def test_adopted_member_fallback_confines_to_skills_dir(self):
         """Refuse fallback SKILL.md paths resolving outside skills_dir while keeping in-tree copies."""
         skills = self.root / 'skills'
@@ -1526,48 +1205,6 @@ class AdoptionTests(unittest.TestCase):
         census_path = self.base / 'census.tsv'
         tsv(census_path, ['source', 'path', 'pin'], self.census)
         return census_path
-
-    def test_hard_kill_between_publish_renames_measured(self):
-        """Measure uncatchable process exit mid-publish and what subsequent --apply runs do."""
-        if not hasattr(os, 'fork'):
-            self.skipTest('os.fork unavailable')
-        fake_runner, _ = self._two_mit0_candidates()
-        real_replace = os.replace
-        pid = os.fork()
-        if pid == 0:
-            def kill_on_second(src, dst):
-                """Exit immediately without running Python cleanup handlers."""
-                if Path(dst) == self.root / 'skills/second':
-                    os._exit(99)
-                real_replace(src, dst)
-
-            with patch.object(adopt.os, 'replace', side_effect=kill_on_second):
-                self.invoke(apply=True, runner=fake_runner)
-            os._exit(0)
-        _, status = os.waitpid(pid, 0)
-        self.assertTrue(os.WIFEXITED(status) and os.WEXITSTATUS(status) == 99)
-
-        leftovers = [p.name for p in self.root.iterdir() if p.name.startswith('.adopt-publish-')]
-        self.assertEqual(len(leftovers), 1)
-        self.assertTrue((self.root / 'LICENSES/MIT-0.txt').is_file())
-        self.assertTrue((self.root / 'skills/first').is_dir())
-        self.assertFalse((self.root / 'skills/second').exists())
-        self.assertEqual(check_skills.index_problems(self.root), ['skills/INDEX.tsv: extra row for second'])
-
-        root_withdrawn = self.base / 'root-withdrawn'
-        shutil.copytree(self.root, root_withdrawn)
-        rows_accept, _ = self.invoke(apply=True, runner=fake_runner)
-        self.assertEqual([r['verdict'] for r in rows_accept], ['present', 'adopted'])
-        self.assertEqual(check_skills.check(self.root), 0)
-
-        tsv(self.base / 'cand-one.tsv', [*CANDIDATE_FIELDS, 'domains'], [self.candidates[0]])
-        rows_withdraw, _ = adopt.run(self.base / 'cand-one.tsv', self.base / 'groups.tsv',
-                                     self.base / 'census.tsv', self.checkouts, root_withdrawn,
-                                     apply=True, gate=passing_gate, hiss_gate=passing_gate, runner=fake_runner)
-        self.assertEqual([r['verdict'] for r in rows_withdraw], ['present'])
-        self.assertEqual(check_skills.check(root_withdrawn), 0)
-        self.assertIn('skills/second/**', (root_withdrawn / 'REUSE.toml').read_text(encoding='utf-8'))
-        self.assertIn('`second`', (root_withdrawn / 'CREDITS.md').read_text(encoding='utf-8'))
 
     def test_missing_vectors_stderr_mentions_working_tree_restore_hint(self):
         """Print the working-tree checkout hint and verify it restores only the named sparse path."""
