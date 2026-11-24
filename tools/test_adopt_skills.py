@@ -7,13 +7,20 @@ import csv
 import hashlib
 import json
 import math
+import os
 import shutil
 import subprocess
+import sys
 import tempfile
-import tomllib
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+
+# isort: split
+# Codacy's Ruff sorts tomllib without the py311 target.
+import tomllib
+
+# isort: split
 
 import adopt_skills as adopt
 import census
@@ -44,6 +51,11 @@ def passing_gate(root, staging, skill):
 
 class AdoptionTests(unittest.TestCase):
     def setUp(self):
+        """Prepare an isolated temporary worktree and synthetic source repositories."""
+        clean_env = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
+        clean_env['GIT_CONFIG_GLOBAL'] = os.devnull
+        clean_env['GIT_CONFIG_NOSYSTEM'] = '1'
+        self.enterContext(patch.dict(os.environ, clean_env, clear=True))
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name)
@@ -197,6 +209,7 @@ class AdoptionTests(unittest.TestCase):
         self.assertEqual(dry, self.invoke())
 
     def test_default_cli_is_dry_run(self):
+        """Run the CLI with the test interpreter and verify dry-run leaves files alone."""
         self.fixture()
         self.invoke(apply=False)
         argv = [str(REPO / 'tools/adopt_skills.py'), '--candidates', str(self.base / 'candidates.tsv'),
@@ -204,7 +217,7 @@ class AdoptionTests(unittest.TestCase):
                 '--checkouts', str(self.checkouts), '--root', str(self.root)]
         before = snapshot(self.root)
         # The absent markdown gate refuses this fixture, but still produces a report without writes.
-        output = adopt.command(['python3', '-B', *argv]).decode()
+        output = adopt.command([sys.executable, '-B', *argv]).decode()
         self.assertIn('candidate\tverdict\tdirectory\treason', output)
         self.assertEqual(snapshot(self.root), before)
 
@@ -449,38 +462,523 @@ class AdoptionTests(unittest.TestCase):
         self.assertTrue((self.root / 'skills/good').exists())
 
     def test_missing_licence_text_triggers_download_through_runner(self):
+        """Download a missing licence into staging with reuse download -o before root changes."""
         files = {'pack/demo/SKILL.md': MD.format(name='demo'), 'pack/demo/LICENSE': 'MIT-0\n'}
         pin = self.source(files)
-        row = dict(source='owner/repo', path='pack/demo/SKILL.md', skill_name='demo',
-                   verdict='candidate', licence='MIT-0', licence_evidence='folder', functions='testing')
+        row = {
+            'source': 'owner/repo', 'path': 'pack/demo/SKILL.md', 'skill_name': 'demo',
+            'verdict': 'candidate', 'licence': 'MIT-0', 'licence_evidence': 'folder', 'functions': 'testing',
+        }
         self.candidates.append(row)
         self.census.append({'source': 'owner/repo', 'path': 'pack/demo/SKILL.md', 'pin': pin})
 
         commands = []
+
         def fake_runner(cmd, *, cwd=None):
+            """Check the staged download target and write the licence text there."""
             commands.append((list(cmd), cwd))
-            (cwd / 'LICENSES' / f'{cmd[-1]}.txt').write_text('Downloaded MIT-0')
+            self.assertEqual(cwd.parent, self.root)
+            self.assertTrue(cwd.name.startswith('.adopt-publish-'))
+            self.assertFalse((self.root / 'skills/demo').exists())
+            self.assertFalse((self.root / 'LICENSES/MIT-0.txt').exists())
+            out_path = Path(cmd[cmd.index('-o') + 1])
+            self.assertEqual(out_path, cwd / 'LICENSES/MIT-0.txt')
+            out_path.write_text('Downloaded MIT-0\n', encoding='utf-8')
             return b'Downloaded'
 
         rows, _ = self.invoke(apply=True, runner=fake_runner)
         self.assertEqual(rows[0]['verdict'], 'adopted')
-        self.assertEqual(commands, [(['reuse', 'download', 'MIT-0'], self.root)])
-        self.assertTrue((self.root / 'LICENSES/MIT-0.txt').is_file())
+        self.assertEqual(len(commands), 1)
+        cmd, stage_cwd = commands[0]
+        self.assertEqual(cmd, ['reuse', 'download', '-o', str(stage_cwd / 'LICENSES/MIT-0.txt'), 'MIT-0'])
+        self.assertFalse(stage_cwd.exists())
+        self.assertEqual([p.name for p in self.root.iterdir() if p.name.startswith('.adopt-publish')], [])
+        self.assertEqual((self.root / 'LICENSES/MIT-0.txt').read_text(encoding='utf-8'), 'Downloaded MIT-0\n')
+        self.assertTrue((self.root / 'skills/demo').is_dir())
+        self.assertIn('demo\towner/repo\ttesting\t\t', (self.root / 'skills/INDEX.tsv').read_text(encoding='utf-8'))
+        self.assertEqual(check_skills.check(self.root), 0)
 
     def test_failed_licence_download_fails_run(self):
-        files = {'pack/demo/SKILL.md': MD.format(name='demo'), 'pack/demo/LICENSE': 'MIT-0\n'}
-        pin = self.source(files)
-        row = dict(source='owner/repo', path='pack/demo/SKILL.md', skill_name='demo',
-                   verdict='candidate', licence='MIT-0', licence_evidence='folder', functions='testing')
-        self.candidates.append(row)
-        self.census.append({'source': 'owner/repo', 'path': 'pack/demo/SKILL.md', 'pin': pin})
+        """Keep existing skills, metadata, index and licences byte-identical when download fails."""
+        (self.root / 'LICENSES').mkdir()
+        (self.root / 'LICENSES/MIT.txt').write_text(LICENCE, encoding='utf-8')
+        self.fixture()
+        self.invoke(apply=True)
+        before = snapshot(self.root)
+        self.candidates, self.census = [], []
+        pin = self.source({'pack/extra/SKILL.md': MD.format(name='extra'), 'pack/extra/LICENSE': 'MIT-0\n'},
+                          source='other/repo')
+        self.candidates.append({
+            'source': 'other/repo', 'path': 'pack/extra/SKILL.md',
+            'skill_name': 'extra', 'verdict': 'candidate', 'licence': 'MIT-0',
+            'licence_evidence': 'folder', 'functions': 'testing',
+        })
+        self.census.append({'source': 'other/repo', 'path': 'pack/extra/SKILL.md', 'pin': pin})
 
         def failing_runner(cmd, *, cwd=None):
+            """Raise a subprocess failure with diagnostic stderr."""
+            self.assertIsNotNone(cwd)
             raise subprocess.CalledProcessError(1, cmd, stderr=b'network error')
 
         with self.assertRaises(ValueError) as ctx:
             self.invoke(apply=True, runner=failing_runner)
         self.assertIn('MIT-0', str(ctx.exception))
+        self.assertIn('network error', str(ctx.exception))
+        self.assertEqual(snapshot(self.root), before)
+
+    def test_timed_out_licence_download_leaves_root_unchanged(self):
+        """Keep root byte-identical with no staging leftovers and name the deadline on timeout."""
+        (self.root / 'LICENSES').mkdir()
+        (self.root / 'LICENSES/MIT.txt').write_text(LICENCE, encoding='utf-8')
+        self.fixture()
+        self.invoke(apply=True)
+        before = snapshot(self.root)
+        self.candidates, self.census = [], []
+        pin = self.source({'pack/extra/SKILL.md': MD.format(name='extra'), 'pack/extra/LICENSE': 'MIT-0\n'},
+                          source='other/repo')
+        self.candidates.append({
+            'source': 'other/repo', 'path': 'pack/extra/SKILL.md',
+            'skill_name': 'extra', 'verdict': 'candidate', 'licence': 'MIT-0',
+            'licence_evidence': 'folder', 'functions': 'testing',
+        })
+        self.census.append({'source': 'other/repo', 'path': 'pack/extra/SKILL.md', 'pin': pin})
+
+        def timeout_runner(cmd, *, cwd=None):
+            """Simulate a timed-out licence download."""
+            self.assertIsNotNone(cwd)
+            raise subprocess.TimeoutExpired(cmd, adopt.TIMEOUT)
+
+        with self.assertRaises(ValueError) as ctx:
+            self.invoke(apply=True, runner=timeout_runner)
+        self.assertIn('MIT-0', str(ctx.exception))
+        self.assertIn(f'{adopt.TIMEOUT} seconds', str(ctx.exception))
+        self.assertEqual(snapshot(self.root), before)
+
+    def test_present_licence_skips_download_and_writes_index(self):
+        """Skip downloads when LICENSES already holds the text or no licence is missing."""
+        (self.root / 'LICENSES').mkdir()
+        (self.root / 'LICENSES/MIT.txt').write_text('Existing MIT text\n', encoding='utf-8')
+        self.fixture()
+
+        def unexpected_runner(cmd, *, cwd=None):
+            """Fail if a download is attempted for a licence already present."""
+            self.assertIsNotNone(cwd)
+            self.fail(f'unexpected download runner call: {cmd}')
+
+        rows, _ = self.invoke(apply=True, runner=unexpected_runner)
+        self.assertEqual(rows[0]['verdict'], 'adopted')
+        self.assertEqual((self.root / 'LICENSES/MIT.txt').read_text(encoding='utf-8'), 'Existing MIT text\n')
+        self.assertIn('demo\towner/repo\ttesting;coding\t\t',
+                      (self.root / 'skills/INDEX.tsv').read_text(encoding='utf-8'))
+        (self.root / 'skills/INDEX.tsv').unlink()
+        adopt.publish(self.root, self.base, [], 'version = 1\n', '# Credits\n', runner=unexpected_runner)
+        self.assertIn('demo\towner/repo\t\t\t', (self.root / 'skills/INDEX.tsv').read_text(encoding='utf-8'))
+        self.assertEqual([p.name for p in self.root.iterdir() if p.name.startswith('.adopt-publish')], [])
+
+    def test_default_download_runner_enforces_deadline_and_maps_errors(self):
+        """Pass TIMEOUT to the command runner and map non-zero exit or timeout to ValueError."""
+        cmd = ['reuse', 'download', '-o', str(self.base / 'MIT-0.txt'), 'MIT-0']
+        ok = subprocess.CompletedProcess(cmd, 0, stdout=b'ok', stderr=b'')
+        with patch.object(adopt.subprocess, 'run', return_value=ok) as mocked:
+            self.assertEqual(adopt.default_download_runner(cmd, cwd=self.root), b'ok')
+        self.assertEqual(mocked.call_args.kwargs['timeout'], adopt.TIMEOUT)
+        self.assertEqual(mocked.call_args.kwargs['cwd'], self.root)
+
+        bad = subprocess.CompletedProcess(cmd, 1, stdout=b'', stderr=b'bad spdx identifier\n')
+        with (patch.object(adopt.subprocess, 'run', return_value=bad),
+              self.assertRaisesRegex(ValueError, r'licence download failed for MIT-0: bad spdx identifier')):
+            adopt.default_download_runner(cmd, cwd=self.root)
+
+        expired = subprocess.TimeoutExpired(cmd, adopt.TIMEOUT)
+        timed_out = rf'licence download failed for MIT-0: timed out after {adopt.TIMEOUT} seconds'
+        with (patch.object(adopt.subprocess, 'run', side_effect=expired),
+              self.assertRaisesRegex(ValueError, timed_out)):
+            adopt.default_download_runner(cmd, cwd=self.root)
+
+    def test_silent_missing_licence_file_raises_and_leaves_root_unchanged(self):
+        """Fail before touching root when the download runner exits cleanly without writing LICENSES/<id>.txt."""
+        (self.root / 'LICENSES').mkdir()
+        (self.root / 'LICENSES/MIT.txt').write_text('Existing MIT\n', encoding='utf-8')
+        self.fixture()
+        self.invoke(apply=True)
+        before = snapshot(self.root)
+
+        self.candidates, self.census = [], []
+        pin = self.source({'pack/extra/SKILL.md': MD.format(name='extra'), 'pack/extra/LICENSE': 'MIT-0\n'},
+                          source='other/repo')
+        self.candidates.append({
+            'source': 'other/repo', 'path': 'pack/extra/SKILL.md',
+            'skill_name': 'extra', 'verdict': 'candidate', 'licence': 'MIT-0',
+            'licence_evidence': 'folder', 'functions': 'testing',
+        })
+        self.census.append({'source': 'other/repo', 'path': 'pack/extra/SKILL.md', 'pin': pin})
+
+        def silent_noop_runner(_cmd, *, cwd=None):
+            """Return without creating the requested output file."""
+            self.assertTrue(cwd.is_dir())
+            return b'ok'
+
+        with self.assertRaisesRegex(ValueError, r'licence download failed for MIT-0: MIT-0\.txt not written'):
+            self.invoke(apply=True, runner=silent_noop_runner)
+        self.assertEqual(snapshot(self.root), before)
+
+        direct_root = self.base / 'direct-root'
+        direct_root.mkdir()
+        direct_before = snapshot(direct_root)
+        reuse_doc = (
+            'version = 1\n\n[[annotations]]\npath = ["skills/x/**"]\n'
+            'SPDX-FileCopyrightText = "2025 x"\nSPDX-License-Identifier = "MIT-0"\n'
+        )
+        with self.assertRaisesRegex(ValueError, r'licence download failed for MIT-0: MIT-0\.txt not written'):
+            adopt.sync_licences(direct_root, reuse_doc, runner=silent_noop_runner)
+        self.assertEqual(snapshot(direct_root), direct_before)
+
+    def _two_mit0_candidates(self):
+        """Populate two MIT-0 candidates and return a deterministic download runner and call log."""
+        pin = self.source({
+            'pack/first/SKILL.md': MD.format(name='first'), 'pack/first/LICENSE': 'MIT-0\n',
+            'pack/second/SKILL.md': MD.format(name='second'), 'pack/second/LICENSE': 'MIT-0\n',
+        })
+        for name, dom in (('first', 'science'), ('second', 'dev')):
+            self.candidates.append({
+                'source': 'owner/repo', 'path': f'pack/{name}/SKILL.md',
+                'skill_name': name, 'verdict': 'candidate', 'licence': 'MIT-0',
+                'licence_evidence': 'folder', 'functions': 'testing', 'domains': dom,
+            })
+            self.census.append({'source': 'owner/repo', 'path': f'pack/{name}/SKILL.md', 'pin': pin})
+        downloads = []
+
+        def fake_runner(cmd, *, cwd=None):
+            """Write a deterministic licence file into the staged output target."""
+            self.assertIsNotNone(cwd)
+            downloads.append(list(cmd))
+            Path(cmd[cmd.index('-o') + 1]).write_text('MIT-0 text\n', encoding='utf-8')
+            return b'ok'
+
+        return fake_runner, downloads
+
+    def _seed_existing_skill(self):
+        """Adopt one MIT skill so root starts with populated metadata, LICENSES and INDEX.tsv."""
+        (self.root / 'LICENSES').mkdir(exist_ok=True)
+        (self.root / 'LICENSES/MIT.txt').write_text(LICENCE, encoding='utf-8')
+        pin = self.source({'pack/seed/SKILL.md': MD.format(name='seed'), 'pack/seed/LICENSE': LICENCE},
+                          source='seed/repo')
+        self.candidate(name='seed', folder='pack/seed', source='seed/repo', pin=pin, domains='core')
+        self.invoke(apply=True)
+        self.candidates, self.census = [], []
+
+    def test_crash_between_publish_renames_and_next_apply_repairs(self):
+        """Roll back root byte-identical on a mid-publish failure and retry both accepted and withdrawn."""
+        fake_runner, downloads = self._two_mit0_candidates()
+        before_empty = snapshot(self.root)
+        real_replace = os.replace
+
+        def fail_second_skill(src, dst):
+            """Fail right after installing the first skill directory."""
+            if Path(dst) == self.root / 'skills/second':
+                err = OSError('simulated crash between skill renames')
+                raise err
+            real_replace(src, dst)
+
+        with (patch.object(adopt.os, 'replace', side_effect=fail_second_skill),
+              self.assertRaisesRegex(OSError, 'simulated crash between skill renames')):
+            self.invoke(apply=True, runner=fake_runner)
+        self.assertEqual(snapshot(self.root), before_empty)
+        self.assertEqual(len(downloads), 1)
+
+        def refuse_second(_root, _staging, skill):
+            """Simulate withdrawing or refusing the second skill on retry."""
+            if skill.name == 'second':
+                err = adopt.Refused('markdown: withdrawn')
+                raise err
+
+        rows_withdrawn, _ = self.invoke(apply=True, runner=fake_runner, gate=refuse_second)
+        self.assertEqual([r['verdict'] for r in rows_withdrawn], ['adopted', 'refused'])
+        self.assertEqual(len(downloads), 2)
+        self.assertEqual(check_skills.check(self.root), 0)
+        for rel in ('REUSE.toml', 'CREDITS.md', 'skills/INDEX.tsv'):
+            self.assertNotIn('second', (self.root / rel).read_text(encoding='utf-8'))
+
+        rows_accepted, _ = self.invoke(apply=True, runner=fake_runner)
+        self.assertEqual([r['verdict'] for r in rows_accepted], ['present', 'adopted'])
+        self.assertEqual(len(downloads), 2)
+        self.assertEqual(check_skills.check(self.root), 0)
+        index_lines = (self.root / 'skills/INDEX.tsv').read_text(encoding='utf-8').splitlines()
+        self.assertIn('first\towner/repo\ttesting\tscience\t', index_lines)
+        self.assertIn('second\towner/repo\ttesting\tdev\t', index_lines)
+
+    def test_crash_rollback_restores_populated_root_byte_identical(self):
+        """Restore pre-existing metadata, index and skills byte-identical when a later batch fails mid-commit."""
+        fake_runner, _ = self._two_mit0_candidates()
+        self.candidates = [self.candidates[0]]
+        self.census = [self.census[0]]
+        self.invoke(apply=True, runner=fake_runner)
+        before_populated = snapshot(self.root)
+
+        pin_extra = self.source({
+            'pack/two/SKILL.md': MD.format(name='two'), 'pack/two/LICENSE': 'MIT-0\n',
+            'pack/three/SKILL.md': MD.format(name='three'), 'pack/three/LICENSE': 'MIT-0\n',
+        }, source='other/repo')
+        for name in ('two', 'three'):
+            self.candidates.append({
+                'source': 'other/repo', 'path': f'pack/{name}/SKILL.md',
+                'skill_name': name, 'verdict': 'candidate', 'licence': 'MIT-0',
+                'licence_evidence': 'folder', 'functions': 'testing', 'domains': 'ops',
+            })
+            self.census.append({'source': 'other/repo', 'path': f'pack/{name}/SKILL.md', 'pin': pin_extra})
+
+        real_replace = os.replace
+
+        def fail_three(src, dst):
+            """Fail on the final rename after overwriting metadata and installing skill two."""
+            if Path(dst) == self.root / 'skills/three':
+                err = OSError('simulated crash on three')
+                raise err
+            real_replace(src, dst)
+
+        with (patch.object(adopt.os, 'replace', side_effect=fail_three),
+              self.assertRaisesRegex(OSError, 'simulated crash on three')):
+            self.invoke(apply=True, runner=fake_runner)
+        self.assertEqual(snapshot(self.root), before_populated)
+
+    def test_output_symlink_refuses_index_and_licenses_targets(self):
+        """Refuse symlinked skills/INDEX.tsv (in-root, outside, dangling) and LICENSES; publish regular files."""
+        self._seed_existing_skill()
+        fake_runner, _ = self._two_mit0_candidates()
+        self.candidates = [self.candidates[0]]
+        self.census = [self.census[0]]
+        index_path = self.root / 'skills/INDEX.tsv'
+        regular_index = index_path.read_bytes()
+        outside_index = self.base / 'outside-index.tsv'
+        outside_index.write_bytes(regular_index)
+        outside_licenses = self.base / 'outside-licenses'
+        outside_licenses.mkdir()
+
+        for link_target in (self.root / 'CREDITS.md', outside_index, self.base / 'dangling-index.tsv'):
+            index_path.unlink()
+            index_path.symlink_to(link_target)
+            before = snapshot(self.root)
+            for apply_mode in (False, True):
+                with self.assertRaisesRegex(ValueError, r'skills/INDEX\.tsv: output symlink refused'):
+                    self.invoke(apply=apply_mode, runner=fake_runner)
+                self.assertEqual(snapshot(self.root), before)
+
+        index_path.unlink()
+        index_path.write_bytes(regular_index)
+        shutil.rmtree(self.root / 'LICENSES')
+        for lic_target in (outside_licenses, self.base / 'dangling-licenses'):
+            (self.root / 'LICENSES').symlink_to(lic_target)
+            before = snapshot(self.root)
+            for apply_mode in (False, True):
+                with self.assertRaisesRegex(ValueError, r'LICENSES: output symlink refused'):
+                    self.invoke(apply=apply_mode, runner=fake_runner)
+                self.assertEqual(snapshot(self.root), before)
+            (self.root / 'LICENSES').unlink()
+
+        (self.root / 'LICENSES').mkdir()
+        (self.root / 'LICENSES/MIT.txt').write_text(LICENCE, encoding='utf-8')
+        rows, _ = self.invoke(apply=True, runner=fake_runner)
+        self.assertEqual(rows[0]['verdict'], 'adopted')
+        self.assertFalse(index_path.is_symlink())
+        self.assertTrue((self.root / 'LICENSES/MIT-0.txt').is_file())
+        self.assertEqual(list(outside_licenses.iterdir()), [])
+        self.assertEqual(check_skills.check(self.root), 0)
+
+    def test_rollback_failure_keeps_staging_names_backups_and_runs_other_undos(self):
+        """Keep staging, report failed target and backup path, preserve cause, and complete remaining undos."""
+        self._seed_existing_skill()
+        pre_reuse = (self.root / 'REUSE.toml').read_text(encoding='utf-8')
+        pre_credits = (self.root / 'CREDITS.md').read_text(encoding='utf-8')
+        pre_index = (self.root / 'skills/INDEX.tsv').read_text(encoding='utf-8')
+        fake_runner, _ = self._two_mit0_candidates()
+        real_replace = os.replace
+        reuse_writes = 0
+
+        def fail_commit_and_reuse_restore(src, dst):
+            """Fail on the second skill rename and then fail restoring REUSE.toml during rollback."""
+            nonlocal reuse_writes
+            dst_path = Path(dst)
+            if dst_path == self.root / 'REUSE.toml':
+                reuse_writes += 1
+                if reuse_writes >= 2:
+                    err = OSError('simulated reuse restore failure')
+                    raise err
+            if dst_path == self.root / 'skills/second':
+                err = OSError('simulated commit failure')
+                raise err
+            real_replace(src, dst)
+
+        with (patch.object(adopt.os, 'replace', side_effect=fail_commit_and_reuse_restore),
+              self.assertRaises(RuntimeError) as ctx):
+            self.invoke(apply=True, runner=fake_runner)
+
+        self.assertIsInstance(ctx.exception.__cause__, OSError)
+        self.assertIn('simulated commit failure', str(ctx.exception.__cause__))
+        staged_dirs = [p for p in self.root.iterdir() if p.is_dir() and p.name.startswith('.adopt-publish-')]
+        self.assertEqual(len(staged_dirs), 1)
+        staging = staged_dirs[0]
+        backup_reuse = staging / 'backup/0-REUSE.toml'
+        self.assertTrue(backup_reuse.is_file())
+        self.assertEqual(backup_reuse.read_text(encoding='utf-8'), pre_reuse)
+        self.assertIn('REUSE.toml', str(ctx.exception))
+        self.assertIn(str(backup_reuse), str(ctx.exception))
+        self.assertFalse((self.root / 'skills/first').exists())
+        self.assertTrue((staging / 'skills/first').is_dir())
+        self.assertFalse((self.root / 'LICENSES/MIT-0.txt').exists())
+        self.assertEqual((self.root / 'CREDITS.md').read_text(encoding='utf-8'), pre_credits)
+        self.assertEqual((self.root / 'skills/INDEX.tsv').read_text(encoding='utf-8'), pre_index)
+
+    def test_rollback_without_failure_and_clean_publish_remove_staging(self):
+        """Remove staging both when rollback succeeds completely and when publish succeeds."""
+        self._seed_existing_skill()
+        fake_runner, _ = self._two_mit0_candidates()
+        real_replace = os.replace
+
+        def fail_second_only(src, dst):
+            """Fail only the second skill rename so rollback succeeds completely."""
+            if Path(dst) == self.root / 'skills/second':
+                err = OSError('simulated commit failure')
+                raise err
+            real_replace(src, dst)
+
+        with (patch.object(adopt.os, 'replace', side_effect=fail_second_only),
+              self.assertRaises(OSError)):
+            self.invoke(apply=True, runner=fake_runner)
+        self.assertEqual([p.name for p in self.root.iterdir() if p.name.startswith('.adopt-publish')], [])
+
+        rows, _ = self.invoke(apply=True, runner=fake_runner)
+        self.assertEqual([r['verdict'] for r in rows], ['adopted', 'adopted'])
+        self.assertEqual([p.name for p in self.root.iterdir() if p.name.startswith('.adopt-publish')], [])
+
+    def _fork_kill_on_second_skill(self, fake_runner):
+        """Run --apply in a child process that exits via os._exit right before installing skills/second."""
+        if not hasattr(os, 'fork'):
+            self.skipTest('os.fork unavailable')
+        real_replace = os.replace
+        pid = os.fork()
+        if pid == 0:
+            def kill_on_second(src, dst):
+                """Exit immediately without running Python cleanup handlers."""
+                if Path(dst) == self.root / 'skills/second':
+                    os._exit(99)
+                real_replace(src, dst)
+
+            with patch.object(adopt.os, 'replace', side_effect=kill_on_second):
+                self.invoke(apply=True, runner=fake_runner)
+            os._exit(0)
+        _, status = os.waitpid(pid, 0)
+        self.assertTrue(os.WIFEXITED(status) and os.WEXITSTATUS(status) == 99)
+
+    def test_hard_kill_between_publish_renames_measured(self):
+        """Reconcile a hard-killed publish on the next --apply so withdrawn skills leave no attribution."""
+        self._seed_existing_skill()
+        before_seed = snapshot(self.root)
+        fake_runner, _ = self._two_mit0_candidates()
+        self._fork_kill_on_second_skill(fake_runner)
+
+        self.assertTrue((self.root / adopt.JOURNAL_NAME).is_file())
+        self.assertTrue((self.root / 'LICENSES/MIT-0.txt').is_file())
+        self.assertTrue((self.root / 'skills/first').is_dir())
+        self.assertIn('skills/second/**', (self.root / 'REUSE.toml').read_text(encoding='utf-8'))
+
+        root_withdrawn = self.base / 'root-withdrawn'
+        root_empty = self.base / 'root-empty'
+        shutil.copytree(self.root, root_withdrawn)
+        shutil.copytree(self.root, root_empty)
+
+        tsv(self.base / 'cand-one.tsv', [*CANDIDATE_FIELDS, 'domains'], [self.candidates[0]])
+        rows_withdraw, _ = adopt.run(self.base / 'cand-one.tsv', self.base / 'groups.tsv',
+                                     self.base / 'census.tsv', self.checkouts, root_withdrawn,
+                                     apply=True, gate=passing_gate, hiss_gate=passing_gate, runner=fake_runner)
+        self.assertEqual([r['verdict'] for r in rows_withdraw], ['adopted'])
+        self.assertEqual(check_skills.check(root_withdrawn), 0)
+        reuse_text = (root_withdrawn / 'REUSE.toml').read_text(encoding='utf-8')
+        credits_text = (root_withdrawn / 'CREDITS.md').read_text(encoding='utf-8')
+        self.assertIn('skills/seed/**', reuse_text)
+        self.assertIn('skills/first/**', reuse_text)
+        self.assertNotIn('second', reuse_text)
+        self.assertIn('`seed`', credits_text)
+        self.assertIn('`first`', credits_text)
+        self.assertNotIn('second', credits_text)
+        self.assertEqual([p.name for p in root_withdrawn.iterdir() if p.name.startswith('.adopt-publish')], [])
+
+        tsv(self.base / 'cand-empty.tsv', CANDIDATE_FIELDS, [])
+        adopt.run(self.base / 'cand-empty.tsv', self.base / 'groups.tsv', self.base / 'census.tsv',
+                  self.checkouts, root_empty, apply=True, gate=passing_gate, hiss_gate=passing_gate,
+                  runner=fake_runner)
+        self.assertEqual(snapshot(root_empty), before_seed)
+
+    def test_reconcile_interrupted_mid_recovery_is_idempotent(self):
+        """Complete reconciliation cleanly after a hard kill interrupts an earlier reconcile pass."""
+        self._seed_existing_skill()
+        fake_runner, _ = self._two_mit0_candidates()
+        self._fork_kill_on_second_skill(fake_runner)
+
+        real_undo = adopt._undo_journal_entry
+        pid = os.fork()
+        if pid == 0:
+            def kill_after_first_undo(kind, path, other=None):
+                """Complete one recovery step and exit immediately."""
+                real_undo(kind, path, other)
+                os._exit(98)
+
+            with patch.object(adopt, '_undo_journal_entry', side_effect=kill_after_first_undo):
+                self.invoke(apply=True, runner=fake_runner)
+            os._exit(0)
+        _, status = os.waitpid(pid, 0)
+        self.assertTrue(os.WIFEXITED(status) and os.WEXITSTATUS(status) == 98)
+        self.assertTrue((self.root / adopt.JOURNAL_NAME).is_file())
+
+        rows, _ = self.invoke(apply=True, runner=fake_runner)
+        self.assertEqual([r['verdict'] for r in rows], ['adopted', 'adopted'])
+        self.assertEqual([p.name for p in self.root.iterdir() if p.name.startswith('.adopt-publish')], [])
+        self.assertEqual(check_skills.check(self.root), 0)
+
+    def test_journal_preview_malformed_outside_root_and_symlink_refused(self):
+        """Refuse previews, malformed journals, escaped paths and symlinks without modifying root."""
+        self._seed_existing_skill()
+        fake_runner, _ = self._two_mit0_candidates()
+        self.assertEqual([r['verdict'] for r in self.invoke(apply=False)[0]], ['adopted', 'adopted'])
+        self._fork_kill_on_second_skill(fake_runner)
+        journal_file = self.root / adopt.JOURNAL_NAME
+        valid_payload = json.loads(journal_file.read_text(encoding='utf-8'))
+
+        before_preview = snapshot(self.root)
+        with self.assertRaisesRegex(ValueError, r'\.adopt-publish\.journal\.json.*--apply'):
+            self.invoke(apply=False, runner=fake_runner)
+        self.assertEqual(snapshot(self.root), before_preview)
+
+        bad_payloads = [
+            '{malformed',
+            json.dumps({**valid_payload, 'version': 2}),
+            json.dumps({**valid_payload, 'staging': '../outside'}),
+            json.dumps({**valid_payload, 'moves': [
+                {'kind': 'skill', 'source': f"{valid_payload['staging']}/skills/second", 'destination': '../evil'},
+            ]}),
+        ]
+        for raw_json in bad_payloads:
+            journal_file.write_text(raw_json, encoding='utf-8')
+            before_bad = snapshot(self.root)
+            with self.assertRaisesRegex(ValueError, r'\.adopt-publish\.journal\.json'):
+                self.invoke(apply=True, runner=fake_runner)
+            self.assertEqual(snapshot(self.root), before_bad)
+
+        journal_file.write_text(json.dumps(valid_payload), encoding='utf-8')
+        outside_dir = self.base / 'outside-skill'
+        outside_dir.mkdir()
+        shutil.rmtree(self.root / 'skills/first')
+        (self.root / 'skills/first').symlink_to(outside_dir)
+        before_sym = snapshot(self.root)
+        with self.assertRaisesRegex(ValueError, r'\.adopt-publish\.journal\.json'):
+            self.invoke(apply=True, runner=fake_runner)
+        self.assertEqual(snapshot(self.root), before_sym)
+
+        journal_file.unlink()
+        journal_file.symlink_to(outside_dir / 'missing.json')
+        before_jlink = snapshot(self.root)
+        with self.assertRaisesRegex(ValueError, r'\.adopt-publish\.journal\.json'):
+            self.invoke(apply=True, runner=fake_runner)
+        self.assertEqual(snapshot(self.root), before_jlink)
 
     def test_report_path_written_and_root_refused(self):
         self.fixture()
