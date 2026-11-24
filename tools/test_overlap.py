@@ -562,6 +562,20 @@ class OverlapResumeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"python3 tools/overlap\.py run"):
             overlap.summary(self.out, self.groups)
 
+    def test_generation_manifest_version_rejects_bool_and_non_int(self):
+        """Accept integer manifest version and reject Boolean, float and string values."""
+        self.run_overlap()
+        manifest = overlap._generation_path(self.groups)
+        valid = json.loads(manifest.read_text(encoding="utf-8"))
+        self.assertIn("groups: 1", overlap.summary(self.out, self.groups))
+        for bad_version in (True, False, "1", 1.0, None):
+            with self.subTest(version=bad_version):
+                manifest.write_text(json.dumps(valid | {"version": bad_version}) + "\n", encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, r"python3 tools/overlap\.py run"):
+                    overlap.summary(self.out, self.groups)
+        manifest.write_text(json.dumps(valid) + "\n", encoding="utf-8")
+        self.assertIn("groups: 1", overlap.summary(self.out, self.groups))
+
     def test_resume_skips_judged_pairs(self):
         """Reuse all three judgments when inputs match and preserve the TSV bytes."""
         self.assertEqual(self.run_overlap(), (3, 1))

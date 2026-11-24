@@ -246,16 +246,16 @@ class RunTests(unittest.TestCase):
 
         def migrate(path, kind):
             """Try to acquire the same output lock before renaming the legacy TSV."""
-            with self.assertRaisesRegex(TimeoutError, r"resume\.tsv\.lock"):
-                with input_identity.output_lock(path):
-                    self.fail("migration did not hold the output lock")
+            with (self.assertRaisesRegex(TimeoutError, r"resume\.tsv\.lock"),
+                  input_identity.output_lock(path)):
+                self.fail("migration did not hold the output lock")
             return archive(path, kind)
 
         def ask(text):
             """Verify that inference still runs inside the same lock."""
-            with self.assertRaisesRegex(TimeoutError, r"resume\.tsv\.lock"):
-                with input_identity.output_lock(self.out):
-                    self.fail("inference did not hold the output lock")
+            with (self.assertRaisesRegex(TimeoutError, r"resume\.tsv\.lock"),
+                  input_identity.output_lock(self.out)):
+                self.fail("inference did not hold the output lock")
             return self.ask(text)
 
         with (patch.object(input_identity, "LOCK_WAIT_SECONDS", 0.001),

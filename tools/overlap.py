@@ -397,9 +397,8 @@ def _matching_embeddings(
             raise ValueError(f"{path}: invalid embedding vector for input {key}: {error}") from error
         text_hash = entry.get("text_sha256")
         # Version 2 caches also contain entries keyed by the original blob ID.
-        if isinstance(text_hash, str) and text_hash in texts:
-            if key == text_hash or text_hash not in matched:
-                matched[text_hash] = vector
+        if isinstance(text_hash, str) and text_hash in texts and (key == text_hash or text_hash not in matched):
+            matched[text_hash] = vector
     return matched
 
 
@@ -861,6 +860,11 @@ def _has_header_field(handle: BinaryIO | None, field: str) -> bool:
     return field in next(csv.reader([header.decode("utf-8")], delimiter=TSV_DELIMITER), [])
 
 
+def _is_version_int(value: Any) -> bool:
+    """Accept plain integer manifest versions and reject Booleans."""
+    return not isinstance(value, bool) and isinstance(value, int)
+
+
 def _verify_generation(manifest: Path, groups: BinaryIO | None, pairs: BinaryIO | None) -> None:
     """Require both open file snapshots to match their committed manifest."""
     message = f"{manifest}: overlap generation missing or mismatched; rerun with python3 tools/overlap.py run ..."
@@ -874,7 +878,7 @@ def _verify_generation(manifest: Path, groups: BinaryIO | None, pairs: BinaryIO 
         record = json.loads(payload)
     except (OSError, ValueError, RecursionError) as error:
         raise ValueError(message) from error
-    if record != _generation(digest_file(groups), digest_file(pairs)) or type(record["version"]) is not int:
+    if record != _generation(digest_file(groups), digest_file(pairs)) or not _is_version_int(record["version"]):
         raise ValueError(message)
 
 

@@ -91,9 +91,9 @@ class InputIdentityTests(unittest.TestCase):
             path = Path(folder) / "rows.tsv"
             with (patch.object(input_identity, "LOCK_WAIT_SECONDS", 0.001),
                   output_lock(path), output_lock(path.with_name("other.tsv")),
-                  self.assertRaisesRegex(TimeoutError, r"rows\.tsv\.lock.*timed out")):
-                with output_lock(path):
-                    self.fail("second lock holder entered")
+                  self.assertRaisesRegex(TimeoutError, r"rows\.tsv\.lock.*timed out"),
+                  output_lock(path)):
+                self.fail("second lock holder entered")
 
     def test_output_lock_releases_on_exception(self):
         """Acquire the same output again after its prior holder raises."""

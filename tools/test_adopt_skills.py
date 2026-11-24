@@ -12,11 +12,16 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import tomllib
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
 from unittest.mock import patch
+
+# isort: split
+# Codacy's Ruff sorts tomllib without the py311 target.
+import tomllib
+
+# isort: split
 
 import adopt_skills as adopt
 import census
@@ -508,6 +513,7 @@ class AdoptionTests(unittest.TestCase):
         self.assertTrue((self.root / 'skills/good').exists())
 
     def test_missing_licence_text_triggers_download_through_runner(self):
+        """Download a missing licence into staging with reuse download -o before root changes."""
         files = {'pack/demo/SKILL.md': MD.format(name='demo'), 'pack/demo/LICENSE': 'MIT-0\n'}
         pin = self.source(files)
         row = dict(source='owner/repo', path='pack/demo/SKILL.md', skill_name='demo',
@@ -517,22 +523,41 @@ class AdoptionTests(unittest.TestCase):
 
         commands = []
         def fake_runner(cmd, *, cwd=None):
+            """Check the staged download target and write the licence text there."""
             commands.append((list(cmd), cwd))
-            (cwd / 'LICENSES' / f'{cmd[-1]}.txt').write_text('Downloaded MIT-0')
+            self.assertEqual(cwd.parent, self.root)
+            self.assertTrue(cwd.name.startswith('.adopt-publish-'))
+            self.assertFalse((self.root / 'skills/demo').exists())
+            self.assertFalse((self.root / 'LICENSES/MIT-0.txt').exists())
+            out_path = Path(cmd[cmd.index('-o') + 1])
+            self.assertEqual(out_path, cwd / 'LICENSES/MIT-0.txt')
+            out_path.write_text('Downloaded MIT-0\n', encoding='utf-8')
             return b'Downloaded'
 
         rows, _ = self.invoke(apply=True, runner=fake_runner)
         self.assertEqual(rows[0]['verdict'], 'adopted')
-        self.assertEqual(commands, [(['reuse', 'download', 'MIT-0'], self.root)])
-        self.assertTrue((self.root / 'LICENSES/MIT-0.txt').is_file())
+        self.assertEqual(len(commands), 1)
+        cmd, stage_cwd = commands[0]
+        self.assertEqual(cmd, ['reuse', 'download', '-o', str(stage_cwd / 'LICENSES/MIT-0.txt'), 'MIT-0'])
+        self.assertFalse(stage_cwd.exists())
+        self.assertEqual([p.name for p in self.root.iterdir() if p.name.startswith('.adopt-publish-')], [])
+        self.assertEqual((self.root / 'LICENSES/MIT-0.txt').read_text(encoding='utf-8'), 'Downloaded MIT-0\n')
+        self.assertTrue((self.root / 'skills/demo').is_dir())
+        self.assertIn('demo\towner/repo\ttesting\t\t', (self.root / 'skills/INDEX.tsv').read_text(encoding='utf-8'))
+        self.assertEqual(check_skills.check(self.root), 0)
 
     def test_failed_licence_download_fails_run(self):
-        files = {'pack/demo/SKILL.md': MD.format(name='demo'), 'pack/demo/LICENSE': 'MIT-0\n'}
-        pin = self.source(files)
-        row = dict(source='owner/repo', path='pack/demo/SKILL.md', skill_name='demo',
-                   verdict='candidate', licence='MIT-0', licence_evidence='folder', functions='testing')
-        self.candidates.append(row)
-        self.census.append({'source': 'owner/repo', 'path': 'pack/demo/SKILL.md', 'pin': pin})
+        """Keep existing skills, metadata, index and licences byte-identical when download fails."""
+        self.fixture()
+        self.invoke(apply=True)
+        before = snapshot(self.root)
+        self.candidates, self.census = [], []
+        pin = self.source({'pack/extra/SKILL.md': MD.format(name='extra'), 'pack/extra/LICENSE': 'MIT-0\n'},
+                          source='other/repo')
+        self.candidates.append(dict(source='other/repo', path='pack/extra/SKILL.md', skill_name='extra',
+                                    verdict='candidate', licence='MIT-0', licence_evidence='folder',
+                                    functions='testing'))
+        self.census.append({'source': 'other/repo', 'path': 'pack/extra/SKILL.md', 'pin': pin})
 
         def failing_runner(cmd, *, cwd=None):
             raise subprocess.CalledProcessError(1, cmd, stderr=b'network error')
@@ -540,6 +565,114 @@ class AdoptionTests(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             self.invoke(apply=True, runner=failing_runner)
         self.assertIn('MIT-0', str(ctx.exception))
+        self.assertIn('network error', str(ctx.exception))
+        self.assertEqual(snapshot(self.root), before)
+
+    def test_timed_out_licence_download_leaves_root_unchanged(self):
+        """Keep root byte-identical with no staging leftovers and name the deadline on timeout."""
+        self.fixture()
+        self.invoke(apply=True)
+        before = snapshot(self.root)
+        self.candidates, self.census = [], []
+        pin = self.source({'pack/extra/SKILL.md': MD.format(name='extra'), 'pack/extra/LICENSE': 'MIT-0\n'},
+                          source='other/repo')
+        self.candidates.append(dict(source='other/repo', path='pack/extra/SKILL.md', skill_name='extra',
+                                    verdict='candidate', licence='MIT-0', licence_evidence='folder',
+                                    functions='testing'))
+        self.census.append({'source': 'other/repo', 'path': 'pack/extra/SKILL.md', 'pin': pin})
+
+        def timeout_runner(cmd, *, cwd=None):
+            """Simulate a timed-out licence download."""
+            raise subprocess.TimeoutExpired(cmd, adopt.TIMEOUT)
+
+        with self.assertRaises(ValueError) as ctx:
+            self.invoke(apply=True, runner=timeout_runner)
+        self.assertIn('MIT-0', str(ctx.exception))
+        self.assertIn(f'{adopt.TIMEOUT} seconds', str(ctx.exception))
+        self.assertEqual(snapshot(self.root), before)
+
+    def test_present_licence_skips_download_and_writes_index(self):
+        """Skip downloads when LICENSES already holds the text or no licence is missing."""
+        (self.root / 'LICENSES').mkdir()
+        (self.root / 'LICENSES/MIT.txt').write_text('Existing MIT text\n', encoding='utf-8')
+        self.fixture()
+
+        def unexpected_runner(cmd, *, cwd=None):
+            """Fail if a download is attempted for a licence already present."""
+            self.fail(f'unexpected download runner call: {cmd}')
+
+        rows, _ = self.invoke(apply=True, runner=unexpected_runner)
+        self.assertEqual(rows[0]['verdict'], 'adopted')
+        self.assertEqual((self.root / 'LICENSES/MIT.txt').read_text(encoding='utf-8'), 'Existing MIT text\n')
+        self.assertIn('demo\towner/repo\ttesting;coding\t\t',
+                      (self.root / 'skills/INDEX.tsv').read_text(encoding='utf-8'))
+        (self.root / 'skills/INDEX.tsv').unlink()
+        adopt.publish(self.root, self.base, [], 'version = 1\n', '# Credits\n', runner=unexpected_runner)
+        self.assertIn('demo\towner/repo\t\t\t', (self.root / 'skills/INDEX.tsv').read_text(encoding='utf-8'))
+        self.assertEqual([p.name for p in self.root.iterdir() if p.name.startswith('.adopt-publish-')], [])
+
+    def test_default_download_runner_enforces_deadline_and_maps_errors(self):
+        """Pass TIMEOUT to the command runner and map non-zero exit or timeout to ValueError."""
+        cmd = ['reuse', 'download', '-o', str(self.base / 'MIT-0.txt'), 'MIT-0']
+        ok = subprocess.CompletedProcess(cmd, 0, stdout=b'ok', stderr=b'')
+        with patch.object(adopt.subprocess, 'run', return_value=ok) as mocked:
+            self.assertEqual(adopt.default_download_runner(cmd, cwd=self.root), b'ok')
+        self.assertEqual(mocked.call_args.kwargs['timeout'], adopt.TIMEOUT)
+        self.assertEqual(mocked.call_args.kwargs['cwd'], self.root)
+
+        bad = subprocess.CompletedProcess(cmd, 1, stdout=b'', stderr=b'bad spdx identifier\n')
+        with (patch.object(adopt.subprocess, 'run', return_value=bad),
+              self.assertRaisesRegex(ValueError, r'licence download failed for MIT-0: bad spdx identifier')):
+            adopt.default_download_runner(cmd, cwd=self.root)
+
+        expired = subprocess.TimeoutExpired(cmd, adopt.TIMEOUT)
+        timed_out = rf'licence download failed for MIT-0: timed out after {adopt.TIMEOUT} seconds'
+        with (patch.object(adopt.subprocess, 'run', side_effect=expired),
+              self.assertRaisesRegex(ValueError, timed_out)):
+            adopt.default_download_runner(cmd, cwd=self.root)
+
+    def test_crash_between_publish_renames_and_next_apply_repairs(self):
+        """Measure state after a mid-publish rename failure and verify the next apply repairs it."""
+        pin = self.source({
+            'pack/first/SKILL.md': MD.format(name='first'), 'pack/first/LICENSE': 'MIT-0\n',
+            'pack/second/SKILL.md': MD.format(name='second'), 'pack/second/LICENSE': 'MIT-0\n',
+        })
+        for name, dom in (('first', 'science'), ('second', 'dev')):
+            self.candidates.append(dict(source='owner/repo', path=f'pack/{name}/SKILL.md', skill_name=name,
+                                        verdict='candidate', licence='MIT-0', licence_evidence='folder',
+                                        functions='testing', domains=dom))
+            self.census.append({'source': 'owner/repo', 'path': f'pack/{name}/SKILL.md', 'pin': pin})
+        downloads = []
+
+        def fake_runner(cmd, *, cwd=None):
+            """Write a deterministic licence file into the staged output target."""
+            downloads.append(list(cmd))
+            Path(cmd[cmd.index('-o') + 1]).write_text('MIT-0 text\n', encoding='utf-8')
+            return b'ok'
+
+        real_replace = os.replace
+
+        def fail_second_skill(src, dst):
+            """Fail right after installing the first skill directory."""
+            if Path(dst) == self.root / 'skills/second':
+                raise OSError('simulated crash between skill renames')
+            real_replace(src, dst)
+
+        with (patch.object(adopt.os, 'replace', side_effect=fail_second_skill),
+              self.assertRaisesRegex(OSError, 'simulated crash between skill renames')):
+            self.invoke(apply=True, runner=fake_runner)
+        self.assertEqual([p.name for p in self.root.iterdir() if p.name.startswith('.adopt-publish-')], [])
+        self.assertTrue((self.root / 'skills/first').is_dir())
+        self.assertFalse((self.root / 'skills/second').exists())
+        self.assertEqual(check_skills.index_problems(self.root), ['skills/INDEX.tsv: extra row for second'])
+
+        rows2, _ = self.invoke(apply=True, runner=fake_runner)
+        self.assertEqual([r['verdict'] for r in rows2], ['present', 'adopted'])
+        self.assertEqual(len(downloads), 1)
+        self.assertEqual(check_skills.check(self.root), 0)
+        index_lines = (self.root / 'skills/INDEX.tsv').read_text(encoding='utf-8').splitlines()
+        self.assertIn('first\towner/repo\ttesting\tscience\t', index_lines)
+        self.assertIn('second\towner/repo\ttesting\tdev\t', index_lines)
 
     def test_report_path_written_and_root_refused(self):
         self.fixture()
@@ -652,32 +785,39 @@ class AdoptionTests(unittest.TestCase):
         self.assertEqual(rows[2]['reason'], 'missing-embedding-vector')
 
     def test_group_different_skills_adopts_both_with_group_id(self):
-        """Adopt both members when their current embeddings show distinct uses."""
-        pin_a = self.source({'pack/alpha/SKILL.md': MD.format(name='alpha'), 'pack/alpha/LICENSE': LICENCE},
+        """Adopt both same-name members when orthogonal embeddings show distinct uses."""
+        md_a = (
+            '---\nname: alpha_skill\ndescription: Use when testing scientific workflows.\n---\n\n'
+            '# Alpha\n\nCheck science.\n'
+        )
+        md_b = (
+            '---\nname: alpha-skill\ndescription: Use when testing developer workflows.\n---\n\n'
+            '# Alpha\n\nCheck dev.\n'
+        )
+        pin_a = self.source({'pack/alpha/SKILL.md': md_a, 'pack/alpha/LICENSE': LICENCE},
                             source='anthropics/skills')
-        cand_a = self.candidate(name='alpha', folder='pack/alpha', source='anthropics/skills', pin=pin_a,
+        cand_a = self.candidate(name='alpha_skill', folder='pack/alpha', source='anthropics/skills', pin=pin_a,
                                 blob_id='alpha_blob', domains='science')
-        pin_b = self.source({'pack/beta/SKILL.md': MD.format(name='beta'), 'pack/beta/LICENSE': LICENCE},
+        pin_b = self.source({'pack/beta/SKILL.md': md_b, 'pack/beta/LICENSE': LICENCE},
                             source='obra/superpowers')
-        cand_b = self.candidate(name='beta', folder='pack/beta', source='obra/superpowers', pin=pin_b,
+        cand_b = self.candidate(name='alpha-skill', folder='pack/beta', source='obra/superpowers', pin=pin_b,
                                 blob_id='beta_blob', domains='dev')
+        self.assertEqual(adopt.normalize_name(cand_a['skill_name']), adopt.normalize_name(cand_b['skill_name']))
         self.groups = [{
             'group_id': '42',
             'members': f'{cand_a["source"]}:{cand_a["path"]},{cand_b["source"]}:{cand_b["path"]}',
         }]
         cache_file = self.embedding_cache({'alpha_blob': [1.0, 0.0], 'beta_blob': [0.0, 1.0]})
         rows, _ = self.invoke(apply=True, include_grouped=True, cache=cache_file)
-        self.assertEqual(len(rows), 2)
-        self.assertEqual(rows[0]['verdict'], 'adopted')
-        self.assertEqual(rows[1]['verdict'], 'adopted')
-        self.assertTrue((self.root / 'skills/alpha').is_dir())
-        self.assertTrue((self.root / 'skills/beta').is_dir())
-        index_text = (self.root / 'skills/INDEX.tsv').read_text(encoding='utf-8')
-        lines = index_text.splitlines()
-        row_alpha = [l for l in lines[1:] if l.startswith('alpha\t')][0]
-        row_beta = [l for l in lines[1:] if l.startswith('beta\t')][0]
-        self.assertEqual(row_alpha.split('\t')[4], '42')
-        self.assertEqual(row_beta.split('\t')[4], '42')
+        self.assertEqual([r['verdict'] for r in rows], ['adopted', 'adopted'])
+        self.assertEqual([r['directory'] for r in rows], ['skills/alpha-skill', 'skills/alpha-skill-obra'])
+        self.assertTrue((self.root / 'skills/alpha-skill').is_dir())
+        self.assertTrue((self.root / 'skills/alpha-skill-obra').is_dir())
+        lines = (self.root / 'skills/INDEX.tsv').read_text(encoding='utf-8').splitlines()
+        row_alpha = [line for line in lines[1:] if line.startswith('alpha-skill\t')][0]
+        row_beta = [line for line in lines[1:] if line.startswith('alpha-skill-obra\t')][0]
+        self.assertEqual(row_alpha.split('\t')[3:5], ['science', '42'])
+        self.assertEqual(row_beta.split('\t')[3:5], ['dev', '42'])
         self.assertEqual(check_skills.check(self.root), 0)
 
     def test_original_refused_by_gate_leaves_copy_refused(self):

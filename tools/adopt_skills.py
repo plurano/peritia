@@ -20,11 +20,16 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import tomllib
 import urllib.parse
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+
+# isort: split
+# Codacy's Ruff sorts tomllib without the py311 target.
+import tomllib
+
+# isort: split
 
 import census
 import check_skills
@@ -819,10 +824,31 @@ def candidate_folder(row: dict) -> str | None:
         return None
 
 
+def _skill_directories(skills_dir: Path, staged_skills: Path | None = None) -> list[Path]:
+    """List existing and newly staged skill folders without overwriting existing names."""
+    by_name: dict[str, Path] = {}
+    for folder in (skills_dir, staged_skills):
+        if folder is not None and folder.is_dir():
+            for path in sorted(folder.iterdir())[:check_skills.MAX_SKILLS]:
+                if path.is_dir():
+                    by_name.setdefault(path.name, path)
+    return [by_name[name] for name in sorted(by_name)[:check_skills.MAX_SKILLS]]
+
+
+def _index_destination(root: Path, target: Path | None, staged_skills: Path | None) -> Path | None:
+    """Return the index path to write when existing or staged skills are present."""
+    if not (root / 'skills').is_dir() and not (staged_skills is not None and staged_skills.is_dir()):
+        return None
+    return (root / 'skills' / 'INDEX.tsv') if target is None else target
+
+
 def rebuild_index(root: Path, adopted_map: dict[str, dict] | None = None,
-                  group_map: dict[str, str] | None = None) -> list[dict[str, str]]:
+                  group_map: dict[str, str] | None = None, *,
+                  staged_skills: Path | None = None) -> list[dict[str, str]]:
+    """Build index rows for the skill folders under root and, when given, the staged ones."""
     skills_dir = root / 'skills'
-    if not skills_dir.is_dir():
+    dirs = _skill_directories(skills_dir, staged_skills)
+    if not dirs:
         return []
     index_file = skills_dir / 'INDEX.tsv'
     existing = {}
@@ -839,7 +865,6 @@ def rebuild_index(root: Path, adopted_map: dict[str, dict] | None = None,
     adopted_map = adopted_map or {}
     group_map = group_map or {}
 
-    dirs = sorted(p for p in skills_dir.iterdir() if p.is_dir())[:check_skills.MAX_SKILLS]
     rows = []
     for d in dirs:
         name = d.name
@@ -872,16 +897,19 @@ def rebuild_index(root: Path, adopted_map: dict[str, dict] | None = None,
 
 
 def write_index(root: Path, adopted_map: dict[str, dict] | None = None,
-                group_map: dict[str, str] | None = None) -> None:
-    skills_dir = root / 'skills'
-    if not skills_dir.is_dir():
-        return
-    rows = rebuild_index(root, adopted_map, group_map)
-    index_file = skills_dir / 'INDEX.tsv'
+                group_map: dict[str, str] | None = None, *,
+                target: Path | None = None, staged_skills: Path | None = None) -> bool:
+    """Write skills/INDEX.tsv, or target, and report whether an index was written."""
+    index_file = _index_destination(root, target, staged_skills)
+    if index_file is None:
+        return False
+    rows = rebuild_index(root, adopted_map, group_map, staged_skills=staged_skills)
+    index_file.parent.mkdir(parents=True, exist_ok=True)
     with index_file.open('w', encoding='utf-8', newline='') as handle:
         writer = csv.DictWriter(handle, fieldnames=INDEX_FIELDS, delimiter='\t', lineterminator='\n')
         writer.writeheader()
         writer.writerows(rows)
+    return True
 
 
 def _pinned_member_text(checkout: Path, pin: str | None, path: str) -> str:
@@ -1084,45 +1112,128 @@ def evaluate(row, grouped, order, pins, checkouts, root, staging, occupied, appl
         return result, None, ''
 
 
+def _called_process_detail(error: subprocess.CalledProcessError) -> str:
+    """Extract a bounded message from a failed subprocess exception."""
+    raw = error.stderr.decode('utf-8', errors='replace') if isinstance(error.stderr, bytes) else (error.stderr or '')
+    return raw.strip()[:500] or ' '.join(str(error).split())[:500]
+
+
+def _download_error(args, error: Exception) -> ValueError:
+    """Format a licence download failure naming the SPDX identifier and cause."""
+    spdx_id = args[-1] if args else 'unknown'
+    prefix = f'licence download failed for {spdx_id}'
+    if isinstance(error, ValueError) and str(error).startswith(f'{prefix}:'):
+        return error
+    if isinstance(error, subprocess.TimeoutExpired):
+        limit = TIMEOUT if error.timeout is None else error.timeout
+        detail = f'timed out after {limit:g} seconds'
+    elif isinstance(error, Refused):
+        prog = args[0] if args else ''
+        detail = str(error).removeprefix(f'command: {prog}: ').strip() or 'non-zero exit status'
+    elif isinstance(error, subprocess.CalledProcessError):
+        detail = _called_process_detail(error)
+    else:
+        detail = ' '.join(str(error).split())[:500] or type(error).__name__
+    return ValueError(f'{prefix}: {detail}')
+
+
 def default_download_runner(args, *, cwd=None):
-    proc = subprocess.run(args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    if proc.returncode != 0:
-        detail = proc.stderr.decode('utf-8', errors='replace').strip()[:500]
-        spdx_id = args[-1] if args else 'unknown'
-        msg = f'licence download failed for {spdx_id}: {detail}' if detail else f'licence download failed for {spdx_id}'
-        raise ValueError(msg)
-    return proc.stdout
+    """Run one licence download under the module deadline; failures raise ValueError."""
+    try:
+        return command(args, cwd=cwd, timeout=TIMEOUT)
+    except (Refused, subprocess.SubprocessError, OSError) as error:
+        raise _download_error(args, error) from error
 
 
-def sync_licences(root: Path, reuse_text: str, runner=default_download_runner):
+def _missing_spdx_ids(root: Path, reuse_text: str) -> list[str]:
+    """List sorted SPDX identifiers in REUSE.toml that root/LICENSES lacks."""
     licenses_dir = root / 'LICENSES'
-    licenses_dir.mkdir(parents=True, exist_ok=True)
-    data = tomllib.loads(reuse_text)
     spdx_ids = set()
-    for anno in data.get('annotations', []):
+    for anno in tomllib.loads(reuse_text).get('annotations', [])[:MAX_ROWS]:
         val = anno.get('SPDX-License-Identifier')
         if val:
-            for token in re.findall(r'[A-Za-z0-9.-]+', val):
+            for token in re.findall(r'[A-Za-z0-9.-]+', val)[:64]:
                 if token not in ('AND', 'OR', 'WITH'):
                     spdx_ids.add(token)
-    for spdx_id in sorted(spdx_ids):
+    return [spdx_id for spdx_id in sorted(spdx_ids)[:MAX_ROWS]
+            if not (licenses_dir / f'{spdx_id}.txt').is_file()]
+
+
+def sync_licences(root: Path, reuse_text: str, runner=default_download_runner, *,
+                  staging: Path | None = None) -> list[Path]:
+    """Download each licence text root/LICENSES lacks, into staging when given; return the files written."""
+    dest_root = root if staging is None else staging
+    missing = _missing_spdx_ids(root, reuse_text)
+    if not missing:
+        return []
+    licenses_dir = dest_root / 'LICENSES'
+    licenses_dir.mkdir(parents=True, exist_ok=True)
+    written = []
+    for spdx_id in missing[:MAX_ROWS]:
         lic_file = licenses_dir / f'{spdx_id}.txt'
-        if not lic_file.is_file():
-            try:
-                runner(['reuse', 'download', spdx_id], cwd=root)
-            except Exception as error:
-                raise ValueError(f'licence download failed for {spdx_id}') from error
+        cmd = ['reuse', 'download', '-o', str(lic_file), spdx_id]
+        try:
+            runner(cmd, cwd=dest_root)
+        except Exception as error:
+            mapped = _download_error(cmd, error)
+            raise mapped from (error.__cause__ if mapped is error else error)
+        if lic_file.is_file():
+            written.append(lic_file)
+    return written
+
+
+def _stage_publish(root: Path, staging: Path, saved: Path, rows: list[dict],
+                   reuse: str, credits: str, adopted_map, group_map, runner) -> tuple[list[Path], list[Path], bool]:
+    """Stage adopted skills, metadata, index and downloaded licences before touching root."""
+    staged_skills = []
+    for row in rows[:MAX_ROWS]:
+        if row['verdict'] != 'adopted':
+            continue
+        dest = root / row['directory']
+        if dest.exists() or dest.is_symlink():
+            raise FileExistsError(f'{dest}: skill directory already exists')
+        target = staging / 'skills' / Path(row['directory']).name
+        shutil.copytree(saved / target.name, target)
+        staged_skills.append(target)
+    for name, text in (('REUSE.toml', reuse), ('CREDITS.md', credits)):
+        (staging / name).write_text(text, encoding='utf-8')
+    staged_licences = sync_licences(root, reuse, runner=runner, staging=staging)
+    index_staged = write_index(root, adopted_map=adopted_map, group_map=group_map,
+                               target=staging / 'INDEX.tsv', staged_skills=staging / 'skills')
+    return staged_licences, staged_skills, index_staged
+
+
+def _commit_publish(root: Path, staging: Path, staged_licences: list[Path],
+                    staged_skills: list[Path], index_staged: bool) -> None:
+    """Move staged artefacts into root, installing skill folders last."""
+    if staged_licences:
+        (root / 'LICENSES').mkdir(parents=True, exist_ok=True)
+        for lic in staged_licences[:MAX_ROWS]:
+            os.replace(lic, root / 'LICENSES' / lic.name)
+    for name in ('REUSE.toml', 'CREDITS.md'):
+        os.replace(staging / name, root / name)
+    if index_staged:
+        (root / 'skills').mkdir(parents=True, exist_ok=True)
+        os.replace(staging / 'INDEX.tsv', root / 'skills' / 'INDEX.tsv')
+    for staged_skill in staged_skills[:check_skills.MAX_SKILLS]:
+        dest = root / 'skills' / staged_skill.name
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if dest.exists() or dest.is_symlink():
+            raise FileExistsError(f'{dest}: skill directory already exists')
+        os.replace(staged_skill, dest)
 
 
 def publish(root, saved, rows, reuse, credits, adopted_map=None, group_map=None, runner=default_download_runner):
-    # All gates have completed before publishing any skill. Never overwrite a skill.
-    for row in rows:
-        if row['verdict'] == 'adopted':
-            shutil.copytree(saved / Path(row['directory']).name, root / row['directory'])
-    for name, text in [('REUSE.toml', reuse), ('CREDITS.md', credits)]:
-        (root / name).write_text(text, encoding='utf-8')
-    sync_licences(root, reuse, runner=runner)
-    write_index(root, adopted_map=adopted_map, group_map=group_map)
+    """Stage every output, then move it under root; a failed download leaves root unchanged."""
+    # All gates and licence downloads complete in staging before modifying root. Never overwrite a skill.
+    staging = Path(tempfile.mkdtemp(dir=root, prefix='.adopt-publish-'))
+    try:
+        licences, skills, index_staged = _stage_publish(
+            root, staging, saved, rows, reuse, credits, adopted_map, group_map, runner,
+        )
+        _commit_publish(root, staging, licences, skills, index_staged)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
 
 
 def resolve_report_path(report: Path | None, root: Path) -> Path | None:
