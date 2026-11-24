@@ -24,6 +24,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+import networkx
+
 _TOOLS_DIR = Path(__file__).resolve().parent
 if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
@@ -348,25 +350,11 @@ def load_done_pairs(overlap_tsv: Path) -> dict[tuple[str, str], dict[str, str]]:
 
 
 def _connected_components(graph: dict[str, set[str]]) -> list[set[str]]:
-    """Computes connected components of at least 2 nodes, sorted deterministically."""
-    visited: set[str] = set()
-    components: list[set[str]] = []
-    for node in sorted(graph.keys()):
-        if node not in visited:
-            comp: set[str] = set()
-            queue = [node]
-            visited.add(node)
-            while queue:
-                curr = queue.pop(0)
-                comp.add(curr)
-                for neighbor in graph[curr]:
-                    if neighbor not in visited:
-                        visited.add(neighbor)
-                        queue.append(neighbor)
-            if len(comp) >= 2:
-                components.append(comp)
-    components.sort(key=lambda c: sorted(c)[0])
-    return components
+    """Returns connected components of at least 2 nodes sorted by smallest member, computed via networkx."""
+    return sorted(
+        (set(comp) for comp in networkx.connected_components(networkx.Graph(graph)) if len(comp) >= 2),
+        key=min,
+    )
 
 
 def build_groups(
