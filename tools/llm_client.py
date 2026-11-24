@@ -7,6 +7,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import urllib.error
 import urllib.request
 from typing import Any
 
@@ -39,6 +40,16 @@ def structured_request_parameters(
     }
 
 
+def _embedding_index(item: Any) -> int:
+    """Extract an integer embedding index, rejecting Booleans and non-objects."""
+    if not isinstance(item, dict):
+        raise TypeError("item is not an object")
+    index = item["index"]
+    if isinstance(index, bool) or not isinstance(index, int):
+        raise TypeError("index is not an integer")
+    return index
+
+
 class LLMClient:
     """OpenAI-compatible HTTP API client for chat completions and embeddings."""
 
@@ -53,6 +64,11 @@ class LLMClient:
         data = json.dumps(payload).encode("utf-8")
         try:
             raw = self._post_text(path, data)
+        except urllib.error.HTTPError as err:
+            code = err.code
+            err.close()
+            status = f" (HTTP {code})" if isinstance(code, int) and not isinstance(code, bool) else ""
+            raise OSError(f"LLM request failed{status} for {provider_id(self.base_url)}{path}") from None
         except (OSError, ValueError, http.client.HTTPException):
             raise OSError(f"LLM request failed for {provider_id(self.base_url)}{path}") from None
         return json.loads(raw)
@@ -132,10 +148,14 @@ class LLMClient:
         if len(data) != len(texts):
             raise ValueError(f"expected {len(texts)} embeddings, got {len(data)}")
         try:
-            sorted_data = sorted(data, key=lambda d: d["index"])
-            return [d["embedding"] for d in sorted_data]
+            sorted_data = sorted(data, key=_embedding_index)
+            indices = [d["index"] for d in sorted_data]
+            vectors = [d["embedding"] for d in sorted_data]
         except (KeyError, TypeError) as err:
             raise ValueError(f"malformed embedding item in reply: {err}") from err
+        if indices != list(range(len(texts))):
+            raise ValueError(f"expected embedding indices 0..{len(texts) - 1}, got {indices}")
+        return vectors
 
 
 def from_env(timeout: float = 300.0) -> LLMClient:

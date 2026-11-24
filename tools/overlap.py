@@ -238,15 +238,34 @@ def _read_embedding_cache(cache_path: Path | None) -> tuple[dict[str, Any], bool
     raise ValueError(f"{cache_path}: invalid embedding cache format")
 
 
+def _is_text_key(key: str) -> bool:
+    """Recognize 64-character hexadecimal SHA-256 text keys."""
+    return len(key) == 64 and all(ch in "0123456789abcdefABCDEF" for ch in key)
+
+
+def _entry_text_hash(key: str, entry: dict) -> str | None:
+    """Return the bound text hash, refusing text-keyed entries whose key disagrees."""
+    text_hash = entry.get("text_sha256")
+    if not isinstance(text_hash, str):
+        return None
+    if _is_text_key(key) and key != text_hash:
+        return None
+    return text_hash
+
+
 def _merge_vectors(existing: dict, incoming: dict, namespace: str, *, unbound: bool = False) -> dict:
     """Retain stored vectors and reject disagreements about an existing input."""
-    for key in existing.keys() & incoming.keys():
-        first, second = existing[key], incoming[key]
+    valid_existing = {
+        key: value for key, value in existing.items()
+        if unbound or not isinstance(value, dict) or _entry_text_hash(key, value) is not None
+    }
+    for key in valid_existing.keys() & incoming.keys():
+        first, second = valid_existing[key], incoming[key]
         if not unbound and isinstance(first, dict) and isinstance(second, dict):
             first, second = first.get("vector"), second.get("vector")
         if first != second:
             raise ValueError(f"embedding cache namespace {namespace!r}: conflicting vector for {key!r}")
-    return incoming | existing
+    return incoming | valid_existing
 
 
 def _merge_cache(existing: dict, incoming: dict) -> dict:
@@ -395,9 +414,9 @@ def _matching_embeddings(
             _check_vector(model, dims, vector)
         except (KeyError, TypeError, ValueError, OverflowError) as error:
             raise ValueError(f"{path}: invalid embedding vector for input {key}: {error}") from error
-        text_hash = entry.get("text_sha256")
+        text_hash = _entry_text_hash(key, entry)
         # Version 2 caches also contain entries keyed by the original blob ID.
-        if isinstance(text_hash, str) and text_hash in texts and (key == text_hash or text_hash not in matched):
+        if text_hash is not None and text_hash in texts and (key == text_hash or text_hash not in matched):
             matched[text_hash] = vector
     return matched
 
@@ -762,13 +781,14 @@ def summary(
     limit: int | None = None,
 ) -> str:
     """Count candidates, overlap-free candidates, groups and current unjudged pairs."""
+    effective_skills_dir = skills_dir or Path("skills")
     num_candidates, candidate_ids = _load_summary_candidates(candidates_path, limit)
-    valid_ids = _build_valid_ids(candidate_ids, skills_dir)
+    valid_ids = _build_valid_ids(candidate_ids, effective_skills_dir)
     with open_overlap_generation(groups_path, overlap_path) as (groups, pairs):
-        num_groups, num_existing, grouped_members = _count_groups(groups, valid_ids, skills_dir)
+        num_groups, num_existing, grouped_members = _count_groups(groups, valid_ids, effective_skills_dir)
         pair_path = Path(pairs.name) if pairs is not None else overlap_path
         judgments = _read_done_pairs(pair_path, pairs) if pairs is not None else {}
-    num_unjudged = _count_unjudged(judgments, valid_ids, skills_dir)
+    num_unjudged = _count_unjudged(judgments, valid_ids, effective_skills_dir)
 
     overlap_free = len(candidate_ids - grouped_members) if candidate_ids else 0
     lines = [
@@ -835,7 +855,20 @@ def _current_pairs_path(groups_path: Path) -> Path:
 
 def _generation_path(groups_path: Path) -> Path:
     """Locate the manifest committed after the two published files."""
+    return groups_path.with_name(groups_path.name + ".generation.json")
+
+
+def _legacy_generation_path(groups_path: Path) -> Path:
+    """Locate the stem-named manifest written by earlier overlap runs."""
     return groups_path.with_suffix(".generation.json")
+
+
+def _select_manifest(manifest: Path, groups_path: Path) -> Path:
+    """Prefer the full-name manifest and fall back to a stem manifest only when absent."""
+    if manifest.exists():
+        return manifest
+    legacy = _legacy_generation_path(groups_path)
+    return legacy if legacy.exists() else manifest
 
 
 def _generation(groups_sha: str, pairs_sha: str) -> dict:
@@ -888,11 +921,12 @@ def open_overlap_generation(
 ) -> Iterator[tuple[TextIO | None, TextIO | None]]:
     """Open verified groups and current pairs, allowing pre-fingerprint input."""
     manifest = _generation_path(groups_path)
+    selected = _select_manifest(manifest, groups_path)
     with ExitStack() as stack:
         groups = _open_optional(groups_path, stack)
         pairs = _open_optional(_current_pairs_path(groups_path), stack)
         if pairs is not None or manifest.exists() or _has_header_field(groups, GENERATION_FIELD):
-            _verify_generation(manifest, groups, pairs)
+            _verify_generation(selected, groups, pairs)
         elif legacy_overlap is not None:
             pairs = _open_optional(legacy_overlap, stack)
             if _has_header_field(pairs, "judge_fp"):

@@ -4,7 +4,9 @@
 """Unit tests for the shared OpenAI-compatible LLM client and its callers."""
 from __future__ import annotations
 
+import email.message
 import http.server
+import io
 import json
 import os
 import sys
@@ -201,6 +203,61 @@ class LLMTests(unittest.TestCase):
             client = from_env()
             self.assertEqual(client.base_url, "http://127.0.0.1:1234/v1")
             self.assertEqual(client.api_key, "key1")
+
+    def test_embed_reorders_out_of_order_indices_and_rejects_bad_permutations(self) -> None:
+        """Reorder distinct out-of-order indices and reject duplicate, missing or non-int indices."""
+        self.server.custom_handler = lambda _path, _body, _headers: (  # type: ignore[attr-defined]
+            200, {"data": [{"index": 1, "embedding": [0.3, 0.4]}, {"index": 0, "embedding": [0.1, 0.2]}]}
+        )
+        self.assertEqual(self.client.embed("test-model", ["first", "second"]), [[0.1, 0.2], [0.3, 0.4]])
+
+        bad_payloads = {
+            "duplicate index": [{"index": 0, "embedding": [0.1]}, {"index": 0, "embedding": [0.2]}],
+            "missing index value": [{"index": 0, "embedding": [0.1]}, {"index": 2, "embedding": [0.2]}],
+            "negative index": [{"index": -1, "embedding": [0.1]}, {"index": 0, "embedding": [0.2]}],
+            "boolean indices": [{"index": False, "embedding": [0.1]}, {"index": True, "embedding": [0.2]}],
+            "missing index key": [{"embedding": [0.1]}, {"index": 1, "embedding": [0.2]}],
+        }
+        for label, items in bad_payloads.items():
+            with self.subTest(label=label):
+                self.server.custom_handler = lambda _p, _b, _h, rows=items: (  # type: ignore[attr-defined]
+                    200, {"data": rows}
+                )
+                with self.assertRaises(ValueError):
+                    self.client.embed("test-model", ["first", "second"])
+
+    def test_http_errors_keep_status_code_without_url_headers_or_body(self) -> None:
+        """Distinguish HTTP 401 and 429 while omitting URL userinfo, headers and body."""
+        base = "https://fixture-user:fixture-pass@example.test:8443/v1"
+        client = LLMClient(base, timeout=5.0)
+        messages_by_code = {}
+        for status_code in (401, 429):
+            headers = email.message.Message()
+            headers["X-Fixture-Header"] = "fixture-header-secret"
+            failure = urllib.error.HTTPError(
+                f"{base}/embeddings?fixture-query#fixture-fragment",
+                status_code,
+                "fixture-reason",
+                headers,
+                io.BytesIO(b'{"error":"fixture-body-secret"}'),
+            )
+            with (patch("llm_client.urllib.request.urlopen", side_effect=failure),
+                  self.assertRaises(OSError) as caught):
+                client.embed("model", ["sample"])
+            rendered = "".join(traceback.format_exception(caught.exception))
+            self.assertIn(f"HTTP {status_code}", str(caught.exception))
+            self.assertIn("https://example.test:8443/v1/embeddings", str(caught.exception))
+            self.assertNotIn("fixture-", rendered)
+            self.assertNotIn("X-Fixture-Header", rendered)
+            messages_by_code[status_code] = str(caught.exception)
+        self.assertNotEqual(messages_by_code[401], messages_by_code[429])
+
+        self.server.custom_handler = lambda _p, _b, _h: (  # type: ignore[attr-defined]
+            429, {"error": "fixture-rate-limit-body"}
+        )
+        with self.assertRaisesRegex(OSError, r"HTTP 429") as live_err:
+            self.client.chat("test-model", [{"role": "user", "content": "hi"}])
+        self.assertNotIn("fixture-rate-limit-body", str(live_err.exception))
 
 
 if __name__ == "__main__":

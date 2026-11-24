@@ -9,6 +9,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -139,10 +140,15 @@ def output_lock(path: Path) -> Iterator[None]:
     raise TimeoutError(f"{lock_path}: timed out waiting for output lock after {LOCK_WAIT_SECONDS:g}s")
 
 
+def _archive_name(path: Path, kind: str, index: int) -> Path:
+    """Format the numbered sibling archive path for an output."""
+    return path.with_name(f"{path.stem}.{kind}-{index}{path.suffix}")
+
+
 def _reserve_archive(path: Path, kind: str) -> Path:
     """Reserve an unused sibling archive name exclusively."""
     for n in range(1, 100):
-        archive = path.with_name(f"{path.stem}.{kind}-{n}{path.suffix}")
+        archive = _archive_name(path, kind, n)
         try:
             with archive.open("xb"):
                 return archive
@@ -151,15 +157,45 @@ def _reserve_archive(path: Path, kind: str) -> Path:
     raise ValueError(f"{path}: all 99 {kind} archive names are taken")
 
 
-def _archive_output(path: Path, kind: str) -> Path:
-    """Move an output to an archive, preserving it even after an ambiguous rename."""
-    archive = _reserve_archive(path, kind)
+def _link_archive(path: Path, kind: str) -> Path | None:
+    """Hard-link path to the first unused archive name, or return None if unsupported."""
+    for n in range(1, 100):
+        archive = _archive_name(path, kind, n)
+        try:
+            os.link(path, archive)
+        except FileExistsError:
+            continue
+        except OSError:
+            return None
+        return archive
+    raise ValueError(f"{path}: all 99 {kind} archive names are taken")
+
+
+def _copy_archive(path: Path, archive: Path) -> None:
+    """Stage a synced copy of path into a sibling temporary file and replace archive."""
+    fd, raw_name = tempfile.mkstemp(prefix=f".{archive.name}.", suffix=".tmp", dir=archive.parent)
+    os.close(fd)
+    temporary = Path(raw_name)
     try:
-        os.replace(path, archive)
+        shutil.copyfile(path, temporary)
+        with temporary.open("r+b") as handle:
+            os.fsync(handle.fileno())
+        os.replace(temporary, archive)
     except OSError as error:
-        if path.exists():
+        if temporary.exists():
             archive.unlink(missing_ok=True)
         raise OSError(f"{path}: could not archive output to {archive}: {error}") from error
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _archive_output(path: Path, kind: str) -> Path:
+    """Archive an active output via hard link or staged copy without removing path."""
+    linked = _link_archive(path, kind)
+    if linked is not None:
+        return linked
+    archive = _reserve_archive(path, kind)
+    _copy_archive(path, archive)
     return archive
 
 
@@ -176,6 +212,7 @@ def staged_output(path: Path, write: Callable[[BinaryIO], None]) -> Iterator[Pat
             handle.close()
             yield temporary
         finally:
+            handle.close()
             temporary.unlink(missing_ok=True)
 
 
@@ -265,12 +302,16 @@ def _jsonl_prefix(path: Path, cap: int) -> tuple[int, int]:
     """Return the line count and offset through the last newline-terminated JSON value."""
     count = boundary = 0
     with path.open("rb") as handle:
-        lines = iter(partial(handle.readline, MAX_RECORD_BYTES + 1), b"")
-        for index, line in enumerate(bounded_history(path, lines, cap), 1):
+        for index in range(1, cap + 2):
+            line = handle.readline(MAX_RECORD_BYTES + 1)
+            if not line:
+                break
             if len(line) > MAX_RECORD_BYTES:
                 raise ValueError(f"{path}: JSONL record exceeds cap of {MAX_RECORD_BYTES} bytes")
             if not line.endswith(b"\n"):
                 break
+            if index > cap:
+                raise ValueError(f"{path}: history exceeds cap of {cap} rows")
             try:
                 json.loads(line.decode("utf-8"))
             except (ValueError, RecursionError):
@@ -306,8 +347,9 @@ class AppendLog:
 
     def _compact(self, payload: bytes, key: Key, latest: Mapping[Key, dict]) -> None:
         """Archive the active log and publish the staged latest records."""
-        if len(latest) >= self.cap:
-            raise ValueError(f"{self.path}: latest history reaches cap of {self.cap} rows")
+        retained = len(latest) + (key not in latest)
+        if retained > self.cap:
+            raise ValueError(f"{self.path}: latest history exceeds cap of {self.cap} rows")
 
         def write(handle: BinaryIO) -> None:
             """Write the header and all retained records to the staged log."""
@@ -322,7 +364,7 @@ class AppendLog:
             os.replace(temporary, pending)
             _archive_output(self.path, "history")
             os.replace(pending, self.path)
-        self.count = len(latest) + (key not in latest)
+        self.count = retained
 
     def append(self, row: dict, key: Key, latest: Mapping[Key, dict]) -> None:
         """Append one complete record, compacting active history when required."""
@@ -377,28 +419,28 @@ def _tsv_record(fields: Sequence[str], row: dict | None = None) -> bytes:
     return out.getvalue()
 
 
-def _prepare_tsv_history(path: Path, fields: list[str], fp_field: str, cap: int) -> int:
+def _prepare_tsv_history(path: Path, fields: list[str], fp_field: str, cap: int) -> tuple[int, bool]:
     """Archive legacy data or repair the current TSV and count its complete rows."""
     if not path.exists():
-        return 0
+        return 0, True
     found, count, boundary = _tsv_prefix(path, cap)
     if found is None or found == fields:
         _quarantine_tail(path, boundary)
-        return count
+        return count, found is None
     if fp_field in found:
         raise ValueError(f"{path}: TSV header {found!r} differs from expected {fields!r}")
     archive = _archive_output(path, "legacy")
     label = "row" if count == 1 else "rows"
     print(f"{path}: moved {count} {label} to {archive} (legacy TSV)", file=sys.stderr)
-    return 0
+    return 0, True
 
 
 def open_fingerprinted_tsv(path: Path, fields: list[str], fp_field: str, *, max_rows: int) -> AppendLog:
     """Prepare a fingerprinted TSV under its output lock and return its append log."""
     _finish_compaction(path)
-    count = _prepare_tsv_history(path, fields, fp_field, max_rows)
+    count, needs_header = _prepare_tsv_history(path, fields, fp_field, max_rows)
     header = _tsv_record(fields)
-    if not path.exists() or not path.stat().st_size:
+    if needs_header:
         with staged_output(path, lambda handle: handle.write(header)) as temporary:
             os.replace(temporary, path)
     return AppendLog(path, max_rows, count, partial(_tsv_record, fields), header)

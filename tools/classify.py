@@ -206,12 +206,23 @@ def read_skill_input(checkouts: Path, item: Item) -> str | None:
         return None
 
 
-def run(items: list[Item], checkouts: Path, output: Path, ask: Callable[[str], Any], model: str,
-        limit: int | None = None, provider: str | None = None) -> Counter:
+def run(
+    items: list[Item],
+    checkouts: Path,
+    output: Path,
+    ask: Callable[[str], Any],
+    model: str,
+    limit: int | None = None,
+    *,
+    provider: str,
+) -> Counter:
     """Append classifications when the latest row does not match the current input."""
+    endpoint = provider_id(provider)
+    if not endpoint:
+        raise ValueError("classify.run requires a non-empty provider base URL")
     context = {
         "model": model,
-        "provider": provider_id(provider),
+        "provider": endpoint,
         "system_prompt_sha256": text_sha256(SYSTEM_PROMPT),
         "request": structured_request_parameters(label_schema(), LABEL_SCHEMA_NAME),
     }
@@ -220,17 +231,18 @@ def run(items: list[Item], checkouts: Path, output: Path, ask: Callable[[str], A
         log = open_fingerprinted_tsv(output, OUTPUT_FIELDS, "input_fp", max_rows=MAX_ROWS)
         done = latest_classifications(output)
         for item in items:
-            if limit is not None and counts.total() >= limit:
+            if limit is not None and counts["ok"] + counts["error"] >= limit:
                 break
             text = read_skill_input(checkouts, item)
-            input_fp = ""
-            if text is not None:
-                input_fp = fingerprint("classify", {
-                    **context, "blob_id": item.blob_id, "skill_text_sha256": text_sha256(skill_prompt(text)),
-                })
-                if done.get(item.blob_id, {}).get("input_fp") == input_fp:
-                    continue
-            labels = classify_one(ask, text) if text is not None else None
+            if text is None:
+                counts["unreadable"] += 1
+                continue
+            input_fp = fingerprint("classify", {
+                **context, "blob_id": item.blob_id, "skill_text_sha256": text_sha256(skill_prompt(text)),
+            })
+            if done.get(item.blob_id, {}).get("input_fp") == input_fp:
+                continue
+            labels = classify_one(ask, text)
             status = "ok" if labels else "error"
             functions, domains = labels or ([], [])
             row = {"blob_id": item.blob_id, "source": item.source, "path": item.path,
@@ -305,13 +317,17 @@ def main(argv: list[str]) -> int:
 
 
 def _run_cli(args: argparse.Namespace) -> int:
-    """Classify census inputs and print the number of successful and failed requests."""
-    client = LLMClient(args.base_url, args.timeout, api_key=os.environ.get("PERITIA_LLM_API_KEY"))
+    """Classify census inputs and print counts of successful, failed and unreadable skills."""
+    base_url = args.base_url if args.base_url is not None else os.environ.get("PERITIA_LLM_BASE_URL", "")
+    client = LLMClient(base_url, args.timeout, api_key=os.environ.get("PERITIA_LLM_API_KEY"))
     classifier = SkillClassifier(client, args.model)
     counts = run(unique_items(args.census), args.checkouts, args.out, classifier.ask, args.model,
-                 args.limit, provider=args.base_url)
-    print(f"model={args.model} prompt_sha256={prompt_digest()} ok={counts['ok']} error={counts['error']}")
-    return 1 if counts["error"] else 0
+                 args.limit, provider=client.base_url)
+    print(
+        f"model={args.model} prompt_sha256={prompt_digest()} "
+        f"ok={counts['ok']} error={counts['error']} unreadable={counts['unreadable']}"
+    )
+    return 1 if counts["error"] or counts["unreadable"] else 0
 
 
 if __name__ == "__main__":

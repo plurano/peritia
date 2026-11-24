@@ -569,13 +569,24 @@ class TrialIdentityTests(unittest.TestCase):
             self.assert_calls(0, 0)
             self.assertEqual([(path.read_bytes(), path.stat().st_mtime_ns) for path in paths], active)
 
-    def test_distinct_trial_history_at_cap_refuses_append(self):
-        """Refuse to discard a distinct active trial slot to make room."""
+    def test_regrade_at_cap_compacts_existing_trial_slots(self):
+        """Compact at the cap when a regrade only updates slots the active history already holds."""
         before = self.first_run()
         self.set_task_field("must_match", ["new grading rule"])
+        with patch.object(judge_groups, "MAX_TRIAL_ROWS", 12):
+            judge_groups.run(**self.options)
+            self.assertEqual(self.trials.with_name("trials.history-1.jsonl").read_bytes(), before)
+            self.assertLessEqual(len(self.new_rows()), 12)
+            self.assert_calls(0, 0)
+            judge_groups.run(**self.options)
+            self.assert_calls(0, 0)
+
+    def test_distinct_trial_slot_at_cap_refuses_append(self):
+        """Refuse to discard a distinct active trial slot to make room for a new one."""
+        before = self.first_run()
         with (patch.object(judge_groups, "MAX_TRIAL_ROWS", 12),
               self.assertRaisesRegex(ValueError, r"trials\.jsonl.*cap of 12 rows")):
-            judge_groups.run(**self.options)
+            judge_groups.run(**(self.options | {"k": 3}))
         self.assertEqual(self.trials.read_bytes(), before)
         self.assertFalse(self.trials.with_name("trials.history-1.jsonl").exists())
 

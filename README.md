@@ -136,9 +136,14 @@ name, and lets a chat model judge per pair whether they serve the same use.
 Overlap resume checks the current skill blobs, judge model, serving endpoint,
 prompts, and effective structured request settings. It appends judgments for
 changed inputs and records failed judgments as unjudged. Each run builds
-`groups.tsv` and writes the current candidate pairs with their current cosine
-and rank to `groups.tsv.pairs.tsv`. A change to k or to the embedding space can
-drop an edge while its judgment stays in `overlap.tsv`.
+`groups.tsv`, writes the current candidate pairs with their current cosine and
+rank to `groups.tsv.pairs.tsv`, and commits both hashes to
+`groups.tsv.generation.json` (readers still accept legacy
+`<stem>.generation.json` for compatibility when `<groups>.generation.json` is
+absent and the hashes match). Consumers copying `groups.tsv` must copy
+`groups.tsv`, `groups.tsv.pairs.tsv`, and `groups.tsv.generation.json` together.
+A change to k or to the embedding space can drop an edge while its judgment
+stays in `overlap.tsv`.
 `python3 tools/overlap.py summary --overlap overlap.tsv --groups groups.tsv
 --candidates candidates.tsv` uses the current pair snapshot to count unjudged
 pairs alongside candidate and group totals. [Overlap tests](tools/test_overlap.py)
@@ -193,7 +198,7 @@ equivalent. Group judging and grouped adoption need `--embed-base-url` when
 embeddings come from a different endpoint. Cache v2 quarantines legacy vectors
 under `legacy_unbound`. Classification and overlap archive legacy TSVs as
 `*.legacy-N.tsv` and append revisions to the fingerprinted TSVs. Rerun overlap
-to produce the current pair snapshot. Trial JSONL appends v2 records and
+to produce the current pair snapshot and generation manifest. Trial JSONL appends v2 records and
 preserves older lines. In Python, use `load_embeddings` in place of
 `load_cache` and `latest_classifications` in place of `done_blobs`.
 `get_embeddings` and `load_embeddings` return vectors keyed by item ID.

@@ -7,10 +7,11 @@ import io
 import json
 import math
 import os
+import shutil
 import tempfile
 import unittest
 import urllib.error
-from contextlib import redirect_stderr
+from contextlib import chdir, redirect_stderr
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
@@ -505,14 +506,20 @@ class OverlapResumeTests(unittest.TestCase):
             self.assertEqual([(path.read_bytes(), path.stat().st_mtime_ns) for path in paths], before)
 
     def test_distinct_pair_history_at_cap_refuses_append(self):
-        """Keep an exactly full pair history intact when each row is required."""
+        """Compact existing pair updates at cap and keep full distinct pair history intact on overflow."""
         with patch.object(overlap, "MAX_PAIRS", 3):
             self.run_overlap()
+            self.assertEqual(self.run_overlap(model="second"), (3, 1))
+            self.assertTrue(self.out.with_name("overlap.history-1.tsv").is_file())
+            self.rows.append({"blob_id": "b4", "source": "s", "path": "c4/SKILL.md",
+                              "skill_name": "c4", "verdict": "candidate"})
+            write_skill_file(self.checkouts, "s/c4/SKILL.md", "---\nname: c4\ndescription: desc4\n---\n")
+            write_candidates(self.folder, self.rows)
             before = self.out.read_bytes(), self.out.stat().st_mtime_ns
             with self.assertRaisesRegex(ValueError, r"overlap\.tsv.*cap of 3 rows"):
                 self.run_overlap(model="second")
             self.assertEqual((self.out.read_bytes(), self.out.stat().st_mtime_ns), before)
-            self.assertFalse(self.out.with_name("overlap.history-1.tsv").exists())
+            self.assertFalse(self.out.with_name("overlap.history-4.tsv").exists())
 
     def test_publication_interruptions_leave_no_readable_mixed_generation(self):
         """Refuse both an incomplete first generation and a stale manifest on update."""
@@ -680,6 +687,47 @@ class OverlapResumeTests(unittest.TestCase):
         report = overlap.summary(self.out, self.groups, self.candidates)
         self.assertIn("unjudged pairs: 3", report)
 
+    def test_separate_manifests_for_same_stem_and_legacy_manifest_compatibility(self):
+        """Keep distinct manifests per full groups filename and verify legacy fallback hashes."""
+        groups_csv = self.folder / "groups.csv"
+        self.assertEqual(self.run_overlap(same_use=True), (3, 1))
+        overlap.run(
+            candidates_tsv=self.candidates, checkouts=self.checkouts, skills_dir=self.folder / "skills",
+            overlap_out=self.folder / "overlap-csv.tsv", groups_out=groups_csv,
+            embed_fn=lambda texts: [[1.0, 0.0] for _ in texts],
+            judge_fn=lambda _prompt: {"same_use": False, "reason": "distinct"}, judge_model="csv-judge",
+        )
+        tsv_manifest = self.folder / "groups.tsv.generation.json"
+        csv_manifest = self.folder / "groups.csv.generation.json"
+        self.assertTrue(tsv_manifest.is_file())
+        self.assertTrue(csv_manifest.is_file())
+        self.assertIn("groups: 1", overlap.summary(self.out, self.groups, self.candidates))
+        self.assertIn("groups: 0", overlap.summary(self.folder / "overlap-csv.tsv", groups_csv, self.candidates))
+        self.assertEqual(len(judge_groups.load_groups(self.groups)), 1)
+        self.assertEqual(len(adopt_skills._read_group_rows(groups_csv)), 0)
+
+        legacy_manifest = self.folder / "groups.generation.json"
+        tsv_manifest.replace(legacy_manifest)
+        self.assertIn("groups: 1", overlap.summary(self.out, self.groups, self.candidates))
+
+        csv_manifest.unlink()
+        with self.assertRaisesRegex(ValueError, r"python3 tools/overlap\.py run"):
+            overlap.summary(self.folder / "overlap-csv.tsv", groups_csv, self.candidates)
+
+        overlap.run(
+            candidates_tsv=self.candidates, checkouts=self.checkouts, skills_dir=self.folder / "skills",
+            overlap_out=self.folder / "overlap-csv.tsv", groups_out=groups_csv,
+            embed_fn=lambda texts: [[1.0, 0.0] for _ in texts],
+            judge_fn=lambda _prompt: {"same_use": False, "reason": "distinct"}, judge_model="csv-judge",
+        )
+        self.assertTrue(csv_manifest.is_file())
+        self.assertTrue(legacy_manifest.is_file())
+        self.assertIn("groups: 1", overlap.summary(self.out, self.groups, self.candidates))
+
+        tsv_manifest.write_text('{"version":1,"groups_sha256":"bad","pairs_sha256":"bad"}\n', encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, r"python3 tools/overlap\.py run"):
+            overlap.summary(self.out, self.groups, self.candidates)
+
 
 class OverlapEmbeddingIdentityTests(unittest.TestCase):
     """Exercise embedding namespace selection and legacy cache migration."""
@@ -822,6 +870,42 @@ class OverlapEmbeddingIdentityTests(unittest.TestCase):
         self.assertEqual(overlap.get_embeddings([self.item], self.embed, self.cache, model="embed"),
                          {self.item.item_id: [0.1, 0.2, 0.3]})
         self.assertEqual(self.embed_calls, [])
+
+    def test_swapped_text_keyed_entries_miss_while_legacy_blob_entry_hits(self):
+        """Refuse text-keyed entries whose key and text_sha256 disagree while keeping legacy hits."""
+        second = replace(self.item, item_id="item2", blob_id="b2", skill_name="name2", description="desc2")
+
+        def distinct_embed(texts):
+            """Return distinct unit vectors per input text."""
+            self.embed_calls.extend(texts)
+            return [[1.0, 0.0, 0.0] if "name1" in text else [0.0, 1.0, 0.0] for text in texts]
+
+        overlap.get_embeddings([self.item, second], distinct_embed, self.cache, model="embed")
+        key_a = text_sha256(overlap.make_embed_text(self.item))
+        key_b = text_sha256(overlap.make_embed_text(second))
+        data = self.load_cache_json()
+        vectors = next(iter(data["namespaces"].values()))["vectors"]
+        vectors[key_a]["text_sha256"], vectors[key_b]["text_sha256"] = key_b, key_a
+        self.cache.write_text(json.dumps(data), encoding="utf-8")
+
+        self.assertEqual(overlap.load_embeddings(self.cache, [self.item, second], "embed", ""), {})
+        self.embed_calls.clear()
+        repaired = overlap.get_embeddings([self.item, second], distinct_embed, self.cache, model="embed")
+        self.assertEqual(len(self.embed_calls), 2)
+        self.assertEqual(repaired, {"item1": [1.0, 0.0, 0.0], "item2": [0.0, 1.0, 0.0]})
+        self.assertEqual(overlap.load_embeddings(self.cache, [self.item, second], "embed", ""), repaired)
+
+        data = self.load_cache_json()
+        vectors = next(iter(data["namespaces"].values()))["vectors"]
+        vectors.pop(key_a)
+        vectors[key_b]["text_sha256"] = key_a
+        self.cache.write_text(json.dumps(data), encoding="utf-8")
+        self.assertEqual(overlap.load_embeddings(self.cache, [self.item], "embed", ""), {})
+
+        vectors.pop(key_b)
+        vectors["e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"] = {"text_sha256": key_a, "vector": [1.0, 0.0, 0.0]}
+        self.cache.write_text(json.dumps(data), encoding="utf-8")
+        self.assertEqual(overlap.load_embeddings(self.cache, [self.item], "embed", ""), {"item1": [1.0, 0.0, 0.0]})
 
     def test_explicit_dims_reject_wrong_response_length(self):
         """Reject a three-dimensional response when the caller requests two dimensions."""
@@ -1184,6 +1268,47 @@ class OverlapSummaryTests(unittest.TestCase):
             self.assertIn("groups: 1", rep)
             self.assertIn("groups with an existing skill: 0", rep)
             self.assertIn("unjudged pairs: 1", rep)
+
+    def test_summary_default_skills_dir_matches_explicit_path_for_removed_skill(self):
+        """Resolve None and Path('skills') identically when filtering removed existing skills."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            write_skill_file(tmp, "skills/kept/SKILL.md", "---\nname: kept\ndescription: kept\n---\n")
+            cand_tsv = write_candidates(tmp, [
+                {"blob_id": "b1", "source": "s", "path": "c1/SKILL.md", "verdict": "candidate"},
+                {"blob_id": "b2", "source": "s", "path": "c2/SKILL.md", "verdict": "candidate"},
+            ])
+            groups = [
+                {"group_id": "1", "members": "s:c1/SKILL.md,skills/removed",
+                 "edges": "s:c1/SKILL.md|skills/removed", "has_existing": "true"},
+                {"group_id": "2", "members": "s:c2/SKILL.md,skills/kept",
+                 "edges": "s:c2/SKILL.md|skills/kept", "has_existing": "true"},
+            ]
+            pairs = [
+                dict.fromkeys(overlap.OVERLAP_FIELDS, "")
+                | {"a": "s:c1/SKILL.md", "b": "skills/removed", "same_use": "unjudged"},
+                dict.fromkeys(overlap.OVERLAP_FIELDS, "")
+                | {"a": "s:c2/SKILL.md", "b": "skills/kept", "same_use": "true"},
+            ]
+            out_overlap = tmp / "overlap.tsv"
+            out_groups = tmp / "groups.tsv"
+            overlap._write_overlap_generation(out_groups, groups, pairs)
+
+            with chdir(tmp):
+                implicit = overlap.summary(out_overlap, out_groups, cand_tsv, skills_dir=None)
+                explicit = overlap.summary(out_overlap, out_groups, cand_tsv, skills_dir=Path("skills"))
+                self.assertEqual(implicit, explicit)
+                self.assertIn("overlap-free candidates: 1", implicit)
+                self.assertIn("groups: 1", implicit)
+                self.assertIn("groups with an existing skill: 1", implicit)
+                self.assertIn("unjudged pairs: 0", implicit)
+
+                shutil.rmtree(tmp / "skills")
+                no_dir_implicit = overlap.summary(out_overlap, out_groups, cand_tsv, skills_dir=None)
+                no_dir_explicit = overlap.summary(out_overlap, out_groups, cand_tsv, skills_dir=Path("skills"))
+                self.assertEqual(no_dir_implicit, no_dir_explicit)
+                self.assertIn("groups: 2", no_dir_implicit)
+                self.assertIn("unjudged pairs: 1", no_dir_implicit)
 
 
 if __name__ == "__main__":

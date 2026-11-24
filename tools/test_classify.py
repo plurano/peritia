@@ -2,16 +2,24 @@
 # SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
 # SPDX-License-Identifier: EUPL-1.2
 """Offline self-tests for the census classifier; no test calls a model."""
+import argparse
 import csv
+import inspect
+import io
+import os
 import tempfile
 import unittest
+from collections import Counter
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
 import classify
 import input_identity
+from llm_client import LLMClient
 
 CENSUS_FIELDS = ["source", "pin", "path", "skill_name", "blob_id", "dup_of_blob", "failure_reason"]
+DEFAULT_PROVIDER = "https://models.invalid/v1"
 
 
 def write_census(folder, rows):
@@ -107,15 +115,19 @@ class ReadTests(unittest.TestCase):
 
 class RunTests(unittest.TestCase):
     def test_run_writes_model_and_status_and_resumes(self):
+        """Record model and status per row and resume skipped items on subsequent runs."""
         with tempfile.TemporaryDirectory() as folder:
             for name in ("x", "y"):
                 write_skill(folder, "a/b", f"{name}/SKILL.md")
             items = [classify.Item("1", "a/b", "x/SKILL.md", "x"), classify.Item("2", "a/b", "y/SKILL.md", "y")]
             out = Path(folder) / "out.tsv"
-            first = classify.run(items[:1], Path(folder), out, lambda text: GOOD, "model-a")
+            first = classify.run(items[:1], Path(folder), out, lambda text: GOOD, "model-a",
+                                 provider=DEFAULT_PROVIDER)
             self.assertEqual(first["ok"], 1)
             asked = []
-            second = classify.run(items, Path(folder), out, lambda text: asked.append(text) or {"functions": ["x"]}, "model-a")
+            second = classify.run(items, Path(folder), out,
+                                  lambda text: asked.append(text) or {"functions": ["x"]}, "model-a",
+                                  provider=DEFAULT_PROVIDER)
             self.assertEqual((second["ok"], second["error"], len(asked)), (0, 1, classify.ATTEMPTS))
             with out.open(newline="", encoding="utf-8") as handle:
                 rows = list(csv.DictReader(handle, delimiter="\t"))
@@ -140,10 +152,10 @@ class RunTests(unittest.TestCase):
         self.asked.append(text)
         return GOOD
 
-    def classify(self, model="model-a", **options):
+    def classify(self, model="model-a", *, provider=DEFAULT_PROVIDER, **options):
         """Classify the current items and return the new model calls."""
         self.asked.clear()
-        classify.run(self.items, self.folder, self.out, self.ask, model, **options)
+        classify.run(self.items, self.folder, self.out, self.ask, model, provider=provider, **options)
         return self.asked.copy()
 
     def test_unchanged_inputs_skip_all_asks(self):
@@ -260,7 +272,7 @@ class RunTests(unittest.TestCase):
 
         with (patch.object(input_identity, "LOCK_WAIT_SECONDS", 0.001),
               patch.object(input_identity, "_archive_output", side_effect=migrate)):
-            classify.run(self.items, self.folder, self.out, ask, "model-a")
+            classify.run(self.items, self.folder, self.out, ask, "model-a", provider=DEFAULT_PROVIDER)
         self.assertEqual(self.out.with_name("resume.legacy-1.tsv").read_bytes(), original)
         self.assertEqual(self.asked, ["x", "y"])
         self.assertEqual(set(classify.latest_classifications(self.out)), {"1", "2"})
@@ -280,17 +292,21 @@ class RunTests(unittest.TestCase):
             self.assertEqual((self.out.read_bytes(), self.out.stat().st_mtime_ns), (active, mtime))
 
     def test_full_distinct_history_refuses_append_without_writing(self):
-        """Refuse compaction when all slots are already needed for the latest rows."""
+        """Compact existing keys at cap and refuse an extra distinct key without writing."""
         with patch.object(classify, "MAX_ROWS", 2):
             self.classify()
+            self.assertEqual(self.classify("model-b"), ["x", "y"])
+            self.assertTrue(self.out.with_name("resume.history-1.tsv").is_file())
+            write_skill(self.folder, "a/b", "z/SKILL.md", "z")
+            self.items.append(classify.Item("3", "a/b", "z/SKILL.md", "z"))
             original = self.out.read_bytes(), self.out.stat().st_mtime_ns
             with self.assertRaisesRegex(ValueError, r"resume\.tsv.*cap of 2 rows"):
                 self.classify("model-b")
             self.assertEqual((self.out.read_bytes(), self.out.stat().st_mtime_ns), original)
-            self.assertFalse(self.out.with_name("resume.history-1.tsv").exists())
+            self.assertFalse(self.out.with_name("resume.history-3.tsv").exists())
 
     def test_compaction_resumes_after_archive_before_active_publish(self):
-        """Recover the staged latest rows if publication fails after the archive rename."""
+        """Keep the active file readable if publication fails after archiving, and recover cleanly."""
         replace = input_identity.os.replace
 
         def interrupt(source, target):
@@ -306,9 +322,11 @@ class RunTests(unittest.TestCase):
             with (patch.object(input_identity.os, "replace", side_effect=interrupt),
                   self.assertRaisesRegex(OSError, "interrupted compaction")):
                 self.classify("model-b")
-            self.assertFalse(self.out.exists())
+            self.assertEqual(self.out.read_bytes(), original)
+            self.assertIn("rows=2 ok=2 error=0 models=model-a,model-b", classify.summary(self.out))
             self.assertEqual(self.out.with_name("resume.history-1.tsv").read_bytes(), original)
-            self.assertEqual(self.classify("model-b"), [])
+            self.assertEqual(self.classify("model-b"), ["y"])
+            self.assertEqual(self.out.with_name("resume.history-2.tsv").read_bytes(), original)
             self.assertFalse(self.out.with_name(".resume.tsv.compacting").exists())
             self.assertIn("rows=2 ok=2 error=0 models=model-b", classify.summary(self.out))
 
@@ -320,11 +338,130 @@ class RunTests(unittest.TestCase):
         write_skill(self.folder, item.source, item.path, item.skill_name)
         self.assertEqual(self.classify(), ["x"])
 
+    def test_run_requires_non_empty_provider_before_opening_log(self):
+        """Reject omitted or empty provider endpoints before touching the output or lock."""
+        provider = inspect.signature(classify.run).parameters["provider"]
+        self.assertEqual(provider.kind, inspect.Parameter.KEYWORD_ONLY)
+        self.assertIs(provider.default, inspect.Parameter.empty)
+        for bad_provider in ("", None):
+            with self.subTest(provider=bad_provider), self.assertRaises(ValueError):
+                classify.run(self.items, self.folder, self.out, self.ask, "model-a", provider=bad_provider)
+            self.assertFalse(self.out.exists())
+            self.assertFalse(self.out.with_name("resume.tsv.lock").exists())
+
+        self.assertEqual(self.classify(provider="https://models.invalid/v1"), ["x", "y"])
+        saved = self.out.read_bytes()
+        with self.assertRaises(ValueError):
+            classify.run(self.items, self.folder, self.out, self.ask, "model-a", provider="")
+        self.assertEqual(self.out.read_bytes(), saved)
+        self.assertEqual(self.classify(provider="https://models.invalid/v1/"), [])
+        self.assertEqual(self.classify(provider="https://other.invalid/v1"), ["x", "y"])
+
+    def test_cli_passes_effective_client_base_url(self):
+        """Bind CLI classifications to the resolved LLMClient endpoint rather than raw args."""
+        census = write_census(self.folder, [
+            {"source": "a/b", "path": "x/SKILL.md", "skill_name": "x", "blob_id": "1"},
+        ])
+        fake_reply = {"choices": [{"message": {"content": '{"functions":["coding"],"domains":["other"]}'}}]}
+        stdout = io.StringIO()
+        with (patch.dict(os.environ, {"PERITIA_LLM_BASE_URL": "https://env.invalid/v1/"}, clear=True),
+              patch.object(LLMClient, "_post", return_value=fake_reply),
+              redirect_stdout(stdout)):
+            rc = classify.main(["run", "--census", str(census), "--checkouts", str(self.folder),
+                                "--out", str(self.out), "--model", "model-a"])
+        self.assertEqual(rc, 0)
+        self.assertIn("ok=1 error=0 unreadable=0", stdout.getvalue())
+        self.assertEqual(self.classify(provider="https://env.invalid/v1"), ["y"])
+
+        args = argparse.Namespace(
+            census=census, checkouts=self.folder, out=self.out, model="model-a",
+            base_url="https://stale-arg.invalid/v1", timeout=5.0, limit=None,
+        )
+        effective_client = LLMClient("https://effective.invalid/v1")
+        with (patch("classify.LLMClient", return_value=effective_client),
+              patch.object(effective_client, "_post", return_value=fake_reply),
+              redirect_stdout(io.StringIO())):
+            self.assertEqual(classify._run_cli(args), 0)
+        self.asked.clear()
+        classify.run(self.items[:1], self.folder, self.out, self.ask, "model-a",
+                     provider="https://effective.invalid/v1")
+        self.assertEqual(self.asked, [])
+
+    def test_unreadable_skill_does_not_consume_limit_or_write_row(self):
+        """Count only model calls against limit and write nothing for unreadable skills."""
+        write_skill(self.folder, "a/b", "z/SKILL.md", "z")
+        self.items.append(classify.Item("3", "a/b", "z/SKILL.md", "z"))
+        (self.folder / "a__b" / "x/SKILL.md").unlink()
+
+        zero = classify.run(self.items, self.folder, self.out, self.ask, "model-a",
+                            limit=0, provider=DEFAULT_PROVIDER)
+        self.assertEqual(zero, Counter())
+        self.assertEqual(self.asked, [])
+
+        first = classify.run(self.items, self.folder, self.out, self.ask, "model-a",
+                             limit=1, provider=DEFAULT_PROVIDER)
+        self.assertEqual(first, Counter({"unreadable": 1, "ok": 1}))
+        self.assertEqual(self.asked, ["y"])
+        self.assertEqual(list(classify.latest_classifications(self.out)), ["2"])
+
+        self.asked.clear()
+        second = classify.run(self.items, self.folder, self.out, self.ask, "model-a",
+                              limit=1, provider=DEFAULT_PROVIDER)
+        self.assertEqual(second, Counter({"unreadable": 1, "ok": 1}))
+        self.assertEqual(self.asked, ["z"])
+        self.assertEqual(set(classify.latest_classifications(self.out)), {"2", "3"})
+
+        self.asked.clear()
+        third = classify.run(self.items, self.folder, self.out, self.ask, "model-a",
+                             limit=1, provider=DEFAULT_PROVIDER)
+        self.assertEqual(third, Counter({"unreadable": 1}))
+        self.assertEqual(self.asked, [])
+        self.assertNotIn("1", classify.latest_classifications(self.out))
+
+    def test_cli_exits_nonzero_when_any_skill_is_unreadable(self):
+        """Print unreadable count beside ok and error and return exit status 1."""
+        census = write_census(self.folder, [
+            {"source": "a/b", "path": "x/SKILL.md", "skill_name": "x", "blob_id": "1"},
+            {"source": "a/b", "path": "y/SKILL.md", "skill_name": "y", "blob_id": "2"},
+        ])
+        (self.folder / "a__b" / "x/SKILL.md").unlink()
+        fake_reply = {"choices": [{"message": {"content": '{"functions":["coding"],"domains":["other"]}'}}]}
+        stdout = io.StringIO()
+        with patch.object(LLMClient, "_post", return_value=fake_reply), redirect_stdout(stdout):
+            rc = classify.main(["run", "--census", str(census), "--checkouts", str(self.folder),
+                                "--out", str(self.out), "--model", "model-a", "--base-url", DEFAULT_PROVIDER])
+        self.assertEqual(rc, 1)
+        self.assertIn("ok=1 error=0 unreadable=1", stdout.getvalue())
+
+    def test_temporarily_unreadable_classified_skill_preserves_labels_and_reuses(self):
+        """Keep prior labels while a skill is unreadable and reuse or reclassify on restore."""
+        self.assertEqual(self.classify(), ["x", "y"])
+        before_bytes = self.out.read_bytes()
+        before_summary = classify.summary(self.out)
+
+        skill_path = self.folder / "a__b" / "x/SKILL.md"
+        skill_path.unlink()
+        self.asked.clear()
+        counts = classify.run(self.items, self.folder, self.out, self.ask, "model-a", provider=DEFAULT_PROVIDER)
+        self.assertEqual(counts, Counter({"unreadable": 1}))
+        self.assertEqual(self.asked, [])
+        self.assertEqual(self.out.read_bytes(), before_bytes)
+        self.assertEqual(classify.summary(self.out), before_summary)
+
+        write_skill(self.folder, "a/b", "x/SKILL.md", "x")
+        self.assertEqual(self.classify(), [])
+        self.assertEqual(self.out.read_bytes(), before_bytes)
+
+        write_skill(self.folder, "a/b", "x/SKILL.md", "x-edited")
+        self.assertEqual(self.classify(), ["x-edited"])
+
     def test_summary_names_zero_hit_domains(self):
+        """Report domain counts and list domains without matching skills excluding other."""
         with tempfile.TemporaryDirectory() as folder:
             write_skill(folder, "a/b", "x/SKILL.md")
             out = Path(folder) / "out.tsv"
-            classify.run([classify.Item("1", "a/b", "x/SKILL.md", "x")], Path(folder), out, lambda text: GOOD, "m")
+            classify.run([classify.Item("1", "a/b", "x/SKILL.md", "x")], Path(folder), out,
+                         lambda text: GOOD, "m", provider=DEFAULT_PROVIDER)
             report = classify.summary(out)
             self.assertIn("rows=1 ok=1 error=0 models=m", report)
             self.assertIn("domain go-service-framework 1", report)

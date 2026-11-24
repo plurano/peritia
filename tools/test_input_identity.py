@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: EUPL-1.2
 """Exercise the shared input fingerprint and TSV migration contracts."""
 import csv
+import errno
 import hashlib
 import io
 import os
@@ -12,6 +13,7 @@ from contextlib import redirect_stderr
 from pathlib import Path
 from unittest.mock import patch
 
+import classify
 import input_identity
 from input_identity import (
     fingerprint,
@@ -173,7 +175,8 @@ class InputIdentityTests(unittest.TestCase):
             original = b"id\nlegacy-a\nlegacy-b\n"
             path.write_bytes(original)
             with output_lock(path):
-                with (patch("os.replace", side_effect=OSError("rename failed")),
+                with (patch("os.link", side_effect=OSError("hard links unsupported")),
+                      patch("os.replace", side_effect=OSError("rename failed")),
                       self.assertRaisesRegex(OSError, r"rows\.tsv.*rows\.legacy-1\.tsv")):
                     open_fingerprinted_tsv(path, ["id", "fp"], "fp", max_rows=3)
                 self.assertEqual(path.read_bytes(), original)
@@ -195,7 +198,9 @@ class InputIdentityTests(unittest.TestCase):
                 replace(source, destination)
                 raise OSError("rename acknowledgement lost")
 
-            with (output_lock(path), patch("os.replace", side_effect=ambiguous_result),
+            with (output_lock(path),
+                  patch("os.link", side_effect=OSError("hard links unsupported")),
+                  patch("os.replace", side_effect=ambiguous_result),
                   self.assertRaisesRegex(OSError, r"rows\.tsv.*rows\.legacy-1\.tsv")):
                 open_fingerprinted_tsv(path, ["id", "fp"], "fp", max_rows=3)
             self.assertEqual(archive.read_bytes(), original)
@@ -254,6 +259,193 @@ class InputIdentityTests(unittest.TestCase):
             with output_lock(path), self.assertRaisesRegex(ValueError, r"\['fp', 'id'\].*\['id', 'fp'\]"):
                 open_fingerprinted_tsv(path, ["id", "fp"], "fp", max_rows=3)
             self.assertEqual(path.read_bytes(), b"fp\tid\n")
+
+    def test_append_log_updates_existing_key_at_cap_and_rejects_third_key(self):
+        """Compact an existing-key update at cap and refuse an extra distinct key."""
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "rows.tsv"
+            row_a = {"id": "a", "fp": "1"}
+            row_b = {"id": "b", "fp": "2"}
+            row_a2 = {"id": "a", "fp": "3"}
+            with output_lock(path):
+                log = open_fingerprinted_tsv(path, ["id", "fp"], "fp", max_rows=2)
+                log.append(row_a, "a", {})
+                log.append(row_b, "b", {"a": row_a})
+                prior = path.read_bytes()
+                log.append(row_a2, "a", {"a": row_a, "b": row_b})
+                self.assertEqual(log.count, 2)
+                self.assertEqual(path.with_name("rows.history-1.tsv").read_bytes(), prior)
+                compacted = path.read_bytes(), path.stat().st_mtime_ns
+                with self.assertRaisesRegex(ValueError, r"rows\.tsv.*cap of 2 rows"):
+                    log.append({"id": "c", "fp": "4"}, "c", {"a": row_a2, "b": row_b})
+                self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), compacted)
+                self.assertFalse(path.with_name("rows.history-2.tsv").exists())
+            with path.open(newline="", encoding="utf-8") as handle:
+                self.assertEqual(list(csv.DictReader(handle, delimiter="\t")), [row_b, row_a2])
+
+    def active_output_spies(self, target, seen, *, allow_link):
+        """Build os.link and os.replace spies that read the active output around each call."""
+        real_link, real_replace = os.link, os.replace
+
+        def checked_link(src, dst):
+            """Verify active output before and after hard-linking the archive."""
+            self.assertTrue(target.exists())
+            seen.append(classify.summary(target).splitlines()[0])
+            if not allow_link:
+                raise OSError(errno.EXDEV, "cross-device link")
+            real_link(src, dst)
+            self.assertTrue(target.exists())
+
+        def checked_replace(src, dst):
+            """Verify active output before and after every atomic rename."""
+            self.assertTrue(target.exists())
+            seen.append(classify.summary(target).splitlines()[0])
+            real_replace(src, dst)
+            self.assertTrue(target.exists())
+            seen.append(classify.summary(target).splitlines()[0])
+
+        return checked_link, checked_replace
+
+    def test_compaction_keeps_active_path_readable_for_link_and_copy_fallback(self):
+        """Keep the active TSV present and readable by classify.summary throughout compaction."""
+        for allow_link in (True, False):
+            with self.subTest(allow_link=allow_link), tempfile.TemporaryDirectory() as folder:
+                path = Path(folder) / "classified.tsv"
+                rows = [
+                    dict.fromkeys(classify.OUTPUT_FIELDS, "")
+                    | {"blob_id": key, "model": "m1", "status": "ok", "functions": "coding",
+                       "domains": "other", "input_fp": f"fp-{key}"}
+                    for key in ("1", "2")
+                ]
+                updated = rows[0] | {"model": "m2", "input_fp": "fp-1b"}
+                with output_lock(path):
+                    log = open_fingerprinted_tsv(path, classify.OUTPUT_FIELDS, "input_fp", max_rows=2)
+                    log.append(rows[0], "1", {})
+                    log.append(rows[1], "2", {"1": rows[0]})
+                    prior = path.read_bytes()
+                    checks = []
+                    checked_link, checked_replace = self.active_output_spies(path, checks, allow_link=allow_link)
+                    with (patch("os.link", side_effect=checked_link),
+                          patch("os.replace", side_effect=checked_replace)):
+                        log.append(updated, "1", {"1": rows[0], "2": rows[1]})
+                self.assertGreaterEqual(len(checks), 3)
+                self.assertEqual(path.with_name("classified.history-1.tsv").read_bytes(), prior)
+                self.assertIn("rows=2 ok=2 error=0 models=m1,m2", classify.summary(path))
+
+    def test_compaction_recovery_handles_kill_after_archive_and_old_pending(self):
+        """Recover cleanly after a kill before final replace and for a missing active file."""
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "rows.tsv"
+            row_a = {"id": "a", "fp": "1"}
+            row_b = {"id": "b", "fp": "2"}
+            row_a2 = {"id": "a", "fp": "3"}
+            real_replace = os.replace
+
+            def kill_before_install(src, dst):
+                """Simulate termination after archiving and before replacing the active file."""
+                if Path(src).name.endswith(".compacting"):
+                    raise RuntimeError("killed before final replace")
+                real_replace(src, dst)
+
+            with output_lock(path):
+                log = open_fingerprinted_tsv(path, ["id", "fp"], "fp", max_rows=2)
+                log.append(row_a, "a", {})
+                log.append(row_b, "b", {"a": row_a})
+                prior = path.read_bytes()
+                with (patch("os.replace", side_effect=kill_before_install),
+                      self.assertRaisesRegex(RuntimeError, "killed before final replace")):
+                    log.append(row_a2, "a", {"a": row_a, "b": row_b})
+                self.assertEqual(path.read_bytes(), prior)
+                self.assertTrue(path.with_name(".rows.tsv.compacting").is_file())
+                self.assertEqual(path.with_name("rows.history-1.tsv").read_bytes(), prior)
+
+                recovered = open_fingerprinted_tsv(path, ["id", "fp"], "fp", max_rows=2)
+                self.assertFalse(path.with_name(".rows.tsv.compacting").exists())
+                self.assertEqual(recovered.count, 2)
+                recovered.append(row_a2, "a", {"a": row_a, "b": row_b})
+                self.assertEqual(path.with_name("rows.history-2.tsv").read_bytes(), prior)
+            with path.open(newline="", encoding="utf-8") as handle:
+                self.assertEqual(list(csv.DictReader(handle, delimiter="\t")), [row_b, row_a2])
+
+            compacted_bytes = path.read_bytes()
+            path.with_name(".rows.tsv.compacting").write_bytes(compacted_bytes)
+            path.unlink()
+            with output_lock(path):
+                restored = open_fingerprinted_tsv(path, ["id", "fp"], "fp", max_rows=2)
+                self.assertEqual(restored.count, 2)
+            self.assertEqual(path.read_bytes(), compacted_bytes)
+
+    def test_staged_output_closes_handle_before_unlink_on_every_path(self):
+        """Close the temporary file handle before unlinking so Windows cleanup succeeds."""
+        with tempfile.TemporaryDirectory() as folder:
+            target = Path(folder) / "out.bin"
+            with input_identity.staged_output(target, lambda handle: handle.write(b"ok")) as staged:
+                self.assertEqual(staged.read_bytes(), b"ok")
+            self.assertFalse(staged.exists())
+
+            real_ntf = tempfile.NamedTemporaryFile
+            real_unlink = Path.unlink
+            created = []
+            closed_states = []
+
+            def track_ntf(*args, **kwargs):
+                """Record the temporary handle opened by staged_output."""
+                handle = real_ntf(*args, **kwargs)
+                created.append(handle)
+                return handle
+
+            def check_unlink(self_path, *args, **kwargs):
+                """Verify the staged handle is already closed when Path.unlink runs."""
+                if created and self_path == Path(created[-1].name):
+                    closed_states.append(created[-1].closed)
+                return real_unlink(self_path, *args, **kwargs)
+
+            with (patch("tempfile.NamedTemporaryFile", side_effect=track_ntf),
+                  patch.object(Path, "unlink", autospec=True, side_effect=check_unlink)):
+                with (self.assertRaisesRegex(KeyError, "write failure"),
+                      input_identity.staged_output(target, lambda _h: (_ for _ in ()).throw(KeyError("write failure")))):
+                    self.fail("write failure did not propagate")
+                with (patch("os.fsync", side_effect=OSError("fsync failure")),
+                      self.assertRaisesRegex(OSError, "fsync failure"),
+                      input_identity.staged_output(target, lambda handle: handle.write(b"x"))):
+                    self.fail("fsync failure did not propagate")
+            self.assertEqual(closed_states, [True, True])
+            self.assertEqual(list(Path(folder).iterdir()), [])
+
+    def test_prefix_readers_quarantine_torn_line_at_cap_and_reject_complete_extra(self):
+        """Quarantine an unterminated tail at cap while refusing a newline-terminated overflow."""
+        with tempfile.TemporaryDirectory() as folder:
+            jsonl = Path(folder) / "rows.jsonl"
+            two_jsonl = b'{"id":"one"}\n{"id":"two"}\n'
+            torn_jsonl = b'{"id":"three"'
+            jsonl.write_bytes(two_jsonl + torn_jsonl)
+            with output_lock(jsonl), redirect_stderr(io.StringIO()):
+                log = input_identity.open_jsonl_history(jsonl, 2)
+                self.assertEqual(log.count, 2)
+            self.assertEqual(jsonl.read_bytes(), two_jsonl)
+            self.assertEqual(jsonl.with_name("rows.torn-1.jsonl").read_bytes(), torn_jsonl)
+
+            zero_jsonl = Path(folder) / "zero.jsonl"
+            zero_jsonl.write_bytes(torn_jsonl)
+            with output_lock(zero_jsonl), redirect_stderr(io.StringIO()):
+                self.assertEqual(input_identity.open_jsonl_history(zero_jsonl, 0).count, 0)
+            self.assertEqual(zero_jsonl.read_bytes(), b"")
+
+            overflow_jsonl = two_jsonl + b'{"id":"three"}\n'
+            jsonl.write_bytes(overflow_jsonl)
+            with output_lock(jsonl), self.assertRaisesRegex(ValueError, r"rows\.jsonl.*cap of 2 rows"):
+                input_identity.open_jsonl_history(jsonl, 2)
+            self.assertEqual(jsonl.read_bytes(), overflow_jsonl)
+
+            tsv = Path(folder) / "rows.tsv"
+            two_tsv = b"id\tfp\na\t1\nb\t2\n"
+            tsv.write_bytes(two_tsv + b"c\t3")
+            with output_lock(tsv), redirect_stderr(io.StringIO()):
+                self.assertEqual(open_fingerprinted_tsv(tsv, ["id", "fp"], "fp", max_rows=2).count, 2)
+            self.assertEqual(tsv.read_bytes(), two_tsv)
+            tsv.write_bytes(two_tsv + b"c\t3\n")
+            with output_lock(tsv), self.assertRaisesRegex(ValueError, r"rows\.tsv.*cap of 2 rows"):
+                open_fingerprinted_tsv(tsv, ["id", "fp"], "fp", max_rows=2)
 
 
 if __name__ == "__main__":
