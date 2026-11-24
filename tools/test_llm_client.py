@@ -131,7 +131,7 @@ class LLMTests(unittest.TestCase):
 
     def _assert_clean_headers(self, headers: httpx2.Headers) -> None:
         """Verify no ambient OpenAI or custom header survived the request allow-list."""
-        lower_names = {name.lower() for name in headers.keys()}
+        lower_names = {name.lower() for name in headers}
         self.assertNotIn("openai-organization", lower_names)
         self.assertNotIn("openai-project", lower_names)
         self.assertNotIn("x-leak", lower_names)

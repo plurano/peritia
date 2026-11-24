@@ -10,7 +10,9 @@ from collections.abc import Callable
 from typing import Any, cast
 
 import httpx2
-import openai
+# Codacy's Guardrails rule is a false positive here: this module checks every reply
+# itself and raises ValueError, and callers validate the parsed JSON.
+import openai  # nosemgrep: codacy.python.openai.import-without-guardrails
 
 from input_identity import provider_id, validate_base_url
 
