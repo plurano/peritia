@@ -877,6 +877,51 @@ class _LicenceRegressionTests(unittest.TestCase):
             with self.subTest(notice=notice):
                 self.assertEqual(skill_problems(self._plant(f"{notice}\n{self.mit}")), [])
 
+    def test_copyright_holder_handles(self):
+        """Accept new handles and aliases in dated and leading undated notices."""
+        holders = (
+            "newhandle99",
+            "foo-bar contributors",
+            "foo-bar authors",
+            "foo-bar developers",
+            "foo-bar team",
+            "James Wolfe (wolfejam)",
+            "James Wolfe (newhandle99)",
+            "a",
+            "a" * 39,
+        )
+        for prefix in ("Copyright (c) 2026", "Copyright"):
+            for holder in holders:
+                notice = f"{prefix} {holder}"
+                with self.subTest(notice=notice):
+                    self.assertEqual(skill_problems(self._plant(f"{notice}\n{self.mit}")), [])
+
+    def test_copyright_holder_handle_limits(self):
+        """Retain malformed handles and lowercase prose in the licence comparison."""
+        holders = (
+            "a" * 40,
+            ("a" * 40) + " contributors",
+            "-newhandle99",
+            "newhandle99-",
+            "somebody else entirely",
+            "acme corp",
+            "newhandle99 and contributors",
+            "James Wolfe wolfejam",
+            "James Wolfe (" + "a" * 40 + ")",
+            "James Wolfe (newhandle99) no commercial use",
+            "(newhandle99)",
+        )
+        for prefix in ("Copyright (c) 2026", "Copyright"):
+            for holder in holders:
+                notice = f"{prefix} {holder}"
+                with self.subTest(notice=notice):
+                    self._refused(self._plant(f"{notice}\n{self.mit}"), "differs from MIT at word offset")
+
+    def test_copyright_handle_keeps_body_terms(self):
+        """Require the template body after removing a valid handle notice."""
+        body = f"Copyright (c) 2026 newhandle99\nNo commercial use\n{self.mit}"
+        self._refused(self._plant(body), "differs from MIT at word offset 0 (expected 'permission', found 'no')")
+
     def test_copyright_holder_token_cap(self):
         """Count an optional email toward the same twelve-token holder limit."""
         holder = "Copyright 2024 " + "Holder " * 11

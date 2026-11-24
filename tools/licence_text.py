@@ -37,13 +37,12 @@ _HOLDER_EMAIL = re.compile(r"<[^<>\s@]+@[^<>\s@]+>")
 _HOLDER_BRACKETS = re.compile(r"\[(?P<square>[^\[\]<>]+)\]|<(?P<angle>[^\[\]<>]+)>")
 _HOLDER_PLACEHOLDER = re.compile(rf"\[{_HOLDER_WORD}\]|<{_HOLDER_WORD}>")
 _HOLDER_PLACEHOLDERS = frozenset({"[name of copyright owner]", "<copyright holder>", "<copyright holders>"})
-_HOLDER_CONNECTORS = frozenset({
-    "and", "of", "the", "et", "al.", "de", "van", "von", "der", "da", "contributors", "authors", "affiliates", "its",
-    "developers", "team",
-    # Exact lowercase handles present in vendored licence notices.
-    "agenttrace", "alfredtech2026", "avelikiy", "awesome-skills", "ch040602", "hyhmrright", "optim-agent",
-    "thecsdoctor", "tubeagentkit", "wolfejam", "xiehuan123", "zhuli",
-})
+_HOLDER_HANDLE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?")
+_HOLDER_ALIAS = re.compile(rf"\({_HOLDER_HANDLE.pattern}\)")
+_HOLDER_COLLECTIVES = frozenset({"contributors", "authors", "developers", "team"})
+_HOLDER_CONNECTORS = _HOLDER_COLLECTIVES | {
+    "and", "of", "the", "et", "al.", "de", "van", "von", "der", "da", "affiliates", "its",
+}
 _RIGHTS_RESERVED = re.compile(r"(?:^| )all rights reserved\.$", re.IGNORECASE)
 TITLE = re.compile(
     r"(?:[a-z0-9-]+(?: [a-z0-9-]+){0,7} license(?: (?:v\.? )?\d+(?:\.\d+)*)?"
@@ -92,7 +91,14 @@ def _copyright_notice(line: str, *, leading: bool = False) -> bool:
 
 
 def _copyright_holder(holder: str) -> bool:
-    """Accept a bounded name or a standard placeholder using original-case tokens."""
+    """Accept bounded names, handles and placeholders using original-case tokens.
+
+    A single lowercase word that matches the handle shape is stripped as a whole holder.
+    The remaining licence body must still equal the template.
+    """
+    handle, separator, collective = holder.partition(" ")
+    if _HOLDER_HANDLE.fullmatch(handle) and (not separator or collective in _HOLDER_COLLECTIVES):
+        return True
     bracketed = holder.removesuffix(".")
     if bracketed.lower() in _HOLDER_PLACEHOLDERS:
         return True
@@ -100,7 +106,15 @@ def _copyright_holder(holder: str) -> bool:
     if brackets and " " in holder:
         holder = brackets["square"] or brackets["angle"]
     tokens = holder.split(" ", MAX_HOLDER_TOKENS)
-    return len(tokens) <= MAX_HOLDER_TOKENS and all(_holder_token(token) for token in tokens)
+    if len(tokens) > MAX_HOLDER_TOKENS:
+        return False
+    has_holder_token = False
+    for token in tokens[:MAX_HOLDER_TOKENS]:
+        if _holder_token(token):
+            has_holder_token = True
+        elif not _HOLDER_ALIAS.fullmatch(token):
+            return False
+    return has_holder_token
 
 
 def _holder_token(token: str) -> bool:
