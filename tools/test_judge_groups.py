@@ -506,17 +506,29 @@ class TrialIdentityTests(unittest.TestCase):
     def test_unknown_trial_version_never_resumes(self):
         """Keep fingerprinted records from an unsupported version without using them."""
         self.first_run()
-        records = self.new_rows()
-        for record in records:
-            record["record_version"] = 99
-        before = "".join(json.dumps(row) + "\n" for row in records).encode()
-        self.trials.write_bytes(before)
-        stderr = io.StringIO()
-        with redirect_stderr(stderr):
-            judge_groups.run(**self.options)
-        self.assert_calls(12, 12)
-        self.assertEqual(len(self.new_rows(before)), 12)
-        self.assertIn("unsupported trial records", stderr.getvalue())
+        baseline = self.new_rows()
+        missing = object()
+        for version in (1, 3, 99, "2", 2.0, True, None, missing):
+            with self.subTest(version="<missing>" if version is missing else version):
+                rows = [
+                    {key: value for key, value in row.items() if key != "record_version"}
+                    if version is missing else (row | {"record_version": version})
+                    for row in baseline
+                ]
+                before = "".join(json.dumps(row) + "\n" for row in rows).encode()
+                self.trials.write_bytes(before)
+                self.chat.reset_mock()
+                self.judge.reset_mock()
+                stderr = io.StringIO()
+                with redirect_stderr(stderr):
+                    judge_groups.run(**self.options)
+                self.assert_calls(12, 12)
+                self.assertEqual(len(self.new_rows(before)), 12)
+                self.assertEqual(
+                    stderr.getvalue().splitlines(),
+                    [f"12 legacy or unsupported trial records ignored "
+                     f"(expected record version 2 and input fingerprints): {self.trials}"],
+                )
 
     def test_trial_history_over_cap_is_refused(self):
         """Refuse an overlong history before invoking either model."""
