@@ -80,8 +80,15 @@ skill's root are excluded from its digest. The text report gives the count and
 first skipped path for each affected copy, even when there is no drift.
 With `--json`, every reported copy includes a sorted `skipped_links` list, and
 the `skipped` list shows affected copies for names without drift. The scan
-continues after a folder error and lists each error on stderr or in the JSON
-`errors` list. The exit status is 2 if any folder fails, 1 if there is drift
+continues after a folder error while time remains and lists each error on
+stderr or in the JSON `errors` list.
+
+`DRIFT_SCAN_SECONDS` sets a 30-second scan budget for the whole drift run,
+including all client folders and synced sets. The deadline is checked between
+filesystem calls, so a single blocking call can overrun it. On expiry, the
+current folder gets an error with the limit and elapsed time. Remaining folders
+get the `not scanned` status in the JSON `folders` list and the same reason in
+`errors`. The exit status is 2 on expiry or any folder error, 1 for drift
 without errors, or 0 otherwise.
 
 ## Census
