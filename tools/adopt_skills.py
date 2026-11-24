@@ -1174,7 +1174,7 @@ def sync_licences(root: Path, reuse_text: str, runner=default_download_runner, *
         cmd = ['reuse', 'download', '-o', str(lic_file), spdx_id]
         try:
             runner(cmd, cwd=dest_root)
-        except Exception as error:
+        except (ValueError, OSError, subprocess.SubprocessError) as error:
             mapped = _download_error(cmd, error)
             raise mapped from (error.__cause__ if mapped is error else error)
         if lic_file.is_file():
@@ -1182,8 +1182,13 @@ def sync_licences(root: Path, reuse_text: str, runner=default_download_runner, *
     return written
 
 
+# Root metadata files publish stages and moves like every other output.
+METADATA_FILES = ('REUSE.toml', 'CREDITS.md')
+
+
 def _stage_publish(root: Path, staging: Path, saved: Path, rows: list[dict],
-                   reuse: str, credits: str, adopted_map, group_map, runner) -> tuple[list[Path], list[Path], bool]:
+                   metadata: dict[str, str], adopted_map, group_map,
+                   runner) -> tuple[list[Path], list[Path], bool]:
     """Stage adopted skills, metadata, index and downloaded licences before touching root."""
     staged_skills = []
     for row in rows[:MAX_ROWS]:
@@ -1195,9 +1200,10 @@ def _stage_publish(root: Path, staging: Path, saved: Path, rows: list[dict],
         target = staging / 'skills' / Path(row['directory']).name
         shutil.copytree(saved / target.name, target)
         staged_skills.append(target)
-    for name, text in (('REUSE.toml', reuse), ('CREDITS.md', credits)):
-        (staging / name).write_text(text, encoding='utf-8')
-    staged_licences = sync_licences(root, reuse, runner=runner, staging=staging)
+    for name in METADATA_FILES:
+        (staging / name).write_text(metadata[name], encoding='utf-8')
+    staged_licences = sync_licences(root, metadata['REUSE.toml'], runner=runner,
+                                    staging=staging)
     index_staged = write_index(root, adopted_map=adopted_map, group_map=group_map,
                                target=staging / 'INDEX.tsv', staged_skills=staging / 'skills')
     return staged_licences, staged_skills, index_staged
@@ -1210,7 +1216,7 @@ def _commit_publish(root: Path, staging: Path, staged_licences: list[Path],
         (root / 'LICENSES').mkdir(parents=True, exist_ok=True)
         for lic in staged_licences[:MAX_ROWS]:
             os.replace(lic, root / 'LICENSES' / lic.name)
-    for name in ('REUSE.toml', 'CREDITS.md'):
+    for name in METADATA_FILES:
         os.replace(staging / name, root / name)
     if index_staged:
         (root / 'skills').mkdir(parents=True, exist_ok=True)
@@ -1229,7 +1235,8 @@ def publish(root, saved, rows, reuse, credits, adopted_map=None, group_map=None,
     staging = Path(tempfile.mkdtemp(dir=root, prefix='.adopt-publish-'))
     try:
         licences, skills, index_staged = _stage_publish(
-            root, staging, saved, rows, reuse, credits, adopted_map, group_map, runner,
+            root, staging, saved, rows, {'REUSE.toml': reuse, 'CREDITS.md': credits},
+            adopted_map, group_map, runner,
         )
         _commit_publish(root, staging, licences, skills, index_staged)
     finally:

@@ -554,9 +554,11 @@ class AdoptionTests(unittest.TestCase):
         self.candidates, self.census = [], []
         pin = self.source({'pack/extra/SKILL.md': MD.format(name='extra'), 'pack/extra/LICENSE': 'MIT-0\n'},
                           source='other/repo')
-        self.candidates.append(dict(source='other/repo', path='pack/extra/SKILL.md', skill_name='extra',
-                                    verdict='candidate', licence='MIT-0', licence_evidence='folder',
-                                    functions='testing'))
+        self.candidates.append({
+            'source': 'other/repo', 'path': 'pack/extra/SKILL.md',
+            'skill_name': 'extra', 'verdict': 'candidate', 'licence': 'MIT-0',
+            'licence_evidence': 'folder', 'functions': 'testing',
+        })
         self.census.append({'source': 'other/repo', 'path': 'pack/extra/SKILL.md', 'pin': pin})
 
         def failing_runner(cmd, *, cwd=None):
@@ -576,9 +578,11 @@ class AdoptionTests(unittest.TestCase):
         self.candidates, self.census = [], []
         pin = self.source({'pack/extra/SKILL.md': MD.format(name='extra'), 'pack/extra/LICENSE': 'MIT-0\n'},
                           source='other/repo')
-        self.candidates.append(dict(source='other/repo', path='pack/extra/SKILL.md', skill_name='extra',
-                                    verdict='candidate', licence='MIT-0', licence_evidence='folder',
-                                    functions='testing'))
+        self.candidates.append({
+            'source': 'other/repo', 'path': 'pack/extra/SKILL.md',
+            'skill_name': 'extra', 'verdict': 'candidate', 'licence': 'MIT-0',
+            'licence_evidence': 'folder', 'functions': 'testing',
+        })
         self.census.append({'source': 'other/repo', 'path': 'pack/extra/SKILL.md', 'pin': pin})
 
         def timeout_runner(cmd, *, cwd=None):
@@ -638,9 +642,11 @@ class AdoptionTests(unittest.TestCase):
             'pack/second/SKILL.md': MD.format(name='second'), 'pack/second/LICENSE': 'MIT-0\n',
         })
         for name, dom in (('first', 'science'), ('second', 'dev')):
-            self.candidates.append(dict(source='owner/repo', path=f'pack/{name}/SKILL.md', skill_name=name,
-                                        verdict='candidate', licence='MIT-0', licence_evidence='folder',
-                                        functions='testing', domains=dom))
+            self.candidates.append({
+                'source': 'owner/repo', 'path': f'pack/{name}/SKILL.md',
+                'skill_name': name, 'verdict': 'candidate', 'licence': 'MIT-0',
+                'licence_evidence': 'folder', 'functions': 'testing', 'domains': dom,
+            })
             self.census.append({'source': 'owner/repo', 'path': f'pack/{name}/SKILL.md', 'pin': pin})
         downloads = []
 
@@ -814,8 +820,9 @@ class AdoptionTests(unittest.TestCase):
         self.assertTrue((self.root / 'skills/alpha-skill').is_dir())
         self.assertTrue((self.root / 'skills/alpha-skill-obra').is_dir())
         lines = (self.root / 'skills/INDEX.tsv').read_text(encoding='utf-8').splitlines()
-        row_alpha = [line for line in lines[1:] if line.startswith('alpha-skill\t')][0]
-        row_beta = [line for line in lines[1:] if line.startswith('alpha-skill-obra\t')][0]
+        row_alpha = next(line for line in lines[1:] if line.startswith('alpha-skill\t'))
+        row_beta = next(line for line in lines[1:]
+                        if line.startswith('alpha-skill-obra\t'))
         self.assertEqual(row_alpha.split('\t')[3:5], ['science', '42'])
         self.assertEqual(row_beta.split('\t')[3:5], ['dev', '42'])
         self.assertEqual(check_skills.check(self.root), 0)
