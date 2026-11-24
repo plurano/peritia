@@ -924,24 +924,28 @@ class AdoptionTests(unittest.TestCase):
         self.assertEqual([r['verdict'] for r in rows], ['adopted', 'adopted'])
         self.assertEqual([p.name for p in self.root.iterdir() if p.name.startswith('.adopt-publish')], [])
 
-    def _fork_kill_on_second_skill(self, fake_runner):
-        """Run --apply in a child process that exits via os._exit right before installing skills/second."""
+    def _fork_kill_before_replace(self, fake_runner, stop_dest: Path, exit_code: int = 99):
+        """Run --apply in a child process that exits via os._exit right before replacing stop_dest."""
         if not hasattr(os, 'fork'):
             self.skipTest('os.fork unavailable')
         real_replace = os.replace
         pid = os.fork()
         if pid == 0:
-            def kill_on_second(src, dst):
+            def kill_at_dest(src, dst):
                 """Exit immediately without running Python cleanup handlers."""
-                if Path(dst) == self.root / 'skills/second':
-                    os._exit(99)
+                if Path(dst) == stop_dest:
+                    os._exit(exit_code)
                 real_replace(src, dst)
 
-            with patch.object(adopt.os, 'replace', side_effect=kill_on_second):
+            with patch.object(adopt.os, 'replace', side_effect=kill_at_dest):
                 self.invoke(apply=True, runner=fake_runner)
             os._exit(0)
         _, status = os.waitpid(pid, 0)
-        self.assertTrue(os.WIFEXITED(status) and os.WEXITSTATUS(status) == 99)
+        self.assertTrue(os.WIFEXITED(status) and os.WEXITSTATUS(status) == exit_code)
+
+    def _fork_kill_on_second_skill(self, fake_runner):
+        """Run --apply in a child process that exits via os._exit right before installing skills/second."""
+        self._fork_kill_before_replace(fake_runner, self.root / 'skills/second', exit_code=99)
 
     def test_hard_kill_between_publish_renames_measured(self):
         """Reconcile a hard-killed publish on the next --apply so withdrawn skills leave no attribution."""
@@ -983,24 +987,27 @@ class AdoptionTests(unittest.TestCase):
         self.assertEqual(snapshot(root_empty), before_seed)
 
     def test_reconcile_interrupted_mid_recovery_is_idempotent(self):
-        """Complete reconciliation cleanly after a hard kill interrupts an earlier reconcile pass."""
+        """Complete reconciliation cleanly after a hard kill interrupts recovery past a real undo."""
         self._seed_existing_skill()
         fake_runner, _ = self._two_mit0_candidates()
         self._fork_kill_on_second_skill(fake_runner)
+        self.assertTrue((self.root / 'skills/first').is_dir())
 
         real_undo = adopt._undo_journal_entry
         pid = os.fork()
         if pid == 0:
-            def kill_after_first_undo(kind, path, other=None):
-                """Complete one recovery step and exit immediately."""
-                real_undo(kind, path, other)
-                os._exit(98)
+            def kill_after_first_skill_undo(kind, path, other=None, source=None):
+                """Exit immediately once recovery removes the installed skills/first directory."""
+                real_undo(kind, path, other, source)
+                if path == self.root / 'skills/first' and not path.exists():
+                    os._exit(98)
 
-            with patch.object(adopt, '_undo_journal_entry', side_effect=kill_after_first_undo):
+            with patch.object(adopt, '_undo_journal_entry', side_effect=kill_after_first_skill_undo):
                 self.invoke(apply=True, runner=fake_runner)
             os._exit(0)
         _, status = os.waitpid(pid, 0)
         self.assertTrue(os.WIFEXITED(status) and os.WEXITSTATUS(status) == 98)
+        self.assertFalse((self.root / 'skills/first').exists())
         self.assertTrue((self.root / adopt.JOURNAL_NAME).is_file())
 
         rows, _ = self.invoke(apply=True, runner=fake_runner)
@@ -1990,8 +1997,8 @@ class AdoptionTests(unittest.TestCase):
         self._fork_kill_on_second_skill(fake_runner)
         journal_file = self.root / adopt.JOURNAL_NAME
         payload = json.loads(journal_file.read_text(encoding='utf-8'))
-        payload['backups']['REUSE.toml'], payload['backups']['CREDITS.md'] = (
-            payload['backups']['CREDITS.md'], payload['backups']['REUSE.toml'],
+        payload['backups']['REUSE.toml']['backup'], payload['backups']['CREDITS.md']['backup'] = (
+            payload['backups']['CREDITS.md']['backup'], payload['backups']['REUSE.toml']['backup'],
         )
         journal_file.write_text(json.dumps(payload), encoding='utf-8')
         before = snapshot(self.root)
@@ -2129,6 +2136,138 @@ class AdoptionTests(unittest.TestCase):
         rows, _ = self.invoke(apply=True, runner=fake_runner)
         self.assertEqual([r['verdict'] for r in rows], ['adopted', 'adopted'])
         self.assertEqual(check_skills.check(self.root), 0)
+
+    def test_reconcile_preserves_operator_skill_when_rename_did_not_run(self):
+        """Keep operator-created skills/second when its staged rename never ran, while undoing completed moves."""
+        self._seed_existing_skill()
+        pre_reuse = (self.root / 'REUSE.toml').read_bytes()
+        pre_credits = (self.root / 'CREDITS.md').read_bytes()
+        pre_index = (self.root / 'skills/INDEX.tsv').read_bytes()
+        fake_runner, _ = self._two_mit0_candidates()
+        self._fork_kill_on_second_skill(fake_runner)
+
+        self.assertTrue((self.root / 'skills/first').is_dir())
+        self.assertFalse((self.root / 'skills/second').exists())
+        operator_second = self.root / 'skills/second'
+        operator_second.mkdir()
+        marker = operator_second / 'operator-marker.txt'
+        marker.write_text('handcrafted by operator\n', encoding='utf-8')
+
+        adopt._reconcile_publish_journal(self.root, apply=True)
+
+        self.assertTrue(operator_second.is_dir())
+        self.assertEqual(marker.read_text(encoding='utf-8'), 'handcrafted by operator\n')
+        self.assertFalse((self.root / 'skills/first').exists())
+        self.assertFalse((self.root / 'LICENSES/MIT-0.txt').exists())
+        self.assertFalse((self.root / adopt.JOURNAL_NAME).exists())
+        self.assertEqual([p.name for p in self.root.iterdir() if p.name.startswith('.adopt-publish')], [])
+        self.assertEqual((self.root / 'REUSE.toml').read_bytes(), pre_reuse)
+        self.assertEqual((self.root / 'CREDITS.md').read_bytes(), pre_credits)
+        self.assertEqual((self.root / 'skills/INDEX.tsv').read_bytes(), pre_index)
+
+    def test_reconcile_preserves_operator_licence_when_rename_did_not_run(self):
+        """Keep operator-created LICENSES/MIT-0.txt when hard-killed before its staged rename ran."""
+        self._seed_existing_skill()
+        pin = self.source({
+            'pack/first/SKILL.md': MD.format(name='first'), 'pack/first/LICENSE': 'Apache-2.0\n',
+            'pack/second/SKILL.md': MD.format(name='second'), 'pack/second/LICENSE': 'MIT-0\n',
+        })
+        for name, lic in (('first', 'Apache-2.0'), ('second', 'MIT-0')):
+            self.candidates.append({
+                'source': 'owner/repo', 'path': f'pack/{name}/SKILL.md',
+                'skill_name': name, 'verdict': 'candidate', 'licence': lic,
+                'licence_evidence': 'folder', 'functions': 'testing',
+            })
+            self.census.append({'source': 'owner/repo', 'path': f'pack/{name}/SKILL.md', 'pin': pin})
+
+        def multi_runner(cmd, *, cwd=None):
+            """Write deterministic staged licence files for Apache-2.0 and MIT-0."""
+            self.assertIsNotNone(cwd)
+            Path(cmd[cmd.index('-o') + 1]).write_text(f'Downloaded {cmd[-1]}\n', encoding='utf-8')
+            return b'ok'
+
+        self._fork_kill_before_replace(multi_runner, self.root / 'LICENSES/MIT-0.txt', exit_code=96)
+        self.assertTrue((self.root / 'LICENSES/Apache-2.0.txt').is_file())
+        self.assertFalse((self.root / 'LICENSES/MIT-0.txt').exists())
+        operator_lic = self.root / 'LICENSES/MIT-0.txt'
+        operator_lic.write_text('Operator custom MIT-0\n', encoding='utf-8')
+
+        adopt._reconcile_publish_journal(self.root, apply=True)
+
+        self.assertEqual(operator_lic.read_text(encoding='utf-8'), 'Operator custom MIT-0\n')
+        self.assertFalse((self.root / 'LICENSES/Apache-2.0.txt').exists())
+        self.assertTrue((self.root / 'LICENSES/MIT.txt').is_file())
+        self.assertFalse((self.root / adopt.JOURNAL_NAME).exists())
+        self.assertEqual([p.name for p in self.root.iterdir() if p.name.startswith('.adopt-publish')], [])
+
+    def test_reconcile_preserves_edited_reuse_when_killed_before_metadata_replace(self):
+        """Keep operator edits to REUSE.toml when hard-killed before the REUSE.toml replacement ran."""
+        self._seed_existing_skill()
+        pre_credits = (self.root / 'CREDITS.md').read_bytes()
+        pre_index = (self.root / 'skills/INDEX.tsv').read_bytes()
+        fake_runner, _ = self._two_mit0_candidates()
+        self._fork_kill_before_replace(fake_runner, self.root / 'REUSE.toml', exit_code=97)
+
+        self.assertTrue((self.root / adopt.JOURNAL_NAME).is_file())
+        self.assertTrue((self.root / 'LICENSES/MIT-0.txt').is_file())
+        edited_reuse = (self.root / 'REUSE.toml').read_text(encoding='utf-8') + '# operator comment\n'
+        (self.root / 'REUSE.toml').write_text(edited_reuse, encoding='utf-8')
+
+        adopt._reconcile_publish_journal(self.root, apply=True)
+
+        self.assertEqual((self.root / 'REUSE.toml').read_bytes(), edited_reuse.encode('utf-8'))
+        self.assertEqual((self.root / 'CREDITS.md').read_bytes(), pre_credits)
+        self.assertEqual((self.root / 'skills/INDEX.tsv').read_bytes(), pre_index)
+        self.assertFalse((self.root / 'LICENSES/MIT-0.txt').exists())
+        self.assertFalse((self.root / adopt.JOURNAL_NAME).exists())
+        self.assertEqual([p.name for p in self.root.iterdir() if p.name.startswith('.adopt-publish')], [])
+
+    def test_reconcile_preserves_operator_index_when_index_not_staged(self):
+        """Leave operator-created skills/INDEX.tsv untouched when publish staged no index."""
+        pre_reuse = (self.root / 'REUSE.toml').read_bytes()
+        self.assertFalse((self.root / 'skills').exists())
+        self._fork_kill_before_replace(None, self.root / 'CREDITS.md', exit_code=97)
+
+        journal_file = self.root / adopt.JOURNAL_NAME
+        payload = json.loads(journal_file.read_text(encoding='utf-8'))
+        self.assertEqual(payload['backups']['skills/INDEX.tsv'], {'backup': None, 'source': None})
+        edited_credits = (self.root / 'CREDITS.md').read_text(encoding='utf-8') + '<!-- operator note -->\n'
+        (self.root / 'CREDITS.md').write_text(edited_credits, encoding='utf-8')
+        (self.root / 'skills').mkdir()
+        index_file = self.root / 'skills/INDEX.tsv'
+        index_file.write_text('skill\tsource\tfunctions\tdomains\toverlap_group\n', encoding='utf-8')
+
+        adopt._reconcile_publish_journal(self.root, apply=True)
+
+        self.assertEqual(index_file.read_text(encoding='utf-8'), 'skill\tsource\tfunctions\tdomains\toverlap_group\n')
+        self.assertEqual((self.root / 'CREDITS.md').read_text(encoding='utf-8'), edited_credits)
+        self.assertEqual((self.root / 'REUSE.toml').read_bytes(), pre_reuse)
+        self.assertFalse(journal_file.exists())
+        self.assertEqual([p.name for p in self.root.iterdir() if p.name.startswith('.adopt-publish')], [])
+
+    def test_journal_invalid_or_null_backup_source_refused_without_modifying_root(self):
+        """Refuse journals with mismatched or null metadata backup sources without modifying root."""
+        self._seed_existing_skill()
+        fake_runner, _ = self._two_mit0_candidates()
+        self._fork_kill_on_second_skill(fake_runner)
+        journal_file = self.root / adopt.JOURNAL_NAME
+        valid = json.loads(journal_file.read_text(encoding='utf-8'))
+        staging = valid['staging']
+        bad_backups = [
+            {**valid['backups'], 'REUSE.toml': {**valid['backups']['REUSE.toml'], 'source': f'{staging}/CREDITS.md'}},
+            {**valid['backups'], 'skills/INDEX.tsv': {
+                **valid['backups']['skills/INDEX.tsv'], 'source': f'{staging}/skills/INDEX.tsv',
+            }},
+            {**valid['backups'], 'REUSE.toml': {**valid['backups']['REUSE.toml'], 'source': 'REUSE.toml'}},
+            {**valid['backups'], 'REUSE.toml': {**valid['backups']['REUSE.toml'], 'source': None}},
+            {**valid['backups'], 'CREDITS.md': {**valid['backups']['CREDITS.md'], 'source': None}},
+        ]
+        for backups_entry in bad_backups[:8]:
+            journal_file.write_text(json.dumps({**valid, 'backups': backups_entry}), encoding='utf-8')
+            before = snapshot(self.root)
+            with self.assertRaisesRegex(ValueError, r'invalid backup source'):
+                self.invoke(apply=True, runner=fake_runner)
+            self.assertEqual(snapshot(self.root), before)
 
 
 class RewriteFencesTests(unittest.TestCase):

@@ -1270,17 +1270,24 @@ def _stage_publish(root: Path, staging: Path, saved: Path, rows: list[dict],
         shutil.copytree(saved / target.name, target)
         staged_skills.append(target)
     for name in METADATA_FILES:
-        (staging / name).write_text(metadata[name], encoding='utf-8')
+        _staged_target_path(staging, root / name).write_text(metadata[name], encoding='utf-8')
     staged_licences = sync_licences(root, metadata['REUSE.toml'], runner=runner,
                                     staging=staging)
-    index_staged = write_index(root, adopted_map=adopted_map, group_map=group_map,
-                               target=staging / 'INDEX.tsv', staged_skills=staging / 'skills')
+    index_staged = write_index(
+        root, adopted_map=adopted_map, group_map=group_map,
+        target=_staged_target_path(staging, root / 'skills/INDEX.tsv'), staged_skills=staging / 'skills',
+    )
     return staged_licences, staged_skills, index_staged
 
 
 def _backup_slot_path(staging: Path, index: int, target: Path) -> Path:
     """Return the canonical staged backup path for one JOURNAL_BACKUP_TARGETS slot."""
     return staging / 'backup' / f'{index}-{target.name}'
+
+
+def _staged_target_path(staging: Path, target: Path) -> Path:
+    """Return the canonical staged replacement path for one JOURNAL_BACKUP_TARGETS entry."""
+    return staging / target.name
 
 
 def _backup_publish_targets(root: Path, staging: Path) -> dict[Path, Path | None]:
@@ -1314,10 +1321,15 @@ def _restore_backup_file(backup: Path, target: Path) -> None:
         raise
 
 
+def _staged_rename_ran(source: Path | None) -> bool:
+    """Return True only when a staged replacement had a source path and that source is gone."""
+    return source is not None and not (source.exists() or source.is_symlink())
+
+
 def _apply_undo_step(kind: str, target: Path, other: Path | None) -> None:
     """Undo one recorded filesystem change under root."""
     if kind == 'move' and other is not None:
-        if (target.exists() or target.is_symlink()) and not (other.exists() or other.is_symlink()):
+        if (target.exists() or target.is_symlink()) and _staged_rename_ran(other):
             os.replace(target, other)
     elif kind == 'restore':
         if other is not None:
@@ -1372,6 +1384,17 @@ def _ensure_publish_dir(folder: Path, undo: list[tuple[str, Path, Path | None]])
         folder.mkdir(parents=True, exist_ok=True)
 
 
+def _journal_backup_record(
+    root: Path, staging: Path, rel: str, backup: Path | None, index_staged: bool,
+) -> dict[str, str | None]:
+    """Build one backup-and-source record for JOURNAL_BACKUP_TARGETS[rel]."""
+    staged = _staged_target_path(staging, root / rel) if (rel in METADATA_FILES or index_staged) else None
+    return {
+        'backup': backup.relative_to(root).as_posix() if backup is not None else None,
+        'source': staged.relative_to(root).as_posix() if staged is not None else None,
+    }
+
+
 def _build_publish_journal(
     root: Path,
     staging: Path,
@@ -1382,7 +1405,7 @@ def _build_publish_journal(
 ) -> dict:
     """Describe the staging directory, backups, planned moves and new directories relative to root."""
     backup_map = {
-        rel: (backups[root / rel].relative_to(root).as_posix() if backups[root / rel] is not None else None)
+        rel: _journal_backup_record(root, staging, rel, backups[root / rel], index_staged)
         for rel in JOURNAL_BACKUP_TARGETS
     }
     moves = [
@@ -1471,30 +1494,45 @@ def _read_journal_json(journal_path: Path) -> dict:
     return data
 
 
+def _parse_journal_backup_entry(
+    root: Path, staging_path: Path, idx: int, rel: str, raw_entry: object, journal_path: Path,
+) -> tuple[Path, Path | None, Path | None]:
+    """Validate one target's backup and staged-source slot in the publish journal."""
+    if not isinstance(raw_entry, dict) or set(raw_entry) != {'backup', 'source'}:
+        raise _journal_error(journal_path, 'malformed backups mapping')
+    target_path = _journal_rel_path(root, rel, journal_path)
+    backup_rel = raw_entry['backup']
+    backup_path: Path | None = None
+    if backup_rel is not None:
+        backup_path = _journal_rel_path(root, backup_rel, journal_path)
+        if backup_path != _backup_slot_path(staging_path, idx, target_path) or not backup_path.is_file():
+            raise _journal_error(journal_path, f'invalid backup path: {backup_rel!r}')
+    source_rel = raw_entry['source']
+    if source_rel is None:
+        if rel in METADATA_FILES:
+            raise _journal_error(journal_path, f'invalid backup source: {source_rel!r}')
+        return target_path, backup_path, None
+    source_path = _journal_rel_path(root, source_rel, journal_path)
+    if source_path != _staged_target_path(staging_path, target_path):
+        raise _journal_error(journal_path, f'invalid backup source: {source_rel!r}')
+    return target_path, backup_path, source_path
+
+
 def _parse_journal_backups(
     root: Path, staging_path: Path, raw_backups: object, journal_path: Path,
-) -> list[tuple[Path, Path | None]]:
-    """Validate the three backup entries recorded in the publish journal."""
+) -> list[tuple[Path, Path | None, Path | None]]:
+    """Validate the three backup and staged-source entries recorded in the publish journal."""
     if not isinstance(raw_backups, dict) or set(raw_backups) != set(JOURNAL_BACKUP_TARGETS):
         raise _journal_error(journal_path, 'malformed backups mapping')
-    entries: list[tuple[Path, Path | None]] = []
-    for idx, rel in enumerate(JOURNAL_BACKUP_TARGETS):
-        target_path = _journal_rel_path(root, rel, journal_path)
-        backup_rel = raw_backups[rel]
-        if backup_rel is None:
-            entries.append((target_path, None))
-            continue
-        backup_path = _journal_rel_path(root, backup_rel, journal_path)
-        expected = _backup_slot_path(staging_path, idx, target_path)
-        if backup_path != expected or not backup_path.is_file():
-            raise _journal_error(journal_path, f'invalid backup path: {backup_rel!r}')
-        entries.append((target_path, backup_path))
-    return entries
+    return [
+        _parse_journal_backup_entry(root, staging_path, idx, rel, raw_backups[rel], journal_path)
+        for idx, rel in enumerate(JOURNAL_BACKUP_TARGETS)
+    ]
 
 
 def _validate_journal_move(
     root: Path, staging_path: Path, item: object, journal_path: Path,
-) -> tuple[str, Path]:
+) -> tuple[str, Path, Path]:
     """Validate one planned move entry from the publish journal."""
     if not isinstance(item, dict) or set(item) != {'kind', 'source', 'destination'}:
         raise _journal_error(journal_path, 'malformed move entry')
@@ -1504,15 +1542,19 @@ def _validate_journal_move(
     if not src.is_relative_to(staging_path):
         raise _journal_error(journal_path, f'move source outside staging: {item["source"]!r}')
     if kind == 'licence' and dest.parent == root / 'LICENSES' and dest.suffix == '.txt':
-        return kind, dest
+        if src != staging_path / 'LICENSES' / dest.name:
+            raise _journal_error(journal_path, f'invalid move source: {item["source"]!r}')
+        return kind, src, dest
     if kind == 'skill' and dest.parent == root / 'skills' and NAME.fullmatch(dest.name):
-        return kind, dest
+        if src != staging_path / 'skills' / dest.name:
+            raise _journal_error(journal_path, f'invalid move source: {item["source"]!r}')
+        return kind, src, dest
     raise _journal_error(journal_path, f'invalid move destination: {item["destination"]!r}')
 
 
 def _parse_journal_moves(
     root: Path, staging_path: Path, raw_moves: object, journal_path: Path,
-) -> list[tuple[str, Path]]:
+) -> list[tuple[str, Path, Path]]:
     """Validate the planned licence and skill moves recorded in the publish journal."""
     limit = MAX_ROWS + check_skills.MAX_SKILLS
     if not isinstance(raw_moves, list) or len(raw_moves) > limit:
@@ -1522,7 +1564,7 @@ def _parse_journal_moves(
 
 def _load_publish_journal(
     root: Path, journal_path: Path,
-) -> tuple[Path, list[tuple[Path, Path | None]], list[tuple[str, Path]], list[Path]]:
+) -> tuple[Path, list[tuple[Path, Path | None, Path | None]], list[tuple[str, Path, Path]], list[Path]]:
     """Read and validate root/.adopt-publish.journal.json before modifying root."""
     data = _read_journal_json(journal_path)
     staging = _journal_rel_path(root, data['staging'], journal_path)
@@ -1535,12 +1577,20 @@ def _load_publish_journal(
     raw_dirs = data['created_dirs']
     if not isinstance(raw_dirs, list) or len(raw_dirs) > 4 or not set(raw_dirs).issubset({'LICENSES', 'skills'}):
         raise _journal_error(journal_path, 'malformed created_dirs list')
-    created_dirs = [_journal_rel_path(root, rel, journal_path) for rel in raw_dirs]
+    created_dirs = [_journal_rel_path(root, rel, journal_path) for rel in raw_dirs[:4]]
     return staging, backups, moves, created_dirs
 
 
-def _undo_journal_entry(kind: str, path: Path, other: Path | None = None) -> None:
-    """Execute one idempotent journal recovery step under root."""
+def _undo_journal_entry(
+    kind: str, path: Path, other: Path | None = None, source: Path | None = None,
+) -> None:
+    """Execute one idempotent journal recovery step when its staged rename completed."""
+    if kind == 'rmdir':
+        if path.is_dir() and not any(path.iterdir()):
+            path.rmdir()
+        return
+    if not _staged_rename_ran(source):
+        return
     if kind == 'skill':
         if path.is_dir():
             shutil.rmtree(path)
@@ -1551,19 +1601,19 @@ def _undo_journal_entry(kind: str, path: Path, other: Path | None = None) -> Non
             path.unlink(missing_ok=True)
         else:
             _restore_backup_file(other, path)
-    elif kind == 'rmdir' and path.is_dir() and not any(path.iterdir()):
-        path.rmdir()
 
 
 def _collect_journal_undos(
-    backups: list[tuple[Path, Path | None]],
-    moves: list[tuple[str, Path]],
+    backups: list[tuple[Path, Path | None, Path | None]],
+    moves: list[tuple[str, Path, Path]],
     created_dirs: list[Path],
-) -> list[tuple[str, Path, Path | None]]:
+) -> list[tuple[str, Path, Path | None, Path | None]]:
     """Build the ordered recovery steps for an interrupted publish journal."""
-    steps: list[tuple[str, Path, Path | None]] = [(kind, dest, None) for kind, dest in reversed(moves)]
-    steps.extend(('backup', target, backup) for target, backup in backups)
-    steps.extend(('rmdir', folder, None) for folder in reversed(created_dirs))
+    steps: list[tuple[str, Path, Path | None, Path | None]] = [
+        (kind, dest, None, src) for kind, src, dest in reversed(moves)
+    ]
+    steps.extend(('backup', target, backup, src) for target, backup, src in backups)
+    steps.extend(('rmdir', folder, None, None) for folder in reversed(created_dirs))
     return steps
 
 
@@ -1583,9 +1633,9 @@ def _reconcile_publish_journal(root: Path, *, apply: bool) -> None:
     steps = _collect_journal_undos(backups, moves, created_dirs)
     failures: list[tuple[str, Path, Path | None]] = []
     first_error: OSError | None = None
-    for kind, target, other in steps[:MAX_ROWS + check_skills.MAX_SKILLS + 8]:
+    for kind, target, other, source in steps[:MAX_ROWS + check_skills.MAX_SKILLS + 8]:
         try:
-            _undo_journal_entry(kind, target, other)
+            _undo_journal_entry(kind, target, other, source)
         except OSError as error:
             if first_error is None:
                 first_error = error
@@ -1616,12 +1666,12 @@ def _apply_commit_moves(
     for name in METADATA_FILES:
         target = root / name
         undo.append(('restore', target, backups[target]))
-        os.replace(staging / name, target)
+        os.replace(_staged_target_path(staging, target), target)
     if index_staged:
         _ensure_publish_dir(root / 'skills', undo)
         index_target = root / 'skills' / 'INDEX.tsv'
         undo.append(('restore', index_target, backups[index_target]))
-        os.replace(staging / 'INDEX.tsv', index_target)
+        os.replace(_staged_target_path(staging, index_target), index_target)
     for staged_skill in skills[:check_skills.MAX_SKILLS]:
         _ensure_publish_dir(root / 'skills', undo)
         dest = root / 'skills' / staged_skill.name
