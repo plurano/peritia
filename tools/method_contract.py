@@ -1,11 +1,17 @@
 # SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
 # SPDX-License-Identifier: EUPL-1.2
-"""Typed reader for the Epitrop slot result, the result half of the Peritia method contract.
+"""Typed reader for the Peritia method contract in contracts/method.schema.json.
 
-The result's shape is Epitrop's own schema, vendored at the commit contracts/epitrop/vendor.json pins
-from https://github.com/tekmora/epitrop (EUPL-1.2). This module also mirrors the done-needs-head rule,
-the checks on evidence path text, and the integer representation of evidence line counts. Epitrop's
-workspace policy covers the run's unit id, the 64 KiB result-file cap, symlinks, and evidence file checks.
+A method definition states what one executable method computes, from which inputs in which units,
+under which model, with which exact tool version, where its result holds and how it is checked. A
+run's result is the Epitrop slot result, whose shape is Epitrop's own schema, vendored at the commit
+contracts/epitrop/vendor.json pins from https://github.com/tekmora/epitrop (EUPL-1.2).
+
+The schemas decide shape. This module adds what a schema cannot state: each input is declared once,
+and a validity bound names a declared input and has min at most max. For results it mirrors Epitrop's
+done-needs-head rule, the checks on evidence path text, and the integer representation of evidence
+line counts. Epitrop's workspace policy covers the run's unit id, the 64 KiB result-file cap,
+symlinks, and evidence file checks.
 Documents are parsed as strict UTF-8 JSON with finite numbers and unique keys.
 """
 from __future__ import annotations
@@ -26,6 +32,7 @@ from referencing import Registry, Resource
 from regress import Regex, RegressError
 
 CONTRACTS_DIR = Path(__file__).resolve().parent / "contracts"
+METHOD_SCHEMA_PATH = CONTRACTS_DIR / "method.schema.json"
 EPITROP_DIR = CONTRACTS_DIR / "epitrop"
 EPITROP_RESULT_SCHEMA_PATH = EPITROP_DIR / "result.schema.json"
 MAX_DOCUMENT_BYTES = 1 << 20  # a contract document is small; refuse anything larger
@@ -36,6 +43,52 @@ EVIDENCE_PREFIX = ".slot/out/evidence/"
 
 class ContractError(ValueError):
     """A document breaks the contract; the message lists every reason found."""
+
+
+@dataclass(frozen=True)
+class Input:
+    """One input a method reads: its name, physical quantity, unit and whether a run needs it."""
+
+    name: str
+    quantity: str
+    unit: str
+    required: bool
+
+
+@dataclass(frozen=True)
+class Bound:
+    """Where a method's result holds for one input, in that input's unit, both ends inclusive."""
+
+    input: str
+    min: float | None
+    max: float | None
+
+    def holds(self, value: float) -> bool:
+        """Return whether value lies inside this bound."""
+        return (self.min is None or value >= self.min) and (self.max is None or value <= self.max)
+
+
+@dataclass(frozen=True)
+class Method:
+    """A typed method definition, read from a document that passed the method schema."""
+
+    id: str
+    skill: str
+    task: str
+    inputs: tuple[Input, ...]
+    conventions: tuple[str, ...]
+    model: str
+    assumptions: tuple[str, ...]
+    tool: str
+    version: str
+    validity_domain: tuple[Bound, ...]
+    verifier_command: tuple[str, ...]
+    acceptance: str
+    result_class: str
+
+    def input(self, name: str) -> Input | None:
+        """Return the declared input called name, or None when the method has none."""
+        return next((item for item in self.inputs if item.name == name), None)
 
 
 @dataclass(frozen=True)
@@ -105,7 +158,7 @@ def parse_document(text: str | bytes, origin: str) -> object:
 
 
 def read_document(path: Path) -> object:
-    """Read and parse one contract document from path."""
+    """Read and parse one byte-capped document. Local repository schema reads have no deadline."""
     try:
         with path.open("rb") as handle:
             text = handle.read(MAX_DOCUMENT_BYTES + 1)
@@ -131,16 +184,27 @@ _ContractValidator = validators.extend(Draft202012Validator, validators={"patter
 
 @functools.cache
 def _validators() -> dict[str, Validator]:
-    """Compile the Epitrop result validator once, refusing a broken schema."""
-    result_schema = read_document(EPITROP_RESULT_SCHEMA_PATH)
-    if not isinstance(result_schema, dict):
-        raise ContractError(f"{EPITROP_RESULT_SCHEMA_PATH}: not a JSON object")
-    try:
-        _ContractValidator.check_schema(result_schema)
-    except SchemaError as err:
-        raise ContractError(f"{EPITROP_RESULT_SCHEMA_PATH}: invalid schema: {err.message}") from err
-    registry = Registry().with_resources([(result_schema["$id"], Resource.from_contents(result_schema))])
-    return {"result": _ContractValidator(result_schema, registry=registry)}
+    """Compile the method and Epitrop result validators once, refusing a broken schema."""
+    schemas = {}
+    resources = []
+    for path in (METHOD_SCHEMA_PATH, EPITROP_RESULT_SCHEMA_PATH):
+        schema = read_document(path)
+        if not isinstance(schema, dict):
+            raise ContractError(f"{path}: not a JSON object")
+        try:
+            _ContractValidator.check_schema(schema)
+            schema_id = schema["$id"]
+        except SchemaError as err:
+            raise ContractError(f"{path}: invalid schema: {err.message}") from err
+        except KeyError as err:
+            raise ContractError(f"{path}: missing $id") from err
+        schemas[path] = schema
+        resources.append((schema_id, Resource.from_contents(schema)))
+    registry = Registry().with_resources(resources)
+    return {
+        "method": _ContractValidator(schemas[METHOD_SCHEMA_PATH], registry=registry),
+        "result": _ContractValidator(schemas[EPITROP_RESULT_SCHEMA_PATH], registry=registry),
+    }
 
 
 def _checked(kind: str, document: object) -> dict:
@@ -177,6 +241,51 @@ def _checked_evidence(entries: Sequence[dict]) -> tuple[Evidence, ...]:
             raise ContractError(f"result: evidence {path!r} lines {lines} is not an integer")
         evidence.append(Evidence(path, item["sha256"], lines))
     return tuple(evidence)
+
+
+def _definition_reasons(method: Method) -> list[str]:
+    """Return why a schema-valid definition is still inconsistent, or nothing when it is sound."""
+    reasons = []
+    names = [item.name for item in method.inputs]
+    if len(set(names)) != len(names):
+        reasons.append("an input name is declared twice")
+    bounded = [bound.input for bound in method.validity_domain]
+    if len(set(bounded)) != len(bounded):
+        reasons.append("an input has two validity bounds")
+    for bound in method.validity_domain:
+        if method.input(bound.input) is None:
+            reasons.append(f"validity bound names undeclared input {bound.input!r}")
+        if any(isinstance(end, bool) or (isinstance(end, float) and not math.isfinite(end))
+               for end in (bound.min, bound.max)):
+            reasons.append(f"validity bound of {bound.input!r} has a non-finite end")
+        elif bound.min is not None and bound.max is not None and bound.min > bound.max:
+            reasons.append(f"validity bound of {bound.input!r} has min above max")
+    return reasons
+
+
+def method_from_document(document: object) -> Method:
+    """Return the typed method a definition document states, or raise ContractError."""
+    document = _checked("method", document)
+    method = Method(
+        id=document["id"],
+        skill=document["skill"],
+        task=document["task"],
+        inputs=tuple(Input(**item) for item in document["inputs"]),
+        conventions=tuple(document.get("conventions", ())),
+        model=document["model"]["name"],
+        assumptions=tuple(document["model"]["assumptions"]),
+        tool=document["implementation"]["tool"],
+        version=document["implementation"]["version"],
+        validity_domain=tuple(Bound(item["input"], item.get("min"), item.get("max"))
+                              for item in document["validity_domain"]),
+        verifier_command=tuple(document["verifier"]["command"]),
+        acceptance=document["verifier"]["acceptance"],
+        result_class=document["result_class"],
+    )
+    reasons = _definition_reasons(method)
+    if reasons:
+        raise ContractError(f"method {method.id}: " + "; ".join(reasons))
+    return method
 
 
 def result_from_document(document: object) -> SlotResult:
