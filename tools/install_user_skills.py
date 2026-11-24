@@ -31,9 +31,12 @@ With --json it prints one object with:
   errors: list of "<folder>: <detail>" diagnostics for failed and unscanned folders
 Each copy has digest (full SHA-256), locations (installed paths), and skipped_links
 (sorted relative paths of unresolvable and out-of-tree links excluded from the digest).
-Synced entries with failed type queries get their own errors even if discovery
-stops. If discovery stops on expiry, confirmed children are reported as not
-scanned.
+Synced entries with failed type queries get one diagnostic per folder, even
+if the folder was already scanned or discovery stops. If discovery stops on
+expiry, confirmed children still awaiting a scan are reported as not scanned.
+If expiry is first detected while reporting a queued type-query failure, that
+diagnostic keeps its recorded detail. Subsequent not scanned diagnostics give
+the limit and elapsed time.
 Only completed folders contribute to the counts and differences. The text view
 prints skipped link counts with the first path, and prints each error to stderr.
 """
@@ -55,7 +58,7 @@ from itertools import islice
 from pathlib import Path
 from time import monotonic
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 REPO = "https://github.com/plurano/peritia"
 TAG = "v0.1.0"
@@ -327,6 +330,10 @@ def drift_scan(home):
     resolver internals are unchecked. One blocking call can overrun. Only
     regular files are opened for hashing. Drift exits 2 on expiry or any
     folder error.
+
+    Queued type errors preserve any earlier folder status and inventory. If
+    expiry is first detected while reporting one, it keeps its recorded detail.
+    Subsequent not scanned diagnostics give the limit and elapsed time.
     """
     started = monotonic()
     clients, _ = client_dirs(home, everyone=True)
@@ -335,19 +342,21 @@ def drift_scan(home):
     roots[clients["codex"] / ".system"] = False
     folders, locations, trees = {}, {}, {}
     errors = []
+    reported_type_errors = set()
     expired = None
     pending = [(folder, None) for folder in reversed(roots)]
     for _ in range(len(roots) + MAX_DRIFT_ENTRIES):
         if not pending:
             break
         folder, type_error = pending.pop()
-        if folder in folders:
-            continue
-        if type_error is not None:
-            folders[folder] = "error"
+        if type_error is not None and folder not in reported_type_errors:
+            folders.setdefault(folder, "error")
             detail = f"cannot check directory type for {folder}: {type_error}"
             errors.append(f"{folder}: {detail}")
+            reported_type_errors.add(folder)
             expired = expired or drift_deadline_reason(started)
+            continue
+        if folder in folders:
             continue
         if expired is not None:
             folders[folder] = "not scanned"
@@ -1496,6 +1505,91 @@ def selftest_drift_synced_entry_errors(root):
     return cases
 
 
+def selftest_drift_synced_configured_overlap(root):
+    """Keep the configured scan when synced discovery cannot check its type."""
+    home = root / "synced-configured-overlap"
+    synced = home / ".claude/skills/synced"
+    configured = fixture_skill(synced, "skills/example", "configured\n")
+    other = fixture_skill(home, ".agents/skills/example", "other\n")
+    status, baseline = fixture_drift(home, codex_home=synced)
+    row = {"path": str(configured.parent), "status": "scanned"}
+    locations = [path for diff in baseline["drift"]
+                 for copy in diff["copies"] for path in copy["locations"]]
+    cases = [("drift: synced configured overlap without denial is scanned once",
+              status == 1 and baseline["errors"] == []
+              and baseline["folders"].count(row) == 1
+              and fixture_first_difference(baseline) == "SKILL.md"
+              and sorted(locations) == sorted((str(configured), str(other))))]
+
+    folder = configured.parent
+    detail = OSError(errno.EACCES, os.strerror(errno.EACCES), str(folder))
+    expected = f"{folder}: cannot check directory type for {folder}: {detail}"
+    with (
+        fixture_synced_entries(
+            synced, partial(fixture_reject_synced, folder, errno.EACCES),
+        ),
+        patch.object(
+            sys.modules[__name__], "drift_folder_ready", wraps=drift_folder_ready,
+        ) as checked,
+    ):
+        status, report = fixture_drift(home, codex_home=synced)
+    checks = [entry.args[0] for entry in checked.call_args_list]
+    error_status = 2
+    cases.append(("drift: synced overlap keeps inventory and reports the exact denial",
+                  status == error_status
+                  and report == {**baseline, "errors": [expected]}
+                  and checks.count(folder) == 1))
+    return cases
+
+
+def selftest_drift_queued_type_errors(root):
+    """Deduplicate queued type errors and preserve their detail at expiry."""
+    home = root / "synced-queued-type-errors"
+    waiting = fixture_skill(
+        home, ".claude/skills/synced/waiting/example", "waiting\n",
+    ).parent
+    failed = waiting.with_name("denied")
+    detail = OSError(errno.EACCES, os.strerror(errno.EACCES), str(failed))
+    denied = f"{failed}: cannot check directory type for {failed}: {detail}"
+    module = sys.modules[__name__]
+    cases = []
+
+    def discover(_folder, _started, pending):
+        """Queue two errors for one folder and advance time after discovery."""
+        duplicate = OSError("duplicate fixture type error")
+        pending.extend(((waiting, None), (failed, duplicate), (failed, detail)))
+        clock.return_value = elapsed
+
+    error_status = 2
+    for elapsed in (0.999, 1.0):
+        with (
+            patch.object(module, "drift_discover_synced", side_effect=discover),
+            patch.object(module, "DRIFT_SCAN_SECONDS", 1),
+            patch.object(module, "monotonic", return_value=0.0) as clock,
+            patch.object(
+                module, "drift_folder_ready", wraps=drift_folder_ready,
+            ) as checked,
+        ):
+            status, report = fixture_drift(home)
+        errors = [denied]
+        waiting_status = "scanned"
+        if elapsed == 1.0:
+            reason = "DRIFT_SCAN_SECONDS=1 reached after 1.000s"
+            errors.extend(f"{path}: not scanned: {reason}"
+                          for path in (waiting, home / ".codex/skills/.system"))
+            waiting_status = "not scanned"
+        folders = {Path(row["path"]): row["status"] for row in report["folders"]}
+        checks = {entry.args[0] for entry in checked.call_args_list}
+        cases.append((
+            f"drift: duplicate type errors keep first detail at {elapsed:.3f}s",
+            status == error_status and report["errors"] == errors
+            and folders.get(failed) == "error" and failed not in checks
+            and folders.get(waiting) == waiting_status
+            and (waiting in checks) == (waiting_status == "scanned"),
+        ))
+    return cases
+
+
 def fixture_synced_discovery_failure(home, failed, first, later, *, expire):
     """Stop discovery after recording a type error and confirming a healthy child."""
     module = sys.modules[__name__]
@@ -1808,34 +1902,70 @@ def refused(call):
     return False
 
 
-def selftest_drift_home_refusal(root):
-    """Reject a missing home before looking up a default or dispatching any verb."""
+def selftest_cli_value_refusal(root):
+    """Reject missing or switch-like values before resolving home or dispatching."""
     module = sys.modules[__name__]
     handlers = ("drift", "install", "verify", "uninstall", "selftest")
-    invalid = [(verb, "--home") for verb in (*handlers, "plan")]
-    invalid += [("drift", "--home", "--json"), ("drift", "--json", "--home"),
-                ("plan", "--home", "--apply"), ("drift", "--home", "")]
+    requirements = {"--home": "a directory value", "--repo": "a value",
+                    "--tag": "a value", "--clients": "a value"}
+    invalid = [(flag, (verb, flag))
+               for verb in (*handlers, "plan") for flag in requirements]
+    invalid += [
+        ("--home", ("drift", "--home", "--json")),
+        ("--home", ("drift", "--json", "--home")),
+        ("--home", ("plan", "--home", "--apply")),
+        ("--home", ("drift", "--home", "")),
+        ("--repo", ("install", "--repo", "--home", str(root))),
+        ("--tag", ("install", "--tag", "--apply")),
+        ("--clients", ("plan", "--clients", "--home", str(root))),
+    ]
     cases = []
     with (
         patch.object(Path, "home", return_value=root) as default_home,
         patch.multiple(module, **dict.fromkeys(handlers, fixture_unexpected_dispatch)),
     ):
-        for argv in invalid:
+        for flag, argv in invalid:
             problem = None
             default_home.reset_mock()
             try:
                 main(argv)
             except (SystemExit, RuntimeError) as exc:
                 problem = str(exc)
-            cases.append((f"drift: invalid home refused before dispatch {argv!r}",
-                          problem == "refused: --home requires a directory value"
+            cases.append((f"CLI: invalid {flag} refused before dispatch {argv!r}",
+                          problem == f"refused: {flag} requires {requirements[flag]}"
                           and not default_home.called))
     return cases
 
 
 def fixture_unexpected_dispatch(*_args, **_kwargs):
     """Prevent invalid fixture input from starting a scan or write."""
-    raise RuntimeError("invalid --home reached command dispatch")
+    raise RuntimeError("invalid value reached command dispatch")
+
+
+def selftest_cli_value_dispatch(root):
+    """Pass valid ordered options and a single-hyphen value to their handlers."""
+    module = sys.modules[__name__]
+    home = str(root)
+    with (
+        patch.object(Path, "home", return_value=root) as default_home,
+        patch.object(module, "install", return_value=0) as installer,
+        patch.object(module, "drift", return_value=0) as scanner,
+    ):
+        accepted = (
+            (("install", "--repo", "a/b", "--home", home), installer,
+             call({"--repo": "a/b", "--home": home}, root, False)),
+            (("install", "--home", home, "--tag", "v1", "--apply"), installer,
+             call({"--tag": "v1", "--home": home}, root, True)),
+            (("drift", "--home", "-x"), scanner, call(Path("-x"), False)),
+        )
+        cases = []
+        for argv, handler, expected in accepted:
+            handler.reset_mock()
+            status = main(argv)
+            cases.append((f"CLI: valid options dispatch {argv!r}",
+                          status == 0 and handler.call_args_list == [expected]
+                          and not default_home.called))
+    return cases
 
 
 def selftest_drift_home_order(root):
@@ -1871,7 +2001,10 @@ def selftest_drift_cases(root):
                 + selftest_drift_filesystem_deadline(root)
                 + selftest_drift_synced_discovery_failure(root)
                 + selftest_drift_inventory_deadline(root)
-                + selftest_drift_home_refusal(root) + selftest_drift_home_order(root))
+                + selftest_drift_home_order(root))
+    checked += (selftest_drift_synced_configured_overlap(root)
+                + selftest_drift_queued_type_errors(root)
+                + selftest_cli_value_refusal(root) + selftest_cli_value_dispatch(root))
     if os.name != "nt":
         checked += (selftest_drift_relative_links(root) + selftest_drift_linked_markers(root)
                     + selftest_drift_denied(root))
@@ -1908,13 +2041,15 @@ def selftest():
 
 
 def install_cli_flags(arguments):
-    """Collect the value options and refuse a missing or switch-like home."""
+    """Collect value options and refuse missing or switch-like values."""
     flags = {}
     for flag, value in zip(arguments, (*arguments[1:], None), strict=False):
-        if flag == "--home" and (not value or value.startswith("--")):
-            raise SystemExit("refused: --home requires a directory value")
-        if flag in {"--tag", "--repo", "--home", "--clients"} and value is not None:
-            flags[flag] = value
+        if flag not in {"--tag", "--repo", "--home", "--clients"}:
+            continue
+        if not value or value.startswith("--"):
+            requirement = "a directory value" if flag == "--home" else "a value"
+            raise SystemExit(f"refused: {flag} requires {requirement}")
+        flags[flag] = value
     return flags
 
 

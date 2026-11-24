@@ -91,12 +91,15 @@ including all client folders and synced sets. One blocking call can still
 overrun the deadline. The `drift_scan` docstring lists the deadline checks
 in [`tools/install_user_skills.py`](tools/install_user_skills.py).
 
-A failed synced-entry type query gets its own folder error. Discovery continues
-with its siblings while time remains. On expiry, the current folder gets an
-error with the limit and elapsed time. If expiry stops synced-set discovery,
-the synced root reports that discovery stopped. Confirmed children each get one
-`not scanned` row and one error. Recorded type-query failures keep their own
-error even when discovery stops. Unlisted entries are unknown. The JSON
+A failed synced-entry type query gets one diagnostic per folder, even if the
+folder was already scanned or discovery stops. Discovery continues with its
+siblings while time remains. When a scan or discovery hits the deadline, the
+current folder's error gives the limit and elapsed time. If expiry is first
+detected while reporting a queued type-query failure, that diagnostic keeps its
+recorded detail. Any subsequent `not scanned` diagnostics give the limit and
+elapsed time. If expiry stops synced-set discovery, the synced root reports
+that discovery stopped. Confirmed children still awaiting a scan each get one
+`not scanned` row and one error. Unlisted entries are unknown. The JSON
 `folders` list gives each folder's `path` and `status` (`scanned`, `absent`,
 `error`, or `not scanned`). The exit status is 2 on expiry or any folder error,
 1 for drift without errors, or 0 otherwise.
