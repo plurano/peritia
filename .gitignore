@@ -5,6 +5,7 @@ bin/
 .venv/
 __pycache__/
 *.py[cod]
+/.adopt-skills.lock
 
 # BEGIN praetor private artifacts (praetorctl adopt)
 .workingdir/

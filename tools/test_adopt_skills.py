@@ -13,8 +13,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
-from contextlib import redirect_stderr
+from contextlib import contextmanager, redirect_stderr
 from pathlib import Path
 from unittest.mock import patch
 
@@ -27,6 +28,7 @@ import tomllib
 import adopt_skills as adopt
 import census
 import check_skills
+import input_identity
 import overlap
 
 REPO = Path(__file__).resolve().parent.parent
@@ -731,6 +733,7 @@ class AdoptionTests(unittest.TestCase):
     def test_crash_between_publish_renames_and_next_apply_repairs(self):
         """Roll back root byte-identical on a mid-publish failure and retry both accepted and withdrawn."""
         fake_runner, downloads = self._two_mit0_candidates()
+        (self.root / '.adopt-skills.lock').touch()
         before_empty = snapshot(self.root)
         real_replace = os.replace
 
@@ -1803,6 +1806,119 @@ class AdoptionTests(unittest.TestCase):
         ])
         with self.assertRaisesRegex(ValueError, 'conflicting vectors for identical embed text'):
             self.embedding_cache({'orig_blob': [1.0, 0.0], 'dup_blob': [0.0, 1.0]})
+
+    def _concurrent_apply_fixtures(self):
+        """Prepare two independent single-skill apply inputs sharing self.root."""
+        (self.root / 'LICENSES').mkdir()
+        (self.root / 'LICENSES/MIT.txt').write_text(LICENCE, encoding='utf-8')
+        pin1 = self.source({'pack/first/SKILL.md': MD.format(name='first'), 'pack/first/LICENSE': LICENCE},
+                           source='owner/first')
+        pin2 = self.source({'pack/second/SKILL.md': MD.format(name='second'), 'pack/second/LICENSE': LICENCE},
+                           source='other/second')
+        groups = self.base / 'concurrent-groups.tsv'
+        tsv(groups, ['members'], [])
+        paths = {}
+        for idx, (name, repo, pin) in enumerate((('first', 'owner/first', pin1), ('second', 'other/second', pin2)), 1):
+            cand_path = self.base / f'cand-{idx}.tsv'
+            cen_path = self.base / f'cen-{idx}.tsv'
+            tsv(cand_path, CANDIDATE_FIELDS, [{
+                'source': repo, 'path': f'pack/{name}/SKILL.md', 'skill_name': name,
+                'verdict': 'candidate', 'licence': 'MIT', 'licence_evidence': 'folder', 'functions': 'testing',
+            }])
+            tsv(cen_path, ['source', 'path', 'pin'], [{'source': repo, 'path': f'pack/{name}/SKILL.md', 'pin': pin}])
+            paths[name] = (cand_path, cen_path)
+        return groups, paths
+
+    def test_concurrent_applies_serialize_under_output_lock(self):
+        """Serialize overlapping --apply runs so the second reads root only after the first publishes."""
+        groups, paths = self._concurrent_apply_fixtures()
+        first_in_gate, release_first, second_ready = threading.Event(), threading.Event(), threading.Event()
+        real_reconcile, real_eval = adopt._reconcile_publish_journal, adopt._evaluate_and_publish
+        events, errors = [], []
+        @contextmanager
+        def tracked_lock(path):
+            events.append(f'{threading.current_thread().name}:lock-attempt')
+            if threading.current_thread().name == 'second':
+                second_ready.set()
+            with input_identity.output_lock(path):
+                yield
+        def tracked_reconcile(root, *, apply):
+            events.append(f'{threading.current_thread().name}:root-read')
+            return real_reconcile(root, apply=apply)
+        def tracked_eval(root, checkouts, parsed, opts):
+            rows = real_eval(root, checkouts, parsed, opts)
+            events.append(f'{threading.current_thread().name}:published')
+            return rows
+        def worker(name, gate_fn):
+            try:
+                adopt.run(paths[name][0], groups, paths[name][1], self.checkouts, self.root,
+                          apply=True, gate=gate_fn, hiss_gate=passing_gate)
+            except (OSError, ValueError, RuntimeError, AssertionError) as exc:
+                errors.append(exc)
+            finally:
+                if name == 'second':
+                    second_ready.set()
+        first = threading.Thread(target=worker, name='first', args=(
+            'first', lambda *_: (first_in_gate.set(), self.assertTrue(release_first.wait(timeout=5.0)))))
+        second = threading.Thread(target=worker, args=('second', passing_gate), name='second')
+        with (patch.object(adopt, 'output_lock', side_effect=tracked_lock),
+              patch.object(adopt, '_reconcile_publish_journal', side_effect=tracked_reconcile),
+              patch.object(adopt, '_evaluate_and_publish', side_effect=tracked_eval)):
+            try:
+                first.start()
+                self.assertTrue(first_in_gate.wait(timeout=5.0))
+                second.start()
+                self.assertTrue(second_ready.wait(timeout=5.0))
+                self.assertIn('second:lock-attempt', events)
+                self.assertNotIn('second:root-read', events)
+            finally:
+                release_first.set()
+                for thread in (first, second):
+                    if thread.ident is not None:
+                        thread.join(timeout=5.0)
+        self.assertEqual((first.is_alive(), second.is_alive(), errors), (False, False, []))
+        self.assertEqual(events, ['first:lock-attempt', 'first:root-read', 'second:lock-attempt',
+                                  'first:published', 'second:root-read', 'second:published'])
+        self.assertEqual(((self.root / '.adopt-skills.lock').is_file(),
+                          (self.root / adopt.JOURNAL_NAME).exists(), check_skills.check(self.root)), (True, False, 0))
+        for name in ('first', 'second'):
+            self.assertTrue((self.root / 'skills' / name).is_dir())
+            self.assertIn(f'skills/{name}/**', (self.root / 'REUSE.toml').read_text(encoding='utf-8'))
+            self.assertIn(f'`{name}`', (self.root / 'CREDITS.md').read_text(encoding='utf-8'))
+            self.assertIn(f'{name}\t', (self.root / 'skills/INDEX.tsv').read_text(encoding='utf-8'))
+
+    def test_apply_lock_timeout_preserves_interrupted_journal(self):
+        """Leave an interrupted publish journal and its staged backups untouched when --apply times out on the lock."""
+        self._seed_existing_skill()
+        fake_runner, _ = self._two_mit0_candidates()
+        self._fork_kill_on_second_skill(fake_runner)
+        journal_file = self.root / adopt.JOURNAL_NAME
+        self.assertTrue(journal_file.is_file())
+        staged = [p for p in self.root.iterdir() if p.is_dir() and p.name.startswith('.adopt-publish-')]
+        self.assertEqual(len(staged), 1)
+        self.assertTrue((staged[0] / 'backup/0-REUSE.toml').is_file())
+
+        with (input_identity.output_lock(self.root / '.adopt-skills'),
+              patch.object(input_identity, 'LOCK_WAIT_SECONDS', 0.05)):
+            before = snapshot(self.root)
+            with self.assertRaisesRegex(TimeoutError, r'\.adopt-skills\.lock.*timed out'):
+                self.invoke(apply=True, runner=fake_runner)
+            self.assertEqual(snapshot(self.root), before)
+            self.assertTrue(journal_file.is_file())
+            self.assertTrue((staged[0] / 'backup/0-REUSE.toml').is_file())
+
+    def test_preview_completes_while_apply_lock_held(self):
+        """Complete preview without waiting on a held apply lock when no publish journal exists."""
+        (self.root / 'LICENSES').mkdir()
+        (self.root / 'LICENSES/MIT.txt').write_text(LICENCE, encoding='utf-8')
+        self.fixture()
+        self.assertFalse((self.root / adopt.JOURNAL_NAME).exists())
+        with (input_identity.output_lock(self.root / '.adopt-skills'),
+              patch.object(input_identity, 'LOCK_WAIT_SECONDS', 0.05)):
+            before = snapshot(self.root)
+            rows, _ = self.invoke(apply=False)
+            self.assertEqual([r['verdict'] for r in rows], ['adopted'])
+            self.assertEqual(snapshot(self.root), before)
 
 
 class RewriteFencesTests(unittest.TestCase):

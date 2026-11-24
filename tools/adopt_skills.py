@@ -22,6 +22,7 @@ import sys
 import tempfile
 import urllib.parse
 from collections import Counter
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -43,6 +44,7 @@ from census import LiveReader, SourceReadError
 from check_skills import front_matter_or_empty
 from git_blob import git_blob_id
 from input_identity import (
+    output_lock,
     provider_id,
     resolve_base_urls,
     validate_base_url,
@@ -1664,14 +1666,14 @@ def run(candidates, groups, census, checkouts, root=Path('.'), *, apply=False,
         report_file is not None and report_file.is_symlink()
     ):
         raise _output_symlink_error('report')
-    # A concurrent --apply is not serialised yet; the apply lock tracked in #58 will wrap this reconcile.
-    _reconcile_publish_journal(root, apply=apply)
-    _check_output_symlinks(root, report_file, raw_report=report)
-    opts = _RunOptions(
-        apply=apply, reader=reader, gates=GateOptions(gate=gate, hiss_gate=hiss_gate),
-        include_grouped=include_grouped, embedding=embedding, sources=sources, runner=runner,
-    )
-    rows = _evaluate_and_publish(root, checkouts, parsed, opts)
+    with output_lock(root / '.adopt-skills') if apply else nullcontext():
+        _reconcile_publish_journal(root, apply=apply)
+        _check_output_symlinks(root, report_file, raw_report=report)
+        opts = _RunOptions(
+            apply=apply, reader=reader, gates=GateOptions(gate=gate, hiss_gate=hiss_gate),
+            include_grouped=include_grouped, embedding=embedding, sources=sources, runner=runner,
+        )
+        rows = _evaluate_and_publish(root, checkouts, parsed, opts)
     if report_file is not None:
         report_file.parent.mkdir(parents=True, exist_ok=True)
         report_file.write_text(report_text(rows), encoding='utf-8')
