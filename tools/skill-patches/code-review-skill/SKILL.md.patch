@@ -48,7 +48,7 @@
 @@ -221,19 +222,19 @@ Language-agnostic patterns applicable to all code reviews:
  
  | Topic | Reference File | Key Topics |
- |-------|----------------|------------|
+ | ------- | ---------------- | ------------ |
 -| **Architecture Review** | [Architecture Review Guide](reference/architecture-review-guide.md) | SOLID, anti-patterns, coupling/cohesion, dependency direction |
 +| **Architecture Review** | [Architecture Review Guide](https://github.com/awesome-skills/code-review-skill/blob/4850184dfd7765ea7b3c5c4e9b6cf8e0815ee7cb/reference/architecture-review-guide.md) | SOLID, anti-patterns, coupling/cohesion, dependency direction |
  | **Performance Review** | [Performance Review Guide](reference/performance-review-guide.md) | Web Vitals, N+1, algorithm complexity, memory leaks, caching |
