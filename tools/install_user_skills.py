@@ -43,6 +43,7 @@ from contextlib import redirect_stdout
 from io import StringIO
 from itertools import islice
 from pathlib import Path
+from time import monotonic
 from unittest.mock import patch
 
 REPO = "https://github.com/plurano/peritia"
@@ -56,6 +57,7 @@ MAX_FILES = 20000  # bounds every tree walk (HISS-02)
 MAX_DRIFT_DEPTH = 16  # directory levels below a skill root
 MAX_DRIFT_ENTRIES = 25000  # entries per folder listing or across an entire skill tree
 MAX_DRIFT_FILE_BYTES = 16 * 1024 * 1024  # per-file drift read limit (HISS-02)
+DRIFT_SCAN_SECONDS = 30  # elapsed time per installed folder scan (HISS-02)
 HASH_CHUNK_BYTES = 64 * 1024
 # Windows refuses a symbolic link without developer mode or admin rights; a directory junction needs neither.
 # PERITIA_LINK_MODE=junction forces junctions (to test that path where symlinks work); the output names the mode.
@@ -95,8 +97,16 @@ def client_dirs(home, everyone):
     return out, skipped
 
 
-def drift_entries(folder, remaining):
+def drift_check_deadline(path, started):
+    """Stop a folder scan when its elapsed time reaches the deadline."""
+    elapsed = monotonic() - started
+    if elapsed >= DRIFT_SCAN_SECONDS:
+        raise TimeoutError(f"{path}: DRIFT_SCAN_SECONDS={DRIFT_SCAN_SECONDS} reached after {elapsed:.3f}s")
+
+
+def drift_entries(folder, remaining, started):
     """List at most the remaining entry budget, in path order."""
+    drift_check_deadline(folder, started)
     with os.scandir(folder) as entries:
         paths = [Path(entry.path) for entry in islice(entries, remaining + 1)]
     if len(paths) > remaining:
@@ -104,12 +114,16 @@ def drift_entries(folder, remaining):
     return sorted(paths)
 
 
-def drift_is_dir(path):
-    """Identify directories and tolerate missing entries and dangling links."""
+def drift_stat(path):
+    """Follow an entry using kernel path rules and ignore unresolvable links."""
     try:
-        return stat.S_ISDIR(path.stat().st_mode)
+        return path.stat()
     except (FileNotFoundError, NotADirectoryError):
-        return False
+        return None
+    except OSError:
+        if path.is_symlink() or is_junction(path):
+            return None
+        raise
 
 
 def drift_tree_path(root, path):
@@ -117,6 +131,9 @@ def drift_tree_path(root, path):
     target = link_target(path)
     if target is None:
         return path
+    # Path normalizes trailing / and /., which the kernel rejects on file targets.
+    if drift_stat(path) is None:
+        return None
     try:
         resolved = (path.parent / target).resolve(strict=True)
     except (FileNotFoundError, NotADirectoryError):
@@ -126,7 +143,8 @@ def drift_tree_path(root, path):
 
 def drift_skill_root(location):
     """Return the resolved root of a directory with a regular SKILL.md."""
-    if not drift_is_dir(location):
+    info = drift_stat(location)
+    if info is None or not stat.S_ISDIR(info.st_mode):
         return None
     try:
         root = location.resolve(strict=True)
@@ -138,17 +156,18 @@ def drift_skill_root(location):
     return None
 
 
-def drift_add_file(files, root, relative, target):
+def drift_add_file(files, root, relative, target, started):
     """Record a file digest within the cap, naming the file if reading fails."""
     if len(files) == MAX_FILES:
         raise ValueError(f"{root}: exceeds MAX_FILES={MAX_FILES}")
+    drift_check_deadline(target, started)
     try:
         files[relative.as_posix()] = digest(target, max_bytes=MAX_DRIFT_FILE_BYTES)
     except OSError as exc:
         raise OSError(f"cannot hash {target}: {exc}") from exc
 
 
-def drift_tree_digest(root):
+def drift_tree_digest(root, started):
     """Return the tree digest, file inventory, and sorted skipped link paths."""
     pending = [(root, Path(), (root,))]
     remaining = MAX_DRIFT_ENTRIES
@@ -158,7 +177,7 @@ def drift_tree_digest(root):
         if not pending:
             break
         folder, prefix, ancestors = pending.pop()
-        entries = drift_entries(folder, remaining)
+        entries = drift_entries(folder, remaining, started)
         remaining -= len(entries)
         for entry in entries:
             relative = prefix / entry.name
@@ -168,7 +187,7 @@ def drift_tree_digest(root):
                 continue
             mode = target.stat().st_mode
             if stat.S_ISREG(mode):
-                drift_add_file(files, root, relative, target)
+                drift_add_file(files, root, relative, target, started)
             elif stat.S_ISDIR(mode) and target not in ancestors:
                 if len(relative.parts) > MAX_DRIFT_DEPTH:
                     raise ValueError(f"{root}: {relative} exceeds MAX_DRIFT_DEPTH={MAX_DRIFT_DEPTH}")
@@ -179,16 +198,17 @@ def drift_tree_digest(root):
     return tree.hexdigest(), files, sorted(skipped_links)
 
 
-def drift_scan_folder(folder, locations, trees):
+def drift_scan_folder(folder, locations, trees, started):
     """Record skill locations after a full folder scan, hashing each resolved root once."""
     found = []
-    for location in drift_entries(folder, MAX_DRIFT_ENTRIES):
+    for location in drift_entries(folder, MAX_DRIFT_ENTRIES, started):
         root = drift_skill_root(location)
         if root is None:
             continue
         if root not in trees:
-            trees[root] = drift_tree_digest(root)
+            trees[root] = drift_tree_digest(root, started)
         found.append((location, root))
+    drift_check_deadline(folder, started)
     for location, root in found:
         locations.setdefault(location.name, []).append((location, root))
 
@@ -219,10 +239,13 @@ def drift_scan(home):
                 if folder in roots:
                     raise NotADirectoryError("expected a skill directory")
                 continue
+            started = monotonic()
             if roots.get(folder):
-                pending.extend(reversed(drift_entries(folder, MAX_DRIFT_ENTRIES)))
+                children = drift_entries(folder, MAX_DRIFT_ENTRIES, started)
+                drift_check_deadline(folder, started)
+                pending.extend(reversed(children))
             else:
-                drift_scan_folder(folder, locations, trees)
+                drift_scan_folder(folder, locations, trees, started)
                 folders[folder] = "scanned"
         except (OSError, RuntimeError, ValueError) as exc:
             # Path.resolve raises RuntimeError for symlink loops on Python 3.11.
@@ -850,7 +873,7 @@ def selftest_drift_links(root):
 
 
 def selftest_drift_relative_links(root):
-    """Check POSIX symlink traversal and paths that continue through a file."""
+    """Check POSIX symlink traversal and preserve the kernel's trailing path rules."""
     home = root / "relative-links"
     skill = fixture_skill(home, ".claude/skills/example", "same\n")
     peer = fixture_skill(home, ".agents/skills/example", "same\n")
@@ -858,6 +881,10 @@ def selftest_drift_relative_links(root):
     (skill / "hop").symlink_to("nested/deeper", target_is_directory=True)
     (skill / "via").symlink_to("hop/../../SKILL.md")
     (peer / "via").write_text("same\n", encoding="utf-8")
+    for folder in (skill / "dir", peer / "dir", peer / "via-dir"):
+        folder.mkdir()
+        (folder / "notes.md").write_text("notes\n", encoding="utf-8")
+    (skill / "via-dir").symlink_to("dir/", target_is_directory=True)
     status, report = fixture_drift(home)
     cases = [("drift: in-tree symlink with parent traversal hashes target",
               status == 0 and report["summary"] == {"drifting": 0, "shared": 1, "folders": 2}
@@ -865,15 +892,40 @@ def selftest_drift_relative_links(root):
 
     (skill / "via").unlink()
     (peer / "via").unlink()
-    (skill / "dangling").symlink_to("SKILL.md/missing")
-    (skill.parent / "dangling-location").symlink_to("example/SKILL.md/missing")
+    dangling = (("dangling", "/missing"), ("trailing-slash", "/"), ("trailing-dot", "/."))
+    for name, suffix in dangling:
+        (skill / name).symlink_to(f"SKILL.md{suffix}")
+        (skill.parent / name).symlink_to(f"example/SKILL.md{suffix}", target_is_directory=True)
+    alias = home / ".copilot/skills/example"
+    alias.parent.mkdir(parents=True)
+    alias.symlink_to("../../.claude/skills/example/", target_is_directory=True)
     status, report = fixture_drift(home)
     skipped = [copy for row in report["skipped"] for copy in row["copies"]]
     cases.append(("drift: dangling symlink through a file is skipped and folder kept",
-                  status == 0 and report["summary"] == {"drifting": 0, "shared": 1, "folders": 2}
-                  and len(skipped) == 1 and skipped[0]["locations"] == [str(skill)]
-                  and skipped[0]["skipped_links"] == ["dangling"]))
+                  status == 0 and report["summary"] == {"drifting": 0, "shared": 1, "folders": 3}
+                  and len(skipped) == 1 and skipped[0]["locations"] == [str(skill), str(alias)]
+                  and skipped[0]["skipped_links"] == sorted(name for name, _ in dangling)))
+    (skill / "loop").symlink_to("loop")
+    (skill.parent / "loop").symlink_to("loop", target_is_directory=True)
+    status, report = fixture_drift(home)
+    cases.append(("drift: looping skill and tree links leave the folder scannable",
+                  status == 0 and report["summary"] == {"drifting": 0, "shared": 1, "folders": 3}
+                  and any("loop" in copy["skipped_links"] for row in report["skipped"] for copy in row["copies"])))
     return cases
+
+
+def selftest_drift_linked_markers(root):
+    """Accept an in-tree file marker and ignore markers that require a directory."""
+    home = root / "linked-markers"
+    for name, suffix in (("trailing-slash", "/"), ("trailing-dot", "/."), ("valid", "")):
+        skill = fixture_skill(home, f".claude/skills/{name}", "same\n")
+        (skill / "SKILL.md").rename(skill / "body.md")
+        (skill / "SKILL.md").symlink_to(f"body.md{suffix}")
+        peer = fixture_skill(home, f".agents/skills/{name}", "same\n")
+        (peer / "body.md").write_text("same\n", encoding="utf-8")
+    status, report = fixture_drift(home)
+    return [("drift: only a kernel-valid symlink is a skill marker",
+             status == 0 and report["summary"] == {"drifting": 0, "shared": 1, "folders": 2})]
 
 
 def selftest_drift_tree_limits(root):
@@ -923,6 +975,54 @@ def selftest_drift_file_limit(root):
                   status == 2 and len(errors) == 1 and str(path.resolve()) in errors[0]
                   and "MAX_DRIFT_FILE_BYTES=8" in errors[0]
                   and folders.get(str(skill.parent)) == "error" and folders.get(str(peer.parent)) == "scanned"))
+    return cases
+
+
+def fixture_timed_drift(home, trigger, elapsed):
+    """Advance a fake clock at the chosen listing and record subsequent I/O."""
+    scandir = os.scandir
+    module = sys.modules[__name__]
+    with patch.object(module, "monotonic", return_value=0.0, create=True) as clock:
+        def advance_after_listing(folder):
+            """Advance time when the preceding listing starts."""
+            entries = scandir(folder)
+            if folder == trigger:
+                clock.return_value = elapsed
+            return entries
+
+        with (
+            patch.object(module, "DRIFT_SCAN_SECONDS", 1, create=True),
+            patch.object(os, "scandir", side_effect=advance_after_listing) as listed,
+            patch.object(module, "digest", wraps=digest) as hashed,
+        ):
+            status, report = fixture_drift(home)
+    paths = {call.args[0] for call in listed.call_args_list + hashed.call_args_list}
+    return status, report, paths
+
+
+def selftest_drift_deadline(root):
+    """Check the folder deadline before both directory listings and file digests."""
+    home = root / "deadline"
+    skill = fixture_skill(home, ".claude/skills/example", "same\n")
+    peer = fixture_skill(home, ".agents/skills/example", "same\n")
+    tree = skill.resolve()
+    cases = []
+    for trigger, blocked in ((skill.parent, tree), (tree, tree / "SKILL.md")):
+        status, report, paths = fixture_timed_drift(home, trigger, 0.999)
+        cases.append((f"drift: {blocked.name} allowed just under deadline",
+                      status == 0 and blocked in paths and report["errors"] == []
+                      and report["summary"] == {"drifting": 0, "shared": 1, "folders": 2}))
+        for elapsed in (1.0, 1.001):
+            status, report, paths = fixture_timed_drift(home, trigger, elapsed)
+            errors = report["errors"]
+            folders = {row["path"]: row["status"] for row in report["folders"]}
+            cases.append((f"drift: {blocked.name} blocked at {elapsed:.3f}s and peer scanned",
+                          status == 2 and blocked not in paths and len(errors) == 1
+                          and errors[0].startswith(f"{skill.parent}: ") and str(blocked) in errors[0]
+                          and "DRIFT_SCAN_SECONDS=1" in errors[0] and f"{elapsed:.3f}s" in errors[0]
+                          and folders.get(str(skill.parent)) == "error"
+                          and folders.get(str(peer.parent)) == "scanned"
+                          and report["summary"] == {"drifting": 0, "shared": 0, "folders": 1}))
     return cases
 
 
@@ -1013,9 +1113,9 @@ def selftest():
                            + selftest_drift_locations(root) + selftest_drift_comparison(root)
                            + selftest_drift_links(root) + selftest_drift_errors(root)
                            + selftest_drift_partial_scan(root) + selftest_drift_tree_limits(root)
-                           + selftest_drift_file_limit(root))
+                           + selftest_drift_file_limit(root) + selftest_drift_deadline(root))
                 if os.name != "nt":
-                    checked += selftest_drift_relative_links(root)
+                    checked += selftest_drift_relative_links(root) + selftest_drift_linked_markers(root)
                 cases += [(f"{mode}: {name}", ok) for name, ok in checked]
         if os.name != "nt":
             os.environ[LINK_MODE_ENV] = "junction"
