@@ -71,6 +71,39 @@ every link with its target, reports the install source, and fails on any change.
 `uninstall` removes the links and the store and reports how many Peritia paths
 remain (zero).
 
+`python3 tools/install_user_skills.py drift` compares same-name skills across
+installed client folders without changing any files. Each drifting name lists
+its locations and short SHA-256 digests, followed by the first path that differs
+between the two most common contents. The summary counts drifting names out of
+all shared names in completed folders. Dangling links and links that leave a
+skill's root are excluded from its digest. The text report gives the count and
+first skipped path for each affected copy, even when there is no drift.
+With `--json`, every reported copy includes a sorted `skipped_links` list, and
+the `skipped` list shows affected copies for names without drift. The scan
+continues after a folder error while time remains and lists each error on
+stderr or in the JSON `errors` list. Each diagnostic starts with the configured
+or discovered folder path as given. When a call fails, the detail names the
+listed entry path before resolution or the canonical path inside a resolved
+skill tree.
+
+`DRIFT_SCAN_SECONDS` sets a 30-second scan budget for the whole drift run,
+including all client folders and synced sets. One blocking call can still
+overrun the deadline. The `drift_scan` docstring lists the deadline checks
+in [`tools/install_user_skills.py`](tools/install_user_skills.py).
+
+A failed synced-entry type query gets one diagnostic per folder, even if the
+folder was already scanned or discovery stops. Discovery continues with its
+siblings while time remains. When a scan or discovery hits the deadline, the
+current folder's error gives the limit and elapsed time. If expiry is first
+detected while reporting a queued type-query failure, that diagnostic keeps its
+recorded detail. Any subsequent `not scanned` diagnostics give the limit and
+elapsed time. If expiry stops synced-set discovery, the synced root reports
+that discovery stopped. Confirmed children still awaiting a scan each get one
+`not scanned` row and one error. Unlisted entries are unknown. The JSON
+`folders` list gives each folder's `path` and `status` (`scanned`, `absent`,
+`error`, or `not scanned`). The exit status is 2 on expiry or any folder error,
+1 for drift without errors, or 0 otherwise.
+
 ## Census
 
 `python3 tools/census.py run --out census.tsv` creates a deterministic TSV
