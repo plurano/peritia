@@ -6,19 +6,21 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any, cast
 
 import httpx2
+
 # Codacy's Guardrails rule is a false positive here: this module checks every reply
 # itself and raises ValueError, and callers validate the parsed JSON.
 import openai  # nosemgrep: codacy.python.openai.import-without-guardrails
-
 from input_identity import provider_id, validate_base_url
 
 DEFAULT_CHAT_TEMPERATURE = 0.0
 DEFAULT_CHAT_SEED = 1
 _PLACEHOLDER_API_KEY = "peritia-keyless-placeholder"
+_JSON_MEDIA_TYPE = "application/json"
+_MAX_CUSTOM_HEADER_LINES = 1024
 _ALLOWED_HEADERS = frozenset({
     "accept",
     "accept-encoding",
@@ -34,6 +36,30 @@ def _is_allowed_header(name: str) -> bool:
     """Allow only transport framing and SDK telemetry headers."""
     lower = name.lower()
     return lower in _ALLOWED_HEADERS or lower.startswith("x-stainless-")
+
+
+def _neutralized_custom_headers(effective_api_key: str) -> dict[str, str | openai.Omit]:
+    """Neutralize ambient OPENAI_CUSTOM_HEADERS names parsed in openai/lib/_client_auth.py:236-252."""
+    raw = os.environ.get("OPENAI_CUSTOM_HEADERS")
+    if not raw:
+        return {}
+    lines = raw.split("\n")
+    if len(lines) > _MAX_CUSTOM_HEADER_LINES:
+        raise ValueError(f"OPENAI_CUSTOM_HEADERS exceeds {_MAX_CUSTOM_HEADER_LINES} lines")
+    headers: dict[str, str | openai.Omit] = {}
+    for line in lines[:_MAX_CUSTOM_HEADER_LINES]:
+        colon = line.find(":")
+        if colon < 0:
+            continue
+        name = line[:colon].strip()
+        lower = name.lower()
+        if lower in ("accept", "content-type"):
+            headers[name] = _JSON_MEDIA_TYPE
+        elif lower == "authorization":
+            headers[name] = f"Bearer {effective_api_key}"
+        else:
+            headers[name] = openai.omit
+    return headers
 
 
 def _generation_parameters(temperature: float | None, seed: int | None) -> dict[str, Any]:
@@ -89,11 +115,15 @@ class LLMClient:
             timeout=timeout,
             transport=transport,
         )
+        effective_api_key = api_key or _PLACEHOLDER_API_KEY
+        # Override ambient OPENAI_CUSTOM_HEADERS parsed in openai/lib/_client_auth.py:236-252.
+        default_headers = _neutralized_custom_headers(effective_api_key)
         self._client = openai.OpenAI(
             base_url=self.base_url,
-            api_key=api_key or _PLACEHOLDER_API_KEY,
+            api_key=effective_api_key,
             max_retries=0,
             timeout=timeout,
+            default_headers=cast(Mapping[str, str], default_headers) if default_headers else None,
             http_client=self._http_client,
         )
 

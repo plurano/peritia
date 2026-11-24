@@ -33,6 +33,16 @@ _AMBIENT_OPENAI_ENV = {
     "OPENAI_ADMIN_KEY": "fixture-env-admin-key",
     "OPENAI_CUSTOM_HEADERS": "X-Leak: 1\nAuthorization: Bearer sk-ambient",
 }
+_HOSTILE_CUSTOM_HEADERS = (
+    "Host: other.internal\n"
+    "Content-Type: text/plain\n"
+    "X-Stainless-Leak: ambient-secret\n"
+    "User-Agent: ambient-ua\n"
+    "Accept: text/html\n"
+    "X-Other: 1\n"
+    "Authorization: Bearer sk-ambient"
+)
+_AMBIENT_VALUE_MARKERS = ("ambient", "other.internal", "text/")
 _EXPECTED_HEADER_NAMES = frozenset({
     "accept",
     "accept-encoding",
@@ -141,6 +151,21 @@ class LLMTests(unittest.TestCase):
                 f"unexpected header on wire: {name}",
             )
 
+    def _assert_framing_and_no_ambient_values(self, req: httpx2.Request, expected_host: str) -> None:
+        """Verify framing headers match URL/body/JSON defaults and carry no ambient values."""
+        self._assert_clean_headers(req.headers)
+        lower_names = {name.lower() for name in req.headers}
+        self.assertNotIn("x-stainless-leak", lower_names)
+        self.assertNotIn("x-other", lower_names)
+        self.assertEqual(req.headers.get_list("host"), [expected_host])
+        self.assertEqual(req.headers.get_list("content-type"), ["application/json"])
+        self.assertEqual(req.headers.get_list("accept"), ["application/json"])
+        self.assertEqual(req.headers.get_list("content-length"), [str(len(req.content))])
+        for _name, value in list(req.headers.multi_items())[:64]:
+            lower_val = value.lower()
+            for marker in _AMBIENT_VALUE_MARKERS:
+                self.assertNotIn(marker, lower_val, f"ambient header value leaked: {value!r}")
+
     def test_positive_schema_request(self) -> None:
         """Schema request carries response_format json_schema, strict false; reply content parsed."""
         schema = {"type": "object", "properties": {"answer": {"type": "number"}}}
@@ -201,6 +226,70 @@ class LLMTests(unittest.TestCase):
             self.assertEqual(client.embed("e", []), [])
         self.assertEqual(seen[-1].url.host, "target.test")
         self.assertNotIn("authorization", seen[-1].headers)
+
+    def test_custom_headers_env_positive_keyed(self) -> None:
+        """Keyed chat and embed neutralize allowed-name OPENAI_CUSTOM_HEADERS values and keep both barriers."""
+        seen: list[httpx2.Request] = []
+        transport = _recording_transport(seen, embed_reply={"data": [{"index": 0, "embedding": [0.25]}]})
+        env = {**_AMBIENT_OPENAI_ENV, "OPENAI_CUSTOM_HEADERS": _HOSTILE_CUSTOM_HEADERS}
+        with patch.dict(os.environ, env):
+            client = LLMClient("https://target.test:8443/v1", timeout=5.0, api_key="explicit-key", transport=transport)
+            self.addCleanup(client.close)
+            self.assertEqual(client.chat("m", [{"role": "user", "content": "hi"}]), "ok")
+            self.assertEqual(client.embed("e", ["doc"]), [[0.25]])
+            client._http_client.headers["X-Other"] = "1"
+            self.assertEqual(client.chat("m", [{"role": "user", "content": "hi"}]), "ok")
+        self.assertEqual(len(seen), 3)
+        for req in seen[:3]:
+            self.assertEqual(req.headers.get_list("authorization"), ["Bearer explicit-key"])
+            self._assert_framing_and_no_ambient_values(req, "target.test:8443")
+
+    def test_custom_headers_env_keyless(self) -> None:
+        """Keyless chat and embed omit Authorization while neutralizing OPENAI_CUSTOM_HEADERS framing overrides."""
+        seen: list[httpx2.Request] = []
+        transport = _recording_transport(seen, embed_reply={"data": [{"index": 0, "embedding": [0.75]}]})
+        env = {**_AMBIENT_OPENAI_ENV, "OPENAI_CUSTOM_HEADERS": _HOSTILE_CUSTOM_HEADERS}
+        with patch.dict(os.environ, env):
+            client = LLMClient("https://target.test:8443/v1", timeout=5.0, api_key=None, transport=transport)
+            self.addCleanup(client.close)
+            self.assertEqual(client.chat("m", [{"role": "user", "content": "hi"}]), "ok")
+            self.assertEqual(client.embed("e", ["doc"]), [[0.75]])
+        self.assertEqual(len(seen), 2)
+        for req in seen[:2]:
+            self.assertNotIn("authorization", req.headers)
+            self._assert_framing_and_no_ambient_values(req, "target.test:8443")
+
+    def test_custom_headers_env_boundary(self) -> None:
+        """Unset, empty, and colonless OPENAI_CUSTOM_HEADERS lines leave generated framing intact."""
+        seen: list[httpx2.Request] = []
+        transport = _recording_transport(seen, embed_reply={"data": [{"index": 0, "embedding": [1.0]}]})
+        cleared = {k: v for k, v in os.environ.items() if not k.startswith("OPENAI_")}
+        cases = (
+            ("unset", cleared, "https://target.test/v1", "target.test"),
+            ("empty", {**cleared, "OPENAI_CUSTOM_HEADERS": ""}, "https://target.test:8443/v1", "target.test:8443"),
+            ("no_colon", {**cleared, "OPENAI_CUSTOM_HEADERS": "missing-colon\n   \nplain"}, "https://target.test/v1", "target.test"),
+            (
+                "mixed_malformed",
+                {
+                    **cleared,
+                    "OPENAI_CUSTOM_HEADERS": (
+                        "missing-colon\n  host : other.internal\ncontent-type: text/plain\nContent-Length: 999999\ntrailing"
+                    ),
+                },
+                "https://target.test:8443/v1",
+                "target.test:8443",
+            ),
+        )
+        for label, env, url, expected_host in cases[:4]:
+            with self.subTest(label=label), patch.dict(os.environ, env, clear=True):
+                seen.clear()
+                client = LLMClient(url, timeout=5.0, api_key=None, transport=transport)
+                self.addCleanup(client.close)
+                self.assertEqual(client.chat("m", [{"role": "user", "content": "hi"}]), "ok")
+                self.assertEqual(client.embed("e", ["doc"]), [[1.0]])
+                for req in seen[:2]:
+                    self.assertNotIn("authorization", req.headers)
+                    self._assert_framing_and_no_ambient_values(req, expected_host)
 
     def test_wire_body_exact_equality_positive_negative_and_boundary(self) -> None:
         """Chat (plain, schema, zero seed) and embeddings (non-empty, empty) match exact wire keys."""
