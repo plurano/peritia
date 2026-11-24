@@ -33,8 +33,8 @@ canonical SPDX text in `LICENSES/` for the ID declared in `ORIGIN.md`.
 A front matter `license` declaration must identify the same licence or point
 to the licence file.
 
-Keep vendored licence files unchanged. Copyright notice lines start with
-`Copyright ` (with a trailing space) or `©`, including `©2026` without a space.
+Keep vendored licence files unchanged. Copyright notice lines start with the
+word `Copyright` and a space, or with `©`, including `©2026` without a space.
 Lettered clause lines such as `(c)` stay in the licence body comparison. The
 checker accepts exact notices from the selected SPDX template or the
 reviewed [`skills/licence-notices.yaml`](skills/licence-notices.yaml) register.
