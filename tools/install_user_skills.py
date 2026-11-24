@@ -19,8 +19,10 @@ Usage:
 Without --apply, install and uninstall only print what they would do.
 
 DRIFT_SCAN_SECONDS (30 seconds) bounds scanning across the whole drift run.
-The scan checks the deadline immediately before each filesystem call.
-One blocking call can still overrun the deadline.
+drift_fs checks before os.scandir, next on its iterator, DirEntry.is_dir,
+Path.stat, os.path.realpath, Path.open, and file.read. Scandir and file context
+exits and the resolver's internal calls are unchecked. One blocking call can
+still overrun the deadline.
 Drift exits 2 on expiry or any folder error, otherwise 1 for differences or 0 for agreement.
 With --json it prints one object with:
   folders: objects with path and status (scanned, absent, error, or not scanned)
@@ -30,7 +32,8 @@ With --json it prints one object with:
   errors: list of "<folder>: <detail>" diagnostics for failed and unscanned folders
 Each copy has digest (full SHA-256), locations (installed paths), and skipped_links
 (sorted relative paths of unresolvable and out-of-tree links excluded from the digest).
-Only confirmed directories under the synced root can appear as folders.
+Synced entries with failed type queries get their own errors. If discovery
+stops on expiry, already queued children are reported as not scanned.
 Only completed folders contribute to the counts and differences. The text view
 prints skipped link counts with the first path, and prints each error to stderr.
 """
@@ -48,6 +51,7 @@ from collections import Counter
 from contextlib import contextmanager, redirect_stdout
 from functools import partial
 from io import StringIO
+from itertools import islice
 from pathlib import Path
 from time import monotonic
 from types import SimpleNamespace
@@ -66,6 +70,7 @@ MAX_DRIFT_ENTRIES = 25000  # entries per folder listing or across an entire skil
 MAX_DRIFT_FILE_BYTES = 16 * 1024 * 1024  # per-file drift read limit (HISS-02)
 DRIFT_SCAN_SECONDS = 30  # elapsed time across all drift folders (HISS-02)
 HASH_CHUNK_BYTES = 64 * 1024
+MAX_FIXTURE_AST_NODES = 50_000
 # Windows refuses a symbolic link without developer mode or admin rights; a directory junction needs neither.
 # PERITIA_LINK_MODE=junction forces junctions (to test that path where symlinks work); the output names the mode.
 LINK_MODE_ENV = "PERITIA_LINK_MODE"
@@ -107,6 +112,11 @@ def client_dirs(home, everyone):
 class DriftScanTimeout(Exception):
     """The shared drift deadline expired."""
 
+    def __init__(self, reason, *, detail=None):
+        """Keep the deadline reason separately from the failing folder's detail."""
+        super().__init__(detail or reason)
+        self.reason = reason
+
 
 def drift_deadline_reason(started):
     """Return the diagnostic when the whole-run scan budget has expired."""
@@ -130,23 +140,30 @@ def drift_fs(path, started, operation, /, *args, **kwargs):
     return operation(*args, **kwargs)
 
 
-def drift_entries(folder, remaining, started, *, directories_only=False):
-    """List at most the remaining entry budget, in path order."""
-    paths = []
+def drift_synced_candidate(entry, path, started, errors):
+    """Queue directories and retain failed type queries for the candidate's folder row."""
+    try:
+        return drift_fs(path, started, entry.is_dir)
+    except OSError as exc:
+        errors[path] = exc
+        return True
+
+
+def drift_entries(folder, remaining, started, *, synced_errors=None):
+    """Yield bounded entries in listing order, filtering synced candidates when requested."""
     try:
         with drift_fs(folder, started, os.scandir, folder) as entries:
-            for _ in range(remaining + 1):
+            for index in range(remaining + 1):
                 entry = drift_fs(folder, started, next, entries, None)
                 if entry is None:
-                    break
+                    return
+                if index == remaining:
+                    raise ValueError(f"{folder}: exceeds MAX_DRIFT_ENTRIES={MAX_DRIFT_ENTRIES}")
                 path = Path(entry.path)
-                if not directories_only or drift_fs(path, started, entry.is_dir):
-                    paths.append(path)
-            else:
-                raise ValueError(f"{folder}: exceeds MAX_DRIFT_ENTRIES={MAX_DRIFT_ENTRIES}")
+                if synced_errors is None or drift_synced_candidate(entry, path, started, synced_errors):
+                    yield path
     except OSError as exc:
         raise OSError(f"cannot list {folder}: {exc}") from exc
-    return sorted(paths)
 
 
 def drift_unresolvable(exc):
@@ -226,7 +243,7 @@ def drift_tree_digest(root, started):
         if not pending:
             break
         folder, prefix, ancestors = pending.pop()
-        entries = drift_entries(folder, remaining, started)
+        entries = sorted(drift_entries(folder, remaining, started))
         remaining -= len(entries)
         for entry in entries:
             relative = prefix / entry.name
@@ -250,7 +267,7 @@ def drift_tree_digest(root, started):
 def drift_scan_folder(folder, locations, trees, started):
     """Record skill locations after a full folder scan, hashing each resolved root once."""
     found = []
-    for location in drift_entries(folder, MAX_DRIFT_ENTRIES, started):
+    for location in sorted(drift_entries(folder, MAX_DRIFT_ENTRIES, started)):
         root = drift_skill_root(location, started)
         if root is None:
             continue
@@ -279,18 +296,34 @@ def drift_folder_ready(folder, started, *, configured):
 def drift_scan_error(exc, started):
     """Preserve folder errors and detect an overrun during a failed blocking call."""
     if isinstance(exc, DriftScanTimeout):
-        return str(exc), str(exc)
+        return str(exc), exc.reason
     reason = drift_deadline_reason(started)
     return (f"{exc} ({reason})" if reason is not None else str(exc)), reason
+
+
+def drift_discover_synced(folder, started, pending):
+    """Queue synced candidates and keep those already found if discovery expires."""
+    children, type_errors = [], {}
+    try:
+        children.extend(drift_entries(folder, MAX_DRIFT_ENTRIES, started, synced_errors=type_errors))
+        drift_check_deadline(folder, started)
+    except (DriftScanTimeout, OSError, ValueError) as exc:
+        message, expired = drift_scan_error(exc, started)
+        if expired is None:
+            children.clear()
+            raise
+        raise DriftScanTimeout(expired, detail=f"synced-set discovery stopped: {message}") from exc
+    finally:
+        pending.extend((child, type_errors.get(child)) for child in sorted(children, reverse=True))
 
 
 def drift_scan(home):
     """Scan configured roots and synced sets with one cooperative deadline.
 
-    Check immediately before every filesystem call. One blocking call can
-    overrun. Discover only synced directories and open only regular files for
-    hashing. The JSON report uses the returned folder statuses (scanned,
-    absent, error, or not scanned) and errors. Drift exits 2 on expiry or any
+    drift_fs checks before os.scandir, iterator next, DirEntry.is_dir,
+    Path.stat, os.path.realpath, Path.open, and file.read. Context exits and
+    resolver internals are unchecked. One blocking call can overrun. Only
+    regular files are opened for hashing. Drift exits 2 on expiry or any
     folder error.
     """
     started = monotonic()
@@ -301,11 +334,11 @@ def drift_scan(home):
     folders, locations, trees = {}, {}, {}
     errors = []
     expired = None
-    pending = list(reversed(roots))
+    pending = [(folder, None) for folder in reversed(roots)]
     for _ in range(len(roots) + MAX_DRIFT_ENTRIES):
         if not pending:
             break
-        folder = pending.pop()
+        folder, type_error = pending.pop()
         if folder in folders:
             continue
         if expired is not None:
@@ -313,14 +346,14 @@ def drift_scan(home):
             errors.append(f"{folder}: not scanned: {expired}")
             continue
         try:
+            if type_error is not None:
+                raise OSError(f"cannot check directory type for {folder}: {type_error}") from type_error
             if not drift_folder_ready(folder, started, configured=folder in roots):
                 drift_check_deadline(folder, started)
                 if folder in roots:
                     folders[folder] = "absent"
             elif roots.get(folder):
-                children = drift_entries(folder, MAX_DRIFT_ENTRIES, started, directories_only=True)
-                pending.extend(reversed(children))
-                drift_check_deadline(folder, started)
+                drift_discover_synced(folder, started, pending)
             else:
                 drift_scan_folder(folder, locations, trees, started)
                 folders[folder] = "scanned"
@@ -719,30 +752,69 @@ def fixture_text_open(call):
     else:
         index = 1
         if isinstance(call.func, ast.Attribute):
-            receiver = ast.unparse(call.func.value)
-            index = int(receiver in ("builtins", "io", "Path", "pathlib.Path"))
+            receiver = call.func.value
+            direct = isinstance(receiver, ast.Name) and receiver.id in ("builtins", "io", "Path")
+            qualified = (isinstance(receiver, ast.Attribute) and receiver.attr == "Path"
+                         and isinstance(receiver.value, ast.Name) and receiver.value.id == "pathlib")
+            index = int(direct or qualified)
         mode = call.args[index] if len(call.args) > index else None
     return (isinstance(mode, ast.Constant) and isinstance(mode.value, str)
-            and "b" not in mode.value and any(flag in mode.value for flag in "wax"))
+            and "b" not in mode.value and any(flag in mode.value for flag in "wax+"))
+
+
+def fixture_text_needs_newline(call):
+    """Identify a direct text write without an explicit no-translation newline."""
+    name = getattr(call.func, "attr", getattr(call.func, "id", None))
+    writes_text = name == "write_text" or (name == "open" and fixture_text_open(call))
+    return writes_text and not any(
+        keyword.arg == "newline" and isinstance(keyword.value, ast.Constant) and keyword.value.value in ("", "\n")
+        for keyword in call.keywords
+    )
+
+
+def fixture_text_offenders(tree):
+    """Check direct fixture text writes within the AST node budget.
+
+    Aliased callables, dynamic open modes, and code outside fixture_* or
+    selftest_* function bodies are out of scope.
+    """
+    offenders = []
+    pending = [(tree, None)]
+    for remaining in range(MAX_FIXTURE_AST_NODES - 1, -1, -1):
+        if not pending:
+            break
+        node, function = pending.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith(("fixture_", "selftest_")):
+            function = node.name
+        children = islice(ast.iter_child_nodes(node), remaining - len(pending) + 1)
+        pending.extend((child, function) for child in children)
+        if len(pending) > remaining:
+            return [f"exceeds MAX_FIXTURE_AST_NODES={MAX_FIXTURE_AST_NODES}"]
+        if function and isinstance(node, ast.Call) and fixture_text_needs_newline(node):
+            offenders.append(f"{function}:{node.lineno}")
+    return sorted(offenders)
 
 
 def selftest_fixture_text():
-    """Report fixture text writes that leave newline translation implicit."""
-    tree = ast.parse(Path(__file__).read_bytes())
-    offenders = []
-    for function in ast.walk(tree):
-        if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        if not function.name.startswith(("fixture_", "selftest_")):
-            continue
-        for node in ast.walk(function):
-            if not isinstance(node, ast.Call) or any(keyword.arg == "newline" for keyword in node.keywords):
-                continue
-            name = getattr(node.func, "attr", getattr(node.func, "id", None))
-            if name == "write_text" or (name == "open" and fixture_text_open(node)):
-                offenders.append(f"{function.name}:{node.lineno}")
+    """Check the module's fixture writes and plant portable newline guard examples."""
+    offenders = fixture_text_offenders(ast.parse(Path(__file__).read_bytes()))
     label = "fixtures: text writes specify newlines or write bytes"
-    return [(f"{label} ({', '.join(offenders)})" if offenders else label, not offenders)]
+    cases = [(f"{label} ({', '.join(offenders)})" if offenders else label, not offenders)]
+    examples = (
+        ("newline=None", 'path.write_text("data", newline=None)', True),
+        ("update mode", 'path.open("r+")', True),
+        ("explicit text mode", 'io.open(path, "wt")', True),
+        ("dynamic newline", 'path.write_text("data", newline=line_ending)', True),
+        ("newline=''", 'Path.open(path, "a+", newline="")', False),
+    )
+    for name, statement, fails in examples:
+        tree = ast.parse(f"def fixture_example(path):\n    {statement}\n")
+        cases.append((f"fixtures: newline guard checks {name}", bool(fixture_text_offenders(tree)) == fails))
+    with patch.object(sys.modules[__name__], "MAX_FIXTURE_AST_NODES", 1):
+        cases.append(("fixtures: AST guard enforces and names its node cap",
+                      fixture_text_offenders(ast.parse("")) == []
+                      and fixture_text_offenders(ast.parse("pass")) == ["exceeds MAX_FIXTURE_AST_NODES=1"]))
+    return cases
 
 
 def fixture_repo(root, dirname="src", skills=("alpha", "beta"), install_set=None):
@@ -1065,9 +1137,10 @@ def selftest_drift_tree_limits(root):
         with patch.object(sys.modules[__name__], cap, exact - 1):
             status, report = fixture_drift(home)
         errors = report["errors"]
+        failed = skill.resolve() / "nested" if cap == "MAX_DRIFT_ENTRIES" else skill.resolve()
         cases.append((f"drift: one over {cap} exits 2 and names folder and cap",
                       status == 2 and len(errors) == 1 and errors[0].startswith(f"{skill.parent}: ")
-                      and str(skill.resolve()) in errors[0] and f"{cap}={exact - 1}" in errors[0]))
+                      and f" {failed}: " in errors[0] and f"{cap}={exact - 1}" in errors[0]))
     return cases
 
 
@@ -1094,7 +1167,7 @@ def selftest_drift_file_limit(root):
     folders = {row["path"]: row["status"] for row in report["folders"]}
     errors = report["errors"]
     cases.append(("drift: one over MAX_DRIFT_FILE_BYTES names file and cap and keeps peer",
-                  status == 2 and len(errors) == 1 and str(path.resolve()) in errors[0]
+                  status == 2 and len(errors) == 1 and f" {path.resolve()}: " in errors[0]
                   and "MAX_DRIFT_FILE_BYTES=8" in errors[0]
                   and folders.get(str(skill.parent)) == "error" and folders.get(str(peer.parent)) == "scanned"))
     return cases
@@ -1134,19 +1207,20 @@ def selftest_drift_deadline(root):
     peer = fixture_skill(home, ".agents/skills/example", "same\n")
     tree = skill.resolve()
     cases = []
-    for trigger, blocked in ((skill.parent, tree), (tree, tree / "SKILL.md")):
+    for trigger, observed, blocked in ((skill.parent, tree, skill), (tree, tree / "SKILL.md", tree / "SKILL.md")):
         status, report, paths = fixture_timed_drift(home, {trigger: 0.999})
         cases.append((f"drift: {blocked.name} allowed just under deadline",
-                      status == 0 and blocked in paths and report["errors"] == []
+                      status == 0 and observed in paths and report["errors"] == []
                       and report["summary"] == {"drifting": 0, "shared": 1, "folders": 2}))
         for elapsed in (1.0, 1.001):
             status, report, paths = fixture_timed_drift(home, {trigger: elapsed})
             errors = report["errors"]
             folders = {row["path"]: row["status"] for row in report["folders"]}
             cases.append((f"drift: {blocked.name} blocked at {elapsed:.3f}s and peer not scanned",
-                          status == 2 and paths.isdisjoint({blocked, peer.parent, peer.resolve()})
+                          status == 2 and paths.isdisjoint({observed, peer.parent, peer.resolve()})
                           and len(errors) == 9
-                          and errors[0].startswith(f"{skill.parent}: ") and str(blocked) in errors[0]
+                          and errors[0].startswith(f"{skill.parent}: ")
+                          and errors[0].endswith(f" while scanning {blocked}")
                           and all("DRIFT_SCAN_SECONDS=1" in error and f"{elapsed:.3f}s" in error for error in errors)
                           and folders.get(str(skill.parent)) == "error"
                           and folders.get(str(peer.parent)) == "not scanned"
@@ -1202,7 +1276,7 @@ def selftest_drift_synced_regular_file(root):
         cases.append((f"drift: synced regular file omitted on exit {expected}",
                       status == expected and folders.get(str(child)) == folders.get(str(alias)) == child_status
                       and str(ignored) not in folders
-                      and all(str(ignored) not in error for error in report["errors"])))
+                      and all(not error.startswith(f"{ignored}: ") for error in report["errors"])))
     return cases
 
 
@@ -1256,6 +1330,97 @@ class FixtureDriftEntries:
         """Record an advance and instrument the resulting entry's type query."""
         entry = self.record(self.folder, next, self.entries)
         return SimpleNamespace(path=entry.path, is_dir=partial(self.record, entry.path, entry.is_dir))
+
+
+@contextmanager
+def fixture_synced_entries(synced, record):
+    """Instrument only iteration and type checks in the specified synced root."""
+    scandir = os.scandir
+
+    @contextmanager
+    def list_directory(folder):
+        """Keep the real listing open until discovery finishes."""
+        with scandir(folder) as entries:
+            yield FixtureDriftEntries(folder, entries, record) if folder == synced else entries
+
+    with patch.object(os, "scandir", list_directory):
+        yield
+
+
+def fixture_reject_synced(failed, code, path, operation, /, *args):
+    """Fail only this entry's type query, leaving the rest of the listing intact."""
+    if Path(path) == failed:
+        raise OSError(code, os.strerror(code), path)
+    return operation(*args)
+
+
+def selftest_drift_synced_entry_errors(root):
+    """Report a failed type query on its own row and keep the healthy sibling."""
+    cases = []
+    for code, name in ((errno.ELOOP, "loop"), (errno.EACCES, "denied")):
+        home = root / f"synced-{name}"
+        healthy = fixture_skill(home, ".claude/skills/synced/aaa-healthy/example", "example\n").parent
+        synced = healthy.parent
+        failed = synced / name
+
+        if code == errno.ELOOP and os.name != "nt":
+            failed.symlink_to(failed.name, target_is_directory=True)
+            status, report = fixture_drift(home)
+        else:
+            failed.mkdir()
+            with fixture_synced_entries(synced, partial(fixture_reject_synced, failed, code)):
+                status, report = fixture_drift(home)
+        folders = {row["path"]: row["status"] for row in report["folders"]}
+        errors = report["errors"]
+        cases.append((f"drift: synced {name} error keeps healthy sibling",
+                      status == 2 and folders.get(str(failed)) == "error"
+                      and folders.get(str(healthy)) == "scanned" and str(synced) not in folders
+                      and len(errors) == 1 and errors[0].startswith(f"{failed}: ")))
+    return cases
+
+
+def fixture_synced_cut(home, synced, cut):
+    """Run drift with expiry immediately after the selected directory confirmation."""
+    module = sys.modules[__name__]
+    seen = []
+
+    def confirm(path, operation, /, *args):
+        """Advance time only when the selected is_dir call confirms a directory."""
+        result = operation(*args)
+        if operation is not next and result:
+            seen.append(Path(path))
+            if len(seen) == cut:
+                clock.return_value = 1.0
+        return result
+
+    with (
+        patch.object(module, "monotonic", return_value=0.0) as clock,
+        patch.object(module, "DRIFT_SCAN_SECONDS", 1),
+        fixture_synced_entries(synced, confirm),
+    ):
+        status, report = fixture_drift(home)
+    return status, report, sorted(seen)
+
+
+def selftest_drift_synced_discovery_deadline(root):
+    """Check exactly which synced sets are reported at each type-query cut."""
+    home = root / "synced-discovery-deadline"
+    synced = home / ".claude/skills/synced"
+    for name in ("one", "two", "three"):
+        fixture_skill(synced, f"{name}/example", "example\n")
+    cases = []
+    for cut in (1, 2, 3):
+        status, report, seen = fixture_synced_cut(home, synced, cut)
+        rows = [row for row in report["folders"] if Path(row["path"]).is_relative_to(synced)]
+        expected = [{"path": str(synced), "status": "error"},
+                    *({"path": str(child), "status": "not scanned"} for child in seen)]
+        errors = [error for error in report["errors"] if error.startswith((f"{synced}: ", f"{synced}{os.sep}"))]
+        reason = f"DRIFT_SCAN_SECONDS=1 reached after 1.000s while scanning {synced}"
+        expected_errors = [f"{synced}: synced-set discovery stopped: {reason}",
+                           *(f"{child}: not scanned: {reason}" for child in seen)]
+        cases.append((f"drift: discovery expiry keeps exactly {cut} confirmed synced sets",
+                      status == 2 and len(seen) == cut and rows == expected and errors == expected_errors))
+    return cases
 
 
 def fixture_counted_drift(home, expire_after):
@@ -1360,6 +1525,9 @@ def selftest_drift_denied(root):
     marker_link.parent.mkdir(parents=True)
     for path in (tree_link, marker_link):
         path.symlink_to(target / "SKILL.md")
+    cases = ((link, link.parent), (plain.resolve() / "SKILL.md", plain.parent),
+             (tree_link.parent.resolve() / tree_link.name, tree_link.parent.parent),
+             (marker_link.parent.resolve() / marker_link.name, marker_link.parent.parent))
     accessible, _ = fixture_drift(home)
     denied = (target.parent, plain)
     try:
@@ -1370,11 +1538,9 @@ def selftest_drift_denied(root):
         for path in denied:
             path.chmod(0o700)
     folders = {row["path"]: row["status"] for row in report["folders"]}
-    cases = ((link, link.parent), (plain, plain.parent),
-             (tree_link, tree_link.parent.parent), (marker_link, marker_link.parent.parent))
     return [(label, accessible == 1 and status == 2 and folders.get(str(peer.parent)) == "scanned"
              and folders.get(str(folder)) == "error"
-             and any(error.startswith(f"{folder}: ") and str(path) in error for error in report["errors"]))
+             and any(error.startswith(f"{folder}: cannot stat {path}: ") for error in report["errors"]))
             for label, (path, folder) in zip(labels, cases, strict=True)]
 
 
@@ -1397,7 +1563,7 @@ def selftest_drift_errors(root):
     errors = report["errors"]
     cases.append(("drift: MAX_FILES exceeded exits 2 and names folder and cap",
                   status == 2 and len(errors) == 1 and errors[0].startswith(f"{skill.parent}: ")
-                  and str(skill.resolve()) in errors[0] and "MAX_FILES=1" in errors[0]))
+                  and f" {skill.resolve()}: " in errors[0] and "MAX_FILES=1" in errors[0]))
 
     open_file = Path.open
 
@@ -1411,7 +1577,7 @@ def selftest_drift_errors(root):
         status, report = fixture_drift(home)
     errors = report.get("errors", [])
     cases.append(("drift: unreadable file exits 2 and names path",
-                  status == 2 and len(errors) == 1 and str(unreadable) in errors[0]
+                  status == 2 and len(errors) == 1 and f"cannot hash {unreadable}: " in errors[0]
                   and "permission denied" in errors[0]))
     return cases
 
@@ -1451,6 +1617,21 @@ def refused(call):
     return False
 
 
+def selftest_drift_cases(root):
+    """Run all drift cases through a non-canonical fixture root."""
+    checked = [("drift: fixture root is non-canonical", root != root.resolve())]
+    checked += (selftest_drift_content(root) + selftest_drift_locations(root) + selftest_drift_comparison(root)
+                + selftest_drift_links(root) + selftest_drift_errors(root) + selftest_drift_partial_scan(root)
+                + selftest_drift_tree_limits(root) + selftest_drift_file_limit(root) + selftest_drift_deadline(root)
+                + selftest_drift_synced_deadline(root) + selftest_drift_synced_regular_file(root)
+                + selftest_drift_synced_entry_errors(root) + selftest_drift_synced_discovery_deadline(root)
+                + selftest_drift_resolve_errors(root) + selftest_drift_filesystem_deadline(root))
+    if os.name != "nt":
+        checked += (selftest_drift_relative_links(root) + selftest_drift_linked_markers(root)
+                    + selftest_drift_denied(root))
+    return checked
+
+
 def selftest():
     """Run the installer and drift fixtures for the available link modes."""
     keep = {name: os.environ.get(name) for name in ("CODEX_HOME", LINK_MODE_ENV)}
@@ -1461,17 +1642,10 @@ def selftest():
             os.environ[LINK_MODE_ENV] = mode
             with tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
-                checked = (selftest_cases(root) + selftest_drift_content(root)
-                           + selftest_drift_locations(root) + selftest_drift_comparison(root)
-                           + selftest_drift_links(root) + selftest_drift_errors(root)
-                           + selftest_drift_partial_scan(root) + selftest_drift_tree_limits(root)
-                           + selftest_drift_file_limit(root) + selftest_drift_deadline(root)
-                           + selftest_drift_synced_deadline(root)
-                           + selftest_drift_synced_regular_file(root) + selftest_drift_resolve_errors(root)
-                           + selftest_drift_filesystem_deadline(root))
-                if os.name != "nt":
-                    checked += (selftest_drift_relative_links(root) + selftest_drift_linked_markers(root)
-                                + selftest_drift_denied(root))
+                real, alias = root / "real", root / "alias"
+                real.mkdir()
+                make_link(alias, real.resolve())
+                checked = selftest_cases(root) + selftest_drift_cases(alias)
                 cases += [(f"{mode}: {name}", ok) for name, ok in checked]
         if os.name != "nt":
             os.environ[LINK_MODE_ENV] = "junction"

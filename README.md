@@ -81,17 +81,26 @@ first skipped path for each affected copy, even when there is no drift.
 With `--json`, every reported copy includes a sorted `skipped_links` list, and
 the `skipped` list shows affected copies for names without drift. The scan
 continues after a folder error while time remains and lists each error on
-stderr or in the JSON `errors` list.
+stderr or in the JSON `errors` list. Each diagnostic starts with the configured
+or discovered folder path as given. When a call fails, the detail names the
+listed entry path before resolution or the canonical path inside a resolved
+skill tree.
 
 `DRIFT_SCAN_SECONDS` sets a 30-second scan budget for the whole drift run,
 including all client folders and synced sets. The scan checks the deadline
-immediately before every filesystem call. One blocking call can still overrun
-the deadline. Only confirmed directories under the synced root enter the scan
-queue. On expiry, the current folder gets an error with the limit and elapsed
-time. Queued folders get the same reason in `errors`. The JSON `folders` list
-gives each folder's `path` and `status` (`scanned`, `absent`, `error`, or
-`not scanned`). The exit status is 2 on expiry or any folder error, 1 for drift
-without errors, or 0 otherwise.
+through `drift_fs` before `os.scandir`, `next` on its iterator, `DirEntry.is_dir`,
+`Path.stat`, `os.path.realpath`, `Path.open`, and file `read`. Scandir and file
+context exits and the resolver's internal calls are unchecked. One blocking
+call can still overrun the deadline.
+
+A failed synced-entry type query gets its own folder error. Discovery continues
+with its siblings while time remains. On expiry, the current folder gets an
+error with the limit and elapsed time. If expiry stops synced-set discovery,
+the synced root reports that discovery stopped. Already queued children each
+get one `not scanned` row and one error. Unlisted entries are unknown. The JSON
+`folders` list gives each folder's `path` and `status` (`scanned`, `absent`,
+`error`, or `not scanned`). The exit status is 2 on expiry or any folder error,
+1 for drift without errors, or 0 otherwise.
 
 ## Census
 
