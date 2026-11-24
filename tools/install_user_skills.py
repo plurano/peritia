@@ -55,6 +55,8 @@ GIT_TIMEOUT = 300  # seconds for one clone or ls-remote (HISS-02)
 MAX_FILES = 20000  # bounds every tree walk (HISS-02)
 MAX_DRIFT_DEPTH = 16  # directory levels below a skill root
 MAX_DRIFT_ENTRIES = 25000  # entries per folder listing or across an entire skill tree
+MAX_DRIFT_FILE_BYTES = 16 * 1024 * 1024  # per-file drift read limit (HISS-02)
+HASH_CHUNK_BYTES = 64 * 1024
 # Windows refuses a symbolic link without developer mode or admin rights; a directory junction needs neither.
 # PERITIA_LINK_MODE=junction forces junctions (to test that path where symlinks work); the output names the mode.
 LINK_MODE_ENV = "PERITIA_LINK_MODE"
@@ -106,7 +108,7 @@ def drift_is_dir(path):
     """Identify directories and tolerate missing entries and dangling links."""
     try:
         return stat.S_ISDIR(path.stat().st_mode)
-    except FileNotFoundError:
+    except (FileNotFoundError, NotADirectoryError):
         return False
 
 
@@ -115,12 +117,9 @@ def drift_tree_path(root, path):
     target = link_target(path)
     if target is None:
         return path
-    target = path.parent / target
-    if not Path(os.path.abspath(target)).is_relative_to(root):
-        return None
     try:
-        resolved = target.resolve(strict=True)
-    except FileNotFoundError:
+        resolved = (path.parent / target).resolve(strict=True)
+    except (FileNotFoundError, NotADirectoryError):
         return None
     return resolved if resolved.is_relative_to(root) else None
 
@@ -129,14 +128,13 @@ def drift_skill_root(location):
     """Return the resolved root of a directory with a regular SKILL.md."""
     if not drift_is_dir(location):
         return None
-    root = location.resolve(strict=True)
-    marker = drift_tree_path(root, root / "SKILL.md")
-    if marker is not None:
-        try:
-            if stat.S_ISREG(marker.stat().st_mode):
-                return root
-        except FileNotFoundError:
-            return None
+    try:
+        root = location.resolve(strict=True)
+        marker = drift_tree_path(root, root / "SKILL.md")
+        if marker is not None and stat.S_ISREG(marker.stat().st_mode):
+            return root
+    except (FileNotFoundError, NotADirectoryError):
+        return None
     return None
 
 
@@ -145,7 +143,7 @@ def drift_add_file(files, root, relative, target):
     if len(files) == MAX_FILES:
         raise ValueError(f"{root}: exceeds MAX_FILES={MAX_FILES}")
     try:
-        files[relative.as_posix()] = digest(target)
+        files[relative.as_posix()] = digest(target, max_bytes=MAX_DRIFT_FILE_BYTES)
     except OSError as exc:
         raise OSError(f"cannot hash {target}: {exc}") from exc
 
@@ -345,8 +343,24 @@ def release_files(tree):
     return picked + [name for name in ("CREDITS.md", "LICENSE", INSTALL_SET_FILE) if (tree / name).is_file()]
 
 
-def digest(path):
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+def digest(path, *, max_bytes=None):
+    """Hash a file in chunks, enforcing the byte limit when supplied by drift."""
+    fingerprint = hashlib.sha256()
+    remaining = max_bytes
+    # Reserve one read to distinguish an exact-limit file from a larger one.
+    reads = sys.maxsize if max_bytes is None else max_bytes // HASH_CHUNK_BYTES + 1
+    with path.open("rb") as source:
+        for _ in range(reads):
+            size = HASH_CHUNK_BYTES if remaining is None else min(HASH_CHUNK_BYTES, remaining + 1)
+            chunk = source.read(size)
+            if remaining is not None:
+                remaining -= len(chunk)
+                if remaining < 0:
+                    raise ValueError(f"{path}: exceeds MAX_DRIFT_FILE_BYTES={max_bytes}")
+            fingerprint.update(chunk)
+            if len(chunk) < size:
+                return fingerprint.hexdigest()
+    raise ValueError(f"{path}: exceeds hash read limit")
 
 
 def read_install_set(tree):
@@ -835,6 +849,83 @@ def selftest_drift_links(root):
     return cases
 
 
+def selftest_drift_relative_links(root):
+    """Check POSIX symlink traversal and paths that continue through a file."""
+    home = root / "relative-links"
+    skill = fixture_skill(home, ".claude/skills/example", "same\n")
+    peer = fixture_skill(home, ".agents/skills/example", "same\n")
+    (skill / "nested/deeper").mkdir(parents=True)
+    (skill / "hop").symlink_to("nested/deeper", target_is_directory=True)
+    (skill / "via").symlink_to("hop/../../SKILL.md")
+    (peer / "via").write_text("same\n", encoding="utf-8")
+    status, report = fixture_drift(home)
+    cases = [("drift: in-tree symlink with parent traversal hashes target",
+              status == 0 and report["summary"] == {"drifting": 0, "shared": 1, "folders": 2}
+              and report["skipped"] == [])]
+
+    (skill / "via").unlink()
+    (peer / "via").unlink()
+    (skill / "dangling").symlink_to("SKILL.md/missing")
+    (skill.parent / "dangling-location").symlink_to("example/SKILL.md/missing")
+    status, report = fixture_drift(home)
+    skipped = [copy for row in report["skipped"] for copy in row["copies"]]
+    cases.append(("drift: dangling symlink through a file is skipped and folder kept",
+                  status == 0 and report["summary"] == {"drifting": 0, "shared": 1, "folders": 2}
+                  and len(skipped) == 1 and skipped[0]["locations"] == [str(skill)]
+                  and skipped[0]["skipped_links"] == ["dangling"]))
+    return cases
+
+
+def selftest_drift_tree_limits(root):
+    """Check acceptance exactly at the entry and depth caps and refusal one over."""
+    home = root / "tree-limits"
+    skill = fixture_skill(home, ".claude/skills/example", "example\n")
+    (skill / "nested").mkdir()
+    (skill / "nested/notes.md").write_text("notes\n", encoding="utf-8")
+    cases = []
+    for cap, exact in (("MAX_DRIFT_ENTRIES", 3), ("MAX_DRIFT_DEPTH", 1)):
+        with patch.object(sys.modules[__name__], cap, exact):
+            status, report = fixture_drift(home)
+        cases.append((f"drift: exactly {cap} accepted",
+                      status == 0 and report["summary"]["folders"] == 1))
+        with patch.object(sys.modules[__name__], cap, exact - 1):
+            status, report = fixture_drift(home)
+        errors = report["errors"]
+        cases.append((f"drift: one over {cap} exits 2 and names folder and cap",
+                      status == 2 and len(errors) == 1 and errors[0].startswith(f"{skill.parent}: ")
+                      and str(skill.resolve()) in errors[0] and f"{cap}={exact - 1}" in errors[0]))
+    return cases
+
+
+def selftest_drift_file_limit(root):
+    """Check the byte boundary, peer scanning, and the uncapped digest."""
+    home = root / "file-limit"
+    skill = fixture_skill(home, ".claude/skills/example", "example\n")
+    peer = fixture_skill(home, ".agents/skills/example", "example\n")
+    path = skill / "data.bin"
+    path.write_bytes(b"12345678")
+    (peer / path.name).write_bytes(b"12345678")
+    with (
+        patch.object(sys.modules[__name__], "MAX_DRIFT_FILE_BYTES", 8, create=True),
+        patch.object(sys.modules[__name__], "HASH_CHUNK_BYTES", 4, create=True),
+    ):
+        status, report = fixture_drift(home)
+        cases = [("drift: exactly MAX_DRIFT_FILE_BYTES accepted",
+                  status == 0 and report["summary"] == {"drifting": 0, "shared": 1, "folders": 2})]
+        content = b"123456789"
+        path.write_bytes(content)
+        status, report = fixture_drift(home)
+        cases.append(("digest: uncapped SHA-256 matches whole-file hash over drift cap",
+                      digest(path) == hashlib.sha256(content).hexdigest()))
+    folders = {row["path"]: row["status"] for row in report["folders"]}
+    errors = report["errors"]
+    cases.append(("drift: one over MAX_DRIFT_FILE_BYTES names file and cap and keeps peer",
+                  status == 2 and len(errors) == 1 and str(path.resolve()) in errors[0]
+                  and "MAX_DRIFT_FILE_BYTES=8" in errors[0]
+                  and folders.get(str(skill.parent)) == "error" and folders.get(str(peer.parent)) == "scanned"))
+    return cases
+
+
 def selftest_drift_errors(root):
     """Check absent folders, scan caps, and a file read failure."""
     home = root / "empty"
@@ -849,24 +940,22 @@ def selftest_drift_errors(root):
     nested.mkdir()
     unreadable = nested.resolve() / "notes.md"
     unreadable.write_text("notes\n", encoding="utf-8")
-    module = sys.modules[__name__]
-    for cap, limit in (("MAX_DRIFT_ENTRIES", 2), ("MAX_DRIFT_DEPTH", 0), ("MAX_FILES", 1)):
-        with patch.object(module, cap, limit, create=True):
-            status, report = fixture_drift(home)
-        errors = report.get("errors", [])
-        cases.append((f"drift: {cap} exceeded exits 2 and names folder and cap",
-                      status == 2 and len(errors) == 1 and errors[0].startswith(f"{skill.parent}: ")
-                      and str(skill.resolve()) in errors[0] and f"{cap}={limit}" in errors[0]))
+    with patch.object(sys.modules[__name__], "MAX_FILES", 1):
+        status, report = fixture_drift(home)
+    errors = report["errors"]
+    cases.append(("drift: MAX_FILES exceeded exits 2 and names folder and cap",
+                  status == 2 and len(errors) == 1 and errors[0].startswith(f"{skill.parent}: ")
+                  and str(skill.resolve()) in errors[0] and "MAX_FILES=1" in errors[0]))
 
-    read_bytes = Path.read_bytes
+    open_file = Path.open
 
-    def reject_file(path):
-        """Simulate a read failure for one fixture file on any platform."""
+    def reject_file(path, *args, **kwargs):
+        """Simulate an open failure for one fixture file on any platform."""
         if path == unreadable:
             raise PermissionError(f"permission denied: {path}")
-        return read_bytes(path)
+        return open_file(path, *args, **kwargs)
 
-    with patch.object(Path, "read_bytes", reject_file):
+    with patch.object(Path, "open", reject_file):
         status, report = fixture_drift(home)
     errors = report.get("errors", [])
     cases.append(("drift: unreadable file exits 2 and names path",
@@ -923,7 +1012,10 @@ def selftest():
                 checked = (selftest_cases(root) + selftest_drift_content(root)
                            + selftest_drift_locations(root) + selftest_drift_comparison(root)
                            + selftest_drift_links(root) + selftest_drift_errors(root)
-                           + selftest_drift_partial_scan(root))
+                           + selftest_drift_partial_scan(root) + selftest_drift_tree_limits(root)
+                           + selftest_drift_file_limit(root))
+                if os.name != "nt":
+                    checked += selftest_drift_relative_links(root)
                 cases += [(f"{mode}: {name}", ok) for name, ok in checked]
         if os.name != "nt":
             os.environ[LINK_MODE_ENV] = "junction"
