@@ -9,7 +9,6 @@ import json
 import math
 import shutil
 import tempfile
-import tomllib
 import unittest
 from contextlib import (
     redirect_stderr,
@@ -18,6 +17,12 @@ from contextlib import (
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
+
+# isort: split
+# Codacy's Ruff sorts tomllib without the py311 target.
+import tomllib
+
+# isort: split
 
 import adopt_skills as adopt
 import census

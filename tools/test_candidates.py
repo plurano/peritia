@@ -7,6 +7,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import candidates
 from licence_text import MAX_LICENCE_BYTES
@@ -210,6 +211,40 @@ class CandidatesTests(unittest.TestCase):
                     reason="LICENSE exceeds 256 KiB",
                 ),
             )
+
+    def test_folder_licence_read_failures_refuse_candidates(self) -> None:
+        """Preserve folder evidence and the read error for each lookup path."""
+        source, path = "a/repo", "skills/demo/SKILL.md"
+        census = candidates.CensusRow(
+            source=source, path=path, skill_name="demo", blob_id="b1", pin="",
+            folder_license="", repository_license="MIT", ineligible="",
+            dup_of_blob="", failure_reason="",
+        )
+        classified = candidates.ClassifiedRow(
+            source=source, path=path, skill_name="demo", blob_id="b1",
+            functions="coding", domains="go-service-framework", model="", status="ok",
+        )
+        tracer = candidates.UpstreamTracer(FakeGitHubReader())
+        with tempfile.TemporaryDirectory() as tmp:
+            checkouts = Path(tmp)
+            skill = write_skill(checkouts, source, path, folder_license_text="MIT License\n")
+            licence = skill.with_name("LICENSE")
+            paths = (
+                ("folder", "", (licence,)),
+                ("named candidate", "license: Complete terms in LICENSE\n", (None,)),
+                ("any candidate", "license: Complete terms in LICENSE.txt\n", (None, licence)),
+            )
+            for lookup, field, matches in paths:
+                skill.write_text(f"---\nname: demo\n{field}---\n", encoding="utf-8")
+                for error_type in (TypeError, ValueError, FileNotFoundError):
+                    error = error_type(f"{lookup} read failed")
+                    with (self.subTest(lookup=lookup, error_type=error_type.__name__),
+                          patch.object(candidates, "find_folder_licence_file", side_effect=matches),
+                          patch.object(candidates.licence_text, "read_utf8", side_effect=error) as read):
+                        row = candidates.decide_row(census, classified, checkouts, set(), tracer)
+                        read.assert_called_once_with(licence, MAX_LICENCE_BYTES)
+                        self.assertEqual((row.licence, row.licence_evidence, row.verdict, row.reason),
+                                         ("unreadable", "folder", "refused", str(error)))
 
     def test_licence_path_upstream_aggregator(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

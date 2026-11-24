@@ -61,6 +61,7 @@ MAX_ROWS = 200_000
 MAX_GH_CALLS = 2000
 GH_TIMEOUT_SECONDS = 20.0
 MAX_SKILL_CHARS = 8192
+_UNREADABLE_TEXT_ERRORS = (FileNotFoundError, TypeError, ValueError)
 
 HEADINGS: list[tuple[str, re.Pattern[str]]] = [
     ("AGPL-3.0", re.compile(r"GNU\s+Affero\s+General\s+Public\s+License.*?(?:Version\s+3|v3|\b3\b)", re.I | re.S)),
@@ -354,7 +355,7 @@ def _folder_licence_resolution(path: Path) -> LicenceResolution:
     """Identify a folder licence within the checker byte limit."""
     try:
         text = licence_text.read_utf8(path, licence_text.MAX_LICENCE_BYTES)
-    except (FileNotFoundError, ValueError) as exc:
+    except _UNREADABLE_TEXT_ERRORS as exc:
         return LicenceResolution(
             "unreadable", "folder", verdict="refused", reason=str(exc),
         )
@@ -429,7 +430,7 @@ def resolve_licence(
     try:
         text = check_skills.read_utf8(skill_path, check_skills.MAX_SKILL_MD_BYTES)
         meta = check_skills.front_matter(text, require_string_licence=True)
-    except (FileNotFoundError, TypeError, ValueError) as exc:
+    except _UNREADABLE_TEXT_ERRORS as exc:
         detail = " ".join(str(exc).split())
         return LicenceResolution("unreadable", "frontmatter", verdict="refused",
                                  reason=f"front matter unreadable: {detail}")
