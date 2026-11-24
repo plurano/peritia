@@ -76,6 +76,16 @@ def passing_gate(root, staging, skill):
     return None
 
 
+class _OsReplaceProxy:
+    """Delegate os attributes to stdlib os while overriding os.replace inside adopt."""
+
+    def __init__(self, replace_fn):
+        self.replace = replace_fn
+
+    def __getattr__(self, name):
+        return getattr(os, name)
+
+
 class AdoptionTests(unittest.TestCase):
     def setUp(self):
         """Prepare an isolated temporary worktree and synthetic source repositories."""
@@ -1052,19 +1062,21 @@ class AdoptionTests(unittest.TestCase):
 
         # Specific report path
         out_report = self.base / 'custom' / 'report.tsv'
+        self.assertEqual(adopt.resolve_report_path(out_report, self.root), out_report.resolve())
         rows, _ = self.invoke(report=out_report)
         self.assertTrue(out_report.is_file())
         self.assertEqual(out_report.read_text(encoding='utf-8'), adopt.report_text(rows))
         self.assertFalse((self.root / 'adopt-report.tsv').exists())
 
-        # Root refused as report location
-        with self.assertRaises(ValueError) as ctx:
-            self.invoke(report=self.root)
-        self.assertIn('repository root refused', str(ctx.exception))
-
-        with self.assertRaises(ValueError) as ctx:
-            self.invoke(report=self.root / 'adopt-report.tsv')
-        self.assertIn('repository root refused', str(ctx.exception))
+        # Root and tool-owned root outputs refused as report locations
+        for bad_root in (self.root, self.root / 'adopt-report.tsv'):
+            with self.assertRaisesRegex(ValueError, 'repository root refused'):
+                self.invoke(report=bad_root)
+        for rel in (adopt.JOURNAL_NAME, '.adopt-skills.lock', *adopt.JOURNAL_BACKUP_TARGETS):
+            with self.assertRaisesRegex(ValueError, 'refused as report location'):
+                adopt.resolve_report_path(self.root / rel, self.root)
+            with self.assertRaisesRegex(ValueError, 'refused as report location'):
+                self.invoke(report=self.root / rel)
 
     def test_group_adopts_original_and_refuses_composio_copy(self):
         """Collapse a copy only when matching embeddings support it."""
@@ -1919,6 +1931,204 @@ class AdoptionTests(unittest.TestCase):
             rows, _ = self.invoke(apply=False)
             self.assertEqual([r['verdict'] for r in rows], ['adopted'])
             self.assertEqual(snapshot(self.root), before)
+
+    def test_skill_directories_filters_dirs_before_max_skills_slice(self):
+        """Keep all MAX_SKILLS directories in INDEX.tsv when skills/INDEX.tsv sits beside them."""
+        (self.root / 'LICENSES').mkdir()
+        (self.root / 'LICENSES/MIT.txt').write_text(LICENCE, encoding='utf-8')
+        pin = self.source({
+            'pack/mu/SKILL.md': MD.format(name='mu'), 'pack/mu/LICENSE': LICENCE,
+            'pack/nu/SKILL.md': MD.format(name='nu'), 'pack/nu/LICENSE': LICENCE,
+        })
+        for name in ('mu', 'nu'):
+            self.candidate(name=name, folder=f'pack/{name}', pin=pin)
+        self.invoke(apply=True)
+        self.assertEqual(check_skills.check(self.root), 0)
+        self.candidates, self.census = [], []
+        with patch.object(check_skills, 'MAX_SKILLS', 2):
+            self.invoke(apply=True)
+            index_text = (self.root / 'skills/INDEX.tsv').read_text(encoding='utf-8')
+            self.assertIn('mu\towner/repo\t', index_text)
+            self.assertIn('nu\towner/repo\t', index_text)
+            self.assertEqual(check_skills.check(self.root), 0)
+
+    def test_restore_backup_file_stages_temp_under_backup_parent(self):
+        """Create restore temporaries inside backup.parent so target.parent never holds *.restore.* files."""
+        backup_dir = self.root / '.adopt-publish-stage' / 'backup'
+        backup_dir.mkdir(parents=True)
+        backup = backup_dir / '0-REUSE.toml'
+        backup.write_text('version = 1\n', encoding='utf-8')
+        target = self.root / 'REUSE.toml'
+        target.write_text('modified\n', encoding='utf-8')
+        recorded = {}
+
+        def fail_replace(src, dst):
+            """Capture temp file placement right before replacement and fail."""
+            recorded['src'] = Path(src)
+            recorded['dst'] = Path(dst)
+            recorded['backup_tmp'] = list(backup.parent.glob('*.restore.*'))
+            recorded['target_tmp'] = list(target.parent.glob('*.restore.*'))
+            raise OSError('simulated restore replace failure')
+
+        with (patch.object(adopt, 'os', _OsReplaceProxy(fail_replace)),
+              self.assertRaisesRegex(OSError, 'simulated restore replace failure')):
+            adopt._restore_backup_file(backup, target)
+        self.assertEqual(recorded['dst'], target)
+        self.assertEqual(recorded['src'].parent, backup.parent)
+        self.assertEqual(recorded['backup_tmp'], [recorded['src']])
+        self.assertEqual(recorded['target_tmp'], [])
+        self.assertEqual(list(target.parent.glob('*.restore.*')), [])
+        self.assertEqual(list(backup.parent.glob('*.restore.*')), [])
+        self.assertEqual(target.read_text(encoding='utf-8'), 'modified\n')
+        adopt._restore_backup_file(backup, target)
+        self.assertEqual(target.read_text(encoding='utf-8'), 'version = 1\n')
+
+    def test_journal_swapped_backup_paths_refused_without_modifying_root(self):
+        """Refuse a journal whose backup slots were swapped before executing any recovery step."""
+        self._seed_existing_skill()
+        fake_runner, _ = self._two_mit0_candidates()
+        self._fork_kill_on_second_skill(fake_runner)
+        journal_file = self.root / adopt.JOURNAL_NAME
+        payload = json.loads(journal_file.read_text(encoding='utf-8'))
+        payload['backups']['REUSE.toml'], payload['backups']['CREDITS.md'] = (
+            payload['backups']['CREDITS.md'], payload['backups']['REUSE.toml'],
+        )
+        journal_file.write_text(json.dumps(payload), encoding='utf-8')
+        before = snapshot(self.root)
+        with self.assertRaisesRegex(ValueError, r'invalid backup path'):
+            self.invoke(apply=True, runner=fake_runner)
+        self.assertEqual(snapshot(self.root), before)
+
+    def test_reconcile_continues_after_restore_failure_and_names_backup(self):
+        """Run remaining recovery steps when REUSE.toml restore fails, keep journal/staging, then recover."""
+        self._seed_existing_skill()
+        pre_credits = (self.root / 'CREDITS.md').read_text(encoding='utf-8')
+        before_seed = snapshot(self.root)
+        fake_runner, _ = self._two_mit0_candidates()
+        self._fork_kill_on_second_skill(fake_runner)
+        self.assertIn('`second`', (self.root / 'CREDITS.md').read_text(encoding='utf-8'))
+        staging = next(p for p in self.root.iterdir() if p.is_dir() and p.name.startswith('.adopt-publish-'))
+        backup_reuse = staging / 'backup/0-REUSE.toml'
+        real_restore = adopt._restore_backup_file
+
+        def fail_reuse_only(backup_path, target_path):
+            """Fail restoring REUSE.toml while letting CREDITS.md and INDEX.tsv succeed."""
+            if target_path == self.root / 'REUSE.toml':
+                raise OSError('simulated reuse reconcile failure')
+            return real_restore(backup_path, target_path)
+
+        with (patch.object(adopt, '_restore_backup_file', side_effect=fail_reuse_only),
+              self.assertRaises(adopt._PublishRollbackError) as ctx):
+            self.invoke(apply=True, runner=fake_runner)
+        self.assertIn('REUSE.toml', str(ctx.exception))
+        self.assertIn(str(backup_reuse), str(ctx.exception))
+        self.assertNotIn('.restore.', str(ctx.exception))
+        self.assertEqual((self.root / 'CREDITS.md').read_text(encoding='utf-8'), pre_credits)
+        self.assertTrue((self.root / adopt.JOURNAL_NAME).is_file())
+        self.assertTrue(staging.is_dir() and backup_reuse.is_file())
+
+        tsv(self.base / 'cand-empty.tsv', CANDIDATE_FIELDS, [])
+        adopt.run(self.base / 'cand-empty.tsv', self.base / 'groups.tsv', self.base / 'census.tsv',
+                  self.checkouts, self.root, apply=True, gate=passing_gate, hiss_gate=passing_gate,
+                  runner=fake_runner)
+        self.assertEqual(snapshot(self.root), before_seed)
+
+    def _assert_interrupt_at_replace_rolls_back(self, target_dest: Path, *, after_replace: bool) -> None:
+        """Raise KeyboardInterrupt right after or before replacing target_dest and assert clean rollback."""
+        self._seed_existing_skill()
+        fake_runner, _ = self._two_mit0_candidates()
+        before = snapshot(self.root)
+        real_replace = os.replace
+        fired = False
+
+        def interrupt_replace(src, dst):
+            """Trigger one KeyboardInterrupt at target_dest and delegate rollback calls."""
+            nonlocal fired
+            if not fired and Path(dst) == target_dest:
+                fired = True
+                if after_replace:
+                    real_replace(src, dst)
+                raise KeyboardInterrupt('simulated interrupt')
+            return real_replace(src, dst)
+
+        with (patch.object(adopt, 'os', _OsReplaceProxy(interrupt_replace)),
+              self.assertRaises(KeyboardInterrupt)):
+            self.invoke(apply=True, runner=fake_runner)
+        self.assertTrue(fired)
+        self.assertEqual(snapshot(self.root), before)
+        self.assertFalse((self.root / adopt.JOURNAL_NAME).exists())
+        self.assertEqual([p.name for p in self.root.iterdir() if p.name.startswith('.adopt-publish-')], [])
+
+    def test_commit_interrupt_after_skill_replace_rolls_back_cleanly(self):
+        """Roll back a moved skill directory when KeyboardInterrupt arrives right after os.replace."""
+        self._assert_interrupt_at_replace_rolls_back(self.root / 'skills/first', after_replace=True)
+
+    def test_commit_interrupt_before_skill_replace_rolls_back_cleanly(self):
+        """Roll back cleanly when KeyboardInterrupt arrives after undo recording but before os.replace."""
+        self._assert_interrupt_at_replace_rolls_back(self.root / 'skills/first', after_replace=False)
+
+    def test_commit_interrupt_after_licence_replace_rolls_back_cleanly(self):
+        """Unlink a moved licence file when KeyboardInterrupt arrives right after os.replace."""
+        self._assert_interrupt_at_replace_rolls_back(self.root / 'LICENSES/MIT-0.txt', after_replace=True)
+
+    def test_licence_destination_symlink_refused_before_journal(self):
+        """Refuse dangling and live LICENSES/<id>.txt symlinks before writing a publish journal."""
+        self._seed_existing_skill()
+        fake_runner, _ = self._two_mit0_candidates()
+        lic_link = self.root / 'LICENSES/MIT-0.txt'
+        live_target = self.base / 'outside-mit0.txt'
+        live_target.write_text('Outside MIT-0\n', encoding='utf-8')
+        for target in (self.base / 'dangling-mit0.txt', live_target):
+            if os.path.lexists(lic_link):
+                lic_link.unlink()
+            lic_link.symlink_to(target)
+            before = snapshot(self.root)
+            with self.assertRaisesRegex(ValueError, r'LICENSES/MIT-0\.txt: output symlink refused'):
+                self.invoke(apply=True, runner=fake_runner)
+            self.assertTrue(os.path.lexists(lic_link) and lic_link.is_symlink())
+            self.assertFalse((self.root / adopt.JOURNAL_NAME).exists())
+            self.assertEqual(snapshot(self.root), before)
+
+    def test_commit_journal_unlink_failure_rolls_back_and_keeps_staging(self):
+        """Roll back root and preserve staging backups if unlinking the publish journal fails."""
+        self._seed_existing_skill()
+        before = snapshot(self.root)
+        fake_runner, _ = self._two_mit0_candidates()
+        journal_path = self.root / adopt.JOURNAL_NAME
+        real_unlink = Path.unlink
+
+        def fail_journal_unlink(path_self, missing_ok=False):
+            """Raise OSError only when unlinking the publish journal."""
+            if path_self == journal_path:
+                raise OSError('simulated journal unlink failure')
+            return real_unlink(path_self, missing_ok=missing_ok)
+
+        with (patch.object(Path, 'unlink', fail_journal_unlink),
+              self.assertRaises(adopt._PublishRollbackError) as ctx):
+            self.invoke(apply=True, runner=fake_runner)
+        self.assertIn(str(journal_path), str(ctx.exception))
+        self.assertTrue(journal_path.is_file())
+        staged_dirs = [p for p in self.root.iterdir() if p.is_dir() and p.name.startswith('.adopt-publish-')]
+        self.assertEqual(len(staged_dirs), 1)
+        staging = staged_dirs[0]
+        self.assertIn(str(staging), str(ctx.exception))
+        for slot in ('0-REUSE.toml', '1-CREDITS.md', '2-INDEX.tsv'):
+            self.assertTrue((staging / 'backup' / slot).is_file(), slot)
+        filtered = {
+            rel: entry for rel, entry in snapshot(self.root).items()
+            if rel != adopt.JOURNAL_NAME and rel != staging.name and not rel.startswith(f'{staging.name}/')
+        }
+        self.assertEqual(filtered, before)
+
+        tsv(self.base / 'cand-empty.tsv', CANDIDATE_FIELDS, [])
+        adopt.run(self.base / 'cand-empty.tsv', self.base / 'groups.tsv', self.base / 'census.tsv',
+                  self.checkouts, self.root, apply=True, gate=passing_gate, hiss_gate=passing_gate,
+                  runner=fake_runner)
+        self.assertEqual(snapshot(self.root), before)
+
+        rows, _ = self.invoke(apply=True, runner=fake_runner)
+        self.assertEqual([r['verdict'] for r in rows], ['adopted', 'adopted'])
+        self.assertEqual(check_skills.check(self.root), 0)
 
 
 class RewriteFencesTests(unittest.TestCase):

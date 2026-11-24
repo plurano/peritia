@@ -22,7 +22,7 @@ import sys
 import tempfile
 import urllib.parse
 from collections import Counter
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -839,9 +839,8 @@ def _skill_directories(skills_dir: Path, staged_skills: Path | None = None) -> l
     by_name: dict[str, Path] = {}
     for folder in (skills_dir, staged_skills):
         if folder is not None and folder.is_dir():
-            for path in sorted(folder.iterdir())[:check_skills.MAX_SKILLS]:
-                if path.is_dir():
-                    by_name.setdefault(path.name, path)
+            for path in sorted(p for p in folder.iterdir() if p.is_dir())[:check_skills.MAX_SKILLS]:
+                by_name.setdefault(path.name, path)
     return [by_name[name] for name in sorted(by_name)[:check_skills.MAX_SKILLS]]
 
 
@@ -1175,9 +1174,16 @@ def default_download_runner(args, *, cwd=None):
     return out
 
 
+def _licence_target_present(root: Path, filename: str) -> bool:
+    """Return True when root/LICENSES/filename is a regular file; refuse any symlink."""
+    target = root / 'LICENSES' / filename
+    if target.is_symlink():
+        raise _output_symlink_error(f'LICENSES/{filename}')
+    return target.is_file()
+
+
 def _missing_spdx_ids(root: Path, reuse_text: str) -> list[str]:
     """List sorted SPDX identifiers in REUSE.toml that root/LICENSES lacks."""
-    licenses_dir = root / 'LICENSES'
     spdx_ids = set()
     for anno in tomllib.loads(reuse_text).get('annotations', [])[:MAX_ROWS]:
         val = anno.get('SPDX-License-Identifier')
@@ -1186,7 +1192,7 @@ def _missing_spdx_ids(root: Path, reuse_text: str) -> list[str]:
                 if token not in ('AND', 'OR', 'WITH'):
                     spdx_ids.add(token)
     return [spdx_id for spdx_id in sorted(spdx_ids)[:MAX_ROWS]
-            if not (licenses_dir / f'{spdx_id}.txt').is_file()]
+            if not _licence_target_present(root, f'{spdx_id}.txt')]
 
 
 def sync_licences(root: Path, reuse_text: str, runner=default_download_runner, *,
@@ -1220,8 +1226,11 @@ def sync_licences(root: Path, reuse_text: str, runner=default_download_runner, *
 
 # Root metadata files publish stages and moves like every other output.
 METADATA_FILES = ('REUSE.toml', 'CREDITS.md')
+APPLY_LOCK_PREFIX = '.adopt-skills'
+APPLY_LOCK_NAME = f'{APPLY_LOCK_PREFIX}.lock'
 JOURNAL_NAME = '.adopt-publish.journal.json'
 JOURNAL_BACKUP_TARGETS = ('REUSE.toml', 'CREDITS.md', 'skills/INDEX.tsv')
+REFUSED_REPORT_TARGETS = (JOURNAL_NAME, APPLY_LOCK_NAME, *JOURNAL_BACKUP_TARGETS)
 OUTPUT_SYMLINK_TARGETS = ('skills', 'skills/INDEX.tsv', 'LICENSES', 'REUSE.toml', 'CREDITS.md')
 
 
@@ -1269,6 +1278,11 @@ def _stage_publish(root: Path, staging: Path, saved: Path, rows: list[dict],
     return staged_licences, staged_skills, index_staged
 
 
+def _backup_slot_path(staging: Path, index: int, target: Path) -> Path:
+    """Return the canonical staged backup path for one JOURNAL_BACKUP_TARGETS slot."""
+    return staging / 'backup' / f'{index}-{target.name}'
+
+
 def _backup_publish_targets(root: Path, staging: Path) -> dict[Path, Path | None]:
     """Copy existing root metadata and index files into staging before replacing them."""
     backup_dir = staging / 'backup'
@@ -1277,7 +1291,7 @@ def _backup_publish_targets(root: Path, staging: Path) -> dict[Path, Path | None
     for idx, rel in enumerate(JOURNAL_BACKUP_TARGETS):
         target = root / rel
         if target.is_file():
-            saved = backup_dir / f'{idx}-{target.name}'
+            saved = _backup_slot_path(staging, idx, target)
             shutil.copy2(target, saved)
             backups[target] = saved
         else:
@@ -1286,9 +1300,9 @@ def _backup_publish_targets(root: Path, staging: Path) -> dict[Path, Path | None
 
 
 def _restore_backup_file(backup: Path, target: Path) -> None:
-    """Restore target from backup atomically while keeping the backup file in staging."""
+    """Stage a copy in backup.parent and atomically replace target while keeping backup."""
     target.parent.mkdir(parents=True, exist_ok=True)
-    fd, raw_tmp = tempfile.mkstemp(dir=target.parent, prefix=f'.{target.name}.restore.', suffix='.tmp')
+    fd, raw_tmp = tempfile.mkstemp(dir=backup.parent, prefix=f'.{target.name}.restore.', suffix='.tmp')
     tmp_path = Path(raw_tmp)
     try:
         with os.fdopen(fd, 'wb') as handle:
@@ -1303,7 +1317,8 @@ def _restore_backup_file(backup: Path, target: Path) -> None:
 def _apply_undo_step(kind: str, target: Path, other: Path | None) -> None:
     """Undo one recorded filesystem change under root."""
     if kind == 'move' and other is not None:
-        os.replace(target, other)
+        if (target.exists() or target.is_symlink()) and not (other.exists() or other.is_symlink()):
+            os.replace(target, other)
     elif kind == 'restore':
         if other is not None:
             _restore_backup_file(other, target)
@@ -1336,18 +1351,25 @@ def _format_rollback_failure(kind: str, target: Path, backup: Path | None) -> st
 
 
 def _rollback_error(
-    staging: Path, failures: list[tuple[str, Path, Path | None]],
+    staging: Path,
+    failures: list[tuple[str, Path, Path | None]],
+    journal_path: Path | None = None,
 ) -> _PublishRollbackError:
-    """Build an error naming the preserved staging folder and every failed undo step."""
+    """Build an error naming the preserved staging folder, optional journal, and failed undo steps."""
+    where = f'staging kept at {staging}'
+    if journal_path is not None:
+        where = f'journal at {journal_path}, {where}'
+    if not failures:
+        return _PublishRollbackError(f'publish rollback failed ({where}): could not remove publish journal')
     details = '; '.join(_format_rollback_failure(kind, target, other) for kind, target, other in failures)
-    return _PublishRollbackError(f'publish rollback failed (staging kept at {staging}): {details}')
+    return _PublishRollbackError(f'publish rollback failed ({where}): {details}')
 
 
 def _ensure_publish_dir(folder: Path, undo: list[tuple[str, Path, Path | None]]) -> None:
     """Create an output directory when absent and record its removal for rollback."""
     if not folder.exists():
-        folder.mkdir(parents=True, exist_ok=True)
         undo.append(('rmdir', folder, None))
+        folder.mkdir(parents=True, exist_ok=True)
 
 
 def _build_publish_journal(
@@ -1456,14 +1478,15 @@ def _parse_journal_backups(
     if not isinstance(raw_backups, dict) or set(raw_backups) != set(JOURNAL_BACKUP_TARGETS):
         raise _journal_error(journal_path, 'malformed backups mapping')
     entries: list[tuple[Path, Path | None]] = []
-    for rel in JOURNAL_BACKUP_TARGETS:
+    for idx, rel in enumerate(JOURNAL_BACKUP_TARGETS):
         target_path = _journal_rel_path(root, rel, journal_path)
         backup_rel = raw_backups[rel]
         if backup_rel is None:
             entries.append((target_path, None))
             continue
         backup_path = _journal_rel_path(root, backup_rel, journal_path)
-        if not backup_path.is_relative_to(staging_path) or not backup_path.is_file():
+        expected = _backup_slot_path(staging_path, idx, target_path)
+        if backup_path != expected or not backup_path.is_file():
             raise _journal_error(journal_path, f'invalid backup path: {backup_rel!r}')
         entries.append((target_path, backup_path))
     return entries
@@ -1532,6 +1555,18 @@ def _undo_journal_entry(kind: str, path: Path, other: Path | None = None) -> Non
         path.rmdir()
 
 
+def _collect_journal_undos(
+    backups: list[tuple[Path, Path | None]],
+    moves: list[tuple[str, Path]],
+    created_dirs: list[Path],
+) -> list[tuple[str, Path, Path | None]]:
+    """Build the ordered recovery steps for an interrupted publish journal."""
+    steps: list[tuple[str, Path, Path | None]] = [(kind, dest, None) for kind, dest in reversed(moves)]
+    steps.extend(('backup', target, backup) for target, backup in backups)
+    steps.extend(('rmdir', folder, None) for folder in reversed(created_dirs))
+    return steps
+
+
 def _reconcile_publish_journal(root: Path, *, apply: bool) -> None:
     """Roll back an interrupted publication on --apply, or refuse preview when a journal exists."""
     journal_path = root / JOURNAL_NAME
@@ -1545,12 +1580,18 @@ def _reconcile_publish_journal(root: Path, *, apply: bool) -> None:
             'interrupted publication pending; rerun with --apply to roll the interrupted publication back first',
         )
     staging, backups, moves, created_dirs = _load_publish_journal(root, journal_path)
-    for kind, dest in reversed(moves):
-        _undo_journal_entry(kind, dest)
-    for target, backup in backups:
-        _undo_journal_entry('backup', target, backup)
-    for folder in reversed(created_dirs):
-        _undo_journal_entry('rmdir', folder)
+    steps = _collect_journal_undos(backups, moves, created_dirs)
+    failures: list[tuple[str, Path, Path | None]] = []
+    first_error: OSError | None = None
+    for kind, target, other in steps[:MAX_ROWS + check_skills.MAX_SKILLS + 8]:
+        try:
+            _undo_journal_entry(kind, target, other)
+        except OSError as error:
+            if first_error is None:
+                first_error = error
+            failures.append((kind, target, other))
+    if failures:
+        raise _rollback_error(staging, failures, journal_path) from first_error
     journal_path.unlink(missing_ok=True)
     if staging.exists():
         shutil.rmtree(staging)
@@ -1565,29 +1606,29 @@ def _apply_commit_moves(
     index_staged: bool,
     undo: list[tuple[str, Path, Path | None]],
 ) -> None:
-    """Execute the journalled filesystem replacements and append each completed step to undo."""
+    """Record each planned undo step before executing its filesystem replacement."""
     if licences:
         _ensure_publish_dir(root / 'LICENSES', undo)
-        for lic in licences:
+        for lic in licences[:MAX_ROWS]:
             dest = root / 'LICENSES' / lic.name
-            os.replace(lic, dest)
             undo.append(('unlink', dest, None))
+            os.replace(lic, dest)
     for name in METADATA_FILES:
         target = root / name
-        os.replace(staging / name, target)
         undo.append(('restore', target, backups[target]))
+        os.replace(staging / name, target)
     if index_staged:
         _ensure_publish_dir(root / 'skills', undo)
         index_target = root / 'skills' / 'INDEX.tsv'
-        os.replace(staging / 'INDEX.tsv', index_target)
         undo.append(('restore', index_target, backups[index_target]))
-    for staged_skill in skills:
+        os.replace(staging / 'INDEX.tsv', index_target)
+    for staged_skill in skills[:check_skills.MAX_SKILLS]:
         _ensure_publish_dir(root / 'skills', undo)
         dest = root / 'skills' / staged_skill.name
         if dest.exists() or dest.is_symlink():
             raise _skill_exists_error(dest)
-        os.replace(staged_skill, dest)
         undo.append(('move', dest, staged_skill))
+        os.replace(staged_skill, dest)
 
 
 def _commit_publish(root: Path, staging: Path, staged_licences: list[Path],
@@ -1598,7 +1639,8 @@ def _commit_publish(root: Path, staging: Path, staged_licences: list[Path],
         dest = root / 'skills' / staged_skill.name
         if dest.exists() or dest.is_symlink():
             raise _skill_exists_error(dest)
-    licences = [lic for lic in staged_licences[:MAX_ROWS] if not (root / 'LICENSES' / lic.name).exists()]
+    licences = [lic for lic in staged_licences[:MAX_ROWS]
+                if not _licence_target_present(root, lic.name)]
     backups = _backup_publish_targets(root, staging)
     journal_path = _write_publish_journal(
         root, _build_publish_journal(root, staging, backups, licences, skills, index_staged),
@@ -1606,13 +1648,16 @@ def _commit_publish(root: Path, staging: Path, staged_licences: list[Path],
     undo: list[tuple[str, Path, Path | None]] = []
     try:
         _apply_commit_moves(root, staging, backups, licences, skills, index_staged, undo)
+        journal_path.unlink()
     except BaseException as commit_error:
         failures = _rollback_publish(undo)
-        if failures:
-            raise _rollback_error(staging, failures) from commit_error
-        journal_path.unlink(missing_ok=True)
+        if not failures:
+            # A journal that cannot be removed is reported just below, naming its path.
+            with suppress(OSError):
+                journal_path.unlink(missing_ok=True)
+        if failures or journal_path.exists() or journal_path.is_symlink():
+            raise _rollback_error(staging, failures, journal_path) from commit_error
         raise
-    journal_path.unlink(missing_ok=True)
 
 
 def publish(root, saved, rows, reuse, credits, adopted_map=None, group_map=None, runner=default_download_runner):
@@ -1636,6 +1681,7 @@ def publish(root, saved, rows, reuse, credits, adopted_map=None, group_map=None,
 
 
 def resolve_report_path(report: Path | None, root: Path) -> Path | None:
+    """Resolve the optional report TSV path and refuse the repository root or tool-owned outputs."""
     if report is None:
         return None
     dest = report.resolve()
@@ -1644,6 +1690,11 @@ def resolve_report_path(report: Path | None, root: Path) -> Path | None:
     root_resolved = root.resolve()
     if dest == root_resolved or dest == (root_resolved / 'adopt-report.tsv'):
         raise ValueError('repository root refused as report location')
+    lexical_dest = report.parent.resolve() / report.name
+    for rel in REFUSED_REPORT_TARGETS:
+        reserved = root_resolved / rel
+        if dest.is_relative_to(reserved) or lexical_dest == reserved:
+            raise ValueError(f'{rel} refused as report location')
     return dest
 
 
@@ -1666,7 +1717,7 @@ def run(candidates, groups, census, checkouts, root=Path('.'), *, apply=False,
         report_file is not None and report_file.is_symlink()
     ):
         raise _output_symlink_error('report')
-    with output_lock(root / '.adopt-skills') if apply else nullcontext():
+    with output_lock(root / APPLY_LOCK_PREFIX) if apply else nullcontext():
         _reconcile_publish_journal(root, apply=apply)
         _check_output_symlinks(root, report_file, raw_report=report)
         opts = _RunOptions(
