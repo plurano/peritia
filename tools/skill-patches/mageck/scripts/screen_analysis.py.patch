@@ -1,0 +1,102 @@
+# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
+# SPDX-License-Identifier: EUPL-1.2
+# threads: peritia-readopt-hiss-02-e78b82a11993
+--- a/scripts/screen_analysis.py
++++ b/scripts/screen_analysis.py
+@@ -15,6 +15,8 @@ import statistics
+ import subprocess
+ import tempfile
+ 
++VERSION_TIMEOUT = 60
++
+ 
+ def numeric_label(value):
+     """Upstream guesses numeric headers as counts and integer labels as indices."""
+@@ -181,8 +183,35 @@ def read_gene_hits(path, fdr):
+     return hits
+ 
+ 
++def _validate_timeout(timeout):
++    """Require a finite positive execution deadline in seconds."""
++    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
++        raise ValueError("Timeout must be a finite number of seconds > 0")
++
++
++def _stream_text(data):
++    """Decode partial subprocess output captured as bytes or text."""
++    if data is None:
++        return ""
++    if isinstance(data, bytes):
++        return data.decode("utf-8", errors="replace")
++    return data
++
++
++def _check_mageck_version(binary):
++    """Return the MAGeCK version string within VERSION_TIMEOUT seconds."""
++    try:
++        proc = subprocess.run(
++            [binary, "--version"], text=True, capture_output=True, check=True, timeout=VERSION_TIMEOUT,
++        )
++    except subprocess.TimeoutExpired as exc:
++        raise RuntimeError(f"MAGeCK --version timed out after {VERSION_TIMEOUT} seconds") from exc
++    return proc.stdout.strip()
++
++
+ def run_test(count_path, output, control, treatment, library_path=None, controls_path=None,
+-             paired=False, normalization="median", executable="mageck", fdr=.05):
++             paired=False, normalization="median", executable="mageck", fdr=.05, timeout=86400.0):
++    _validate_timeout(timeout)
+     if not 0 < fdr < 1:
+         raise ValueError("FDR must lie between zero and one")
+     if normalization not in {"median", "total", "control", "none"}:
+@@ -195,7 +224,7 @@ def run_test(count_path, output, control, treatment, library_path=None, controls
+         raise RuntimeError("MAGeCK executable not found; install MAGeCK 0.5.9.5 and its RRA binary")
+     output = Path(output)
+     output.mkdir(parents=True, exist_ok=False)
+-    version = subprocess.run([binary, "--version"], text=True, capture_output=True, check=True).stdout.strip()
++    version = _check_mageck_version(binary)
+     # Upstream uses shell commands internally. Fixed staging names avoid its path quoting problems.
+     with tempfile.TemporaryDirectory(prefix="mageck-analysis-") as temporary:
+         work = Path(temporary)
+@@ -208,14 +237,21 @@ def run_test(count_path, output, control, treatment, library_path=None, controls
+         if controls_path:
+             shutil.copyfile(controls_path, work / "controls.txt")
+             command += ["--control-sgrna", "controls.txt"]
+-        process = subprocess.run(command, cwd=work, capture_output=True, text=True, check=False)
++        log_path = output / "execution.log"
++        try:
++            process = subprocess.run(
++                command, cwd=work, capture_output=True, text=True, check=False, timeout=timeout,
++            )
++        except subprocess.TimeoutExpired as exc:
++            log_path.write_text(_stream_text(exc.stdout) + _stream_text(exc.stderr), encoding="utf-8")
++            raise RuntimeError(f"MAGeCK timed out after {timeout} seconds; inspect {log_path}") from exc
+         log = process.stdout + process.stderr
+-        (output / "execution.log").write_text(log)
++        log_path.write_text(log)
+         for artifact in work.glob("screen.*"):
+             if artifact.is_file():
+                 shutil.copyfile(artifact, output / artifact.name)
+         if process.returncode or not (output / "screen.gene_summary.txt").is_file():
+-            raise RuntimeError(f"MAGeCK did not complete; inspect {output / 'execution.log'}")
++            raise RuntimeError(f"MAGeCK did not complete; inspect {log_path}")
+     # 0.5.9.5 normalizes cttab_sel in selected_samples_id = controlgroup + treatgroup
+     # order before any paired-guide expansion, rather than in original count-column order.
+     normalization_info = normalization_evidence(log, normalization, control + treatment)
+@@ -242,12 +278,15 @@ def main():
+     parser.add_argument("--output", type=Path, help="New directory for test output; JSON path for QC")
+     parser.add_argument("--mageck", default="mageck")
+     parser.add_argument("--fdr", type=float, default=.05)
++    parser.add_argument("--timeout", type=float, default=86400.0,
++                        help="Execution deadline in seconds for test mode (default: 86400)")
+     args = parser.parse_args()
+     if args.mode == "test":
+         if args.output is None:
+             parser.error("test requires --output")
+         report = run_test(args.counts, args.output, args.control, args.treatment, args.library,
+-                          args.control_guides, args.paired, args.normalization, args.mageck, args.fdr)
++                          args.control_guides, args.paired, args.normalization, args.mageck,
++                          args.fdr, timeout=args.timeout)
+     else:
+         report = inspect_screen(args.counts, args.control, args.treatment, args.library, args.control_guides, args.paired)
+         if args.output:

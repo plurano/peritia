@@ -155,7 +155,14 @@ def summarize(directory: Path, expected_samples: list[str] | None = None) -> dic
     return {"measurements": measurements, "warnings": warnings}
 
 
-def run(manifest: Path, output: Path, executable: str, pipeline: Path) -> dict:
+def _validate_timeout(timeout: float) -> None:
+    """Require a finite positive execution deadline in seconds."""
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("Timeout must be a finite number of seconds > 0")
+
+
+def run(manifest: Path, output: Path, executable: str, pipeline: Path, timeout: float = 86400.0) -> dict:
+    _validate_timeout(timeout)
     if output.exists() and any(output.iterdir()):
         raise ValueError("Use an empty output directory to keep runs distinct")
     output.mkdir(parents=True, exist_ok=True)
@@ -172,12 +179,19 @@ def run(manifest: Path, output: Path, executable: str, pipeline: Path) -> dict:
     report.write_text(json.dumps(result, indent=2) + "\n")
     try:
         with (output / "cellprofiler.log").open("w") as log:
-            subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=True)
+            subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=True, timeout=timeout)
         if not done_file.is_file() or done_file.read_text().strip() != "Complete":
             raise ValueError("CellProfiler completion marker is missing or not Complete")
         result.update(summarize(output, [r["sample_id"] for r in qc["images"]]))
         result["status"] = "complete"
-    except (ValueError, OSError, KeyError, csv.Error, subprocess.CalledProcessError) as exc:
+    except (
+        ValueError,
+        OSError,
+        KeyError,
+        csv.Error,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+    ) as exc:
         result.update({"status": "failed", "error": str(exc)})
         raise
     finally:
@@ -197,6 +211,8 @@ def main() -> None:
     analysis.add_argument("--executable", default="cellprofiler")
     analysis.add_argument("--pipeline", type=Path,
                           default=Path(__file__).resolve().parents[1] / "assets" / "nuclei.cppipe")
+    analysis.add_argument("--timeout", type=float, default=86400.0,
+                          help="Execution deadline in seconds (default: 86400)")
     summary = sub.add_parser("summarize", help="Check existing Image.csv and Nuclei.csv")
     summary.add_argument("output", type=Path)
     args = parser.parse_args()
@@ -204,10 +220,17 @@ def main() -> None:
         if args.action == "prepare":
             result = prepare(args.manifest, args.output_csv)
         elif args.action == "run":
-            result = run(args.manifest, args.output, args.executable, args.pipeline)
+            result = run(args.manifest, args.output, args.executable, args.pipeline, timeout=args.timeout)
         else:
             result = summarize(args.output)
-    except (ValueError, OSError, KeyError, csv.Error, subprocess.CalledProcessError) as exc:
+    except (
+        ValueError,
+        OSError,
+        KeyError,
+        csv.Error,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+    ) as exc:
         parser.exit(1, f"Error: {exc}\n")
     print(json.dumps(result, indent=2))
 
