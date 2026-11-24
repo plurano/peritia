@@ -12,6 +12,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
@@ -26,10 +28,12 @@ import tomllib
 import adopt_skills as adopt
 import census
 import check_skills
+import input_identity
 import overlap
 
 REPO = Path(__file__).resolve().parent.parent
 MD = '---\nname: {name}\ndescription: Use when testing adoption.\n---\n\n# Example\n\nCheck the result.\n'
+COPY_MD = '---\nname: {name}\ndescription: Use when testing copied adoption.\n---\n\n# Example\n\nCheck the copy.\n'
 LICENCE = 'MIT License\n\nCopyright (c) 2025 owner\n'
 CANDIDATE_FIELDS = ['source', 'path', 'skill_name', 'verdict', 'licence', 'licence_evidence', 'functions']
 EMBED_MODEL = 'fixture-embed'
@@ -170,7 +174,11 @@ class AdoptionTests(unittest.TestCase):
                 item = overlap.item_from_skill(adopt.candidate_id(row), row['blob_id'], row['skill_name'],
                                                handle.read(overlap.MAX_SKILL_CHARS))
             items.append(item)
-            by_text.setdefault(overlap.make_embed_text(item), vectors[item.blob_id])
+            embed_text = overlap.make_embed_text(item)
+            vector = vectors[item.blob_id]
+            if embed_text in by_text and by_text[embed_text] != vector:
+                raise ValueError(f'conflicting vectors for identical embed text: {embed_text}')
+            by_text[embed_text] = vector
         path = self.base / 'cache.json'
         overlap.get_embeddings(items, lambda texts: [by_text[text] for text in texts], path,
                                model=EMBED_MODEL, provider=EMBED_PROVIDER)
@@ -635,8 +643,8 @@ class AdoptionTests(unittest.TestCase):
               self.assertRaisesRegex(ValueError, timed_out)):
             adopt.default_download_runner(cmd, cwd=self.root)
 
-    def test_crash_between_publish_renames_and_next_apply_repairs(self):
-        """Measure state after a mid-publish rename failure and verify the next apply repairs it."""
+    def _two_mit0_candidates(self):
+        """Populate two MIT-0 candidates and return a deterministic download runner and call log."""
         pin = self.source({
             'pack/first/SKILL.md': MD.format(name='first'), 'pack/first/LICENSE': 'MIT-0\n',
             'pack/second/SKILL.md': MD.format(name='second'), 'pack/second/LICENSE': 'MIT-0\n',
@@ -652,10 +660,18 @@ class AdoptionTests(unittest.TestCase):
 
         def fake_runner(cmd, *, cwd=None):
             """Write a deterministic licence file into the staged output target."""
+            self.assertIsNotNone(cwd)
             downloads.append(list(cmd))
             Path(cmd[cmd.index('-o') + 1]).write_text('MIT-0 text\n', encoding='utf-8')
             return b'ok'
 
+        return fake_runner, downloads
+
+    def test_crash_between_publish_renames_and_next_apply_repairs(self):
+        """Roll back root byte-identical on a mid-publish failure and retry both accepted and withdrawn."""
+        fake_runner, downloads = self._two_mit0_candidates()
+        (self.root / '.adopt-skills.lock').touch()
+        before_empty = snapshot(self.root)
         real_replace = os.replace
 
         def fail_second_skill(src, dst):
@@ -667,18 +683,61 @@ class AdoptionTests(unittest.TestCase):
         with (patch.object(adopt.os, 'replace', side_effect=fail_second_skill),
               self.assertRaisesRegex(OSError, 'simulated crash between skill renames')):
             self.invoke(apply=True, runner=fake_runner)
-        self.assertEqual([p.name for p in self.root.iterdir() if p.name.startswith('.adopt-publish-')], [])
-        self.assertTrue((self.root / 'skills/first').is_dir())
-        self.assertFalse((self.root / 'skills/second').exists())
-        self.assertEqual(check_skills.index_problems(self.root), ['skills/INDEX.tsv: extra row for second'])
-
-        rows2, _ = self.invoke(apply=True, runner=fake_runner)
-        self.assertEqual([r['verdict'] for r in rows2], ['present', 'adopted'])
+        self.assertEqual(snapshot(self.root), before_empty)
         self.assertEqual(len(downloads), 1)
+
+        def refuse_second(_root, _staging, skill):
+            """Simulate withdrawing or refusing the second skill on retry."""
+            if skill.name == 'second':
+                raise adopt.Refused('markdown: withdrawn')
+
+        rows_withdrawn, _ = self.invoke(apply=True, runner=fake_runner, gate=refuse_second)
+        self.assertEqual([r['verdict'] for r in rows_withdrawn], ['adopted', 'refused'])
+        self.assertEqual(len(downloads), 2)
+        self.assertEqual(check_skills.check(self.root), 0)
+        for rel in ('REUSE.toml', 'CREDITS.md', 'skills/INDEX.tsv'):
+            self.assertNotIn('second', (self.root / rel).read_text(encoding='utf-8'))
+
+        rows_accepted, _ = self.invoke(apply=True, runner=fake_runner)
+        self.assertEqual([r['verdict'] for r in rows_accepted], ['present', 'adopted'])
+        self.assertEqual(len(downloads), 2)
         self.assertEqual(check_skills.check(self.root), 0)
         index_lines = (self.root / 'skills/INDEX.tsv').read_text(encoding='utf-8').splitlines()
         self.assertIn('first\towner/repo\ttesting\tscience\t', index_lines)
         self.assertIn('second\towner/repo\ttesting\tdev\t', index_lines)
+
+    def test_crash_rollback_restores_populated_root_byte_identical(self):
+        """Restore pre-existing metadata, index and skills byte-identical when a later batch fails mid-commit."""
+        fake_runner, _ = self._two_mit0_candidates()
+        self.candidates = [self.candidates[0]]
+        self.census = [self.census[0]]
+        self.invoke(apply=True, runner=fake_runner)
+        before_populated = snapshot(self.root)
+
+        pin_extra = self.source({
+            'pack/two/SKILL.md': MD.format(name='two'), 'pack/two/LICENSE': 'MIT-0\n',
+            'pack/three/SKILL.md': MD.format(name='three'), 'pack/three/LICENSE': 'MIT-0\n',
+        }, source='other/repo')
+        for name in ('two', 'three'):
+            self.candidates.append({
+                'source': 'other/repo', 'path': f'pack/{name}/SKILL.md',
+                'skill_name': name, 'verdict': 'candidate', 'licence': 'MIT-0',
+                'licence_evidence': 'folder', 'functions': 'testing', 'domains': 'ops',
+            })
+            self.census.append({'source': 'other/repo', 'path': f'pack/{name}/SKILL.md', 'pin': pin_extra})
+
+        real_replace = os.replace
+
+        def fail_three(src, dst):
+            """Fail on the final rename after overwriting metadata and installing skill two."""
+            if Path(dst) == self.root / 'skills/three':
+                raise OSError('simulated crash on three')
+            real_replace(src, dst)
+
+        with (patch.object(adopt.os, 'replace', side_effect=fail_three),
+              self.assertRaisesRegex(OSError, 'simulated crash on three')):
+            self.invoke(apply=True, runner=fake_runner)
+        self.assertEqual(snapshot(self.root), before_populated)
 
     def test_report_path_written_and_root_refused(self):
         self.fixture()
@@ -708,7 +767,7 @@ class AdoptionTests(unittest.TestCase):
                                source='anthropics/skills')
         orig_cand = self.candidate(name='demo', folder='pack/demo', source='anthropics/skills', pin=orig_pin,
                                    blob_id='orig_blob', domains='coding;testing')
-        copy_pin = self.source({'pack/demo/SKILL.md': MD.format(name='demo'), 'pack/demo/LICENSE': LICENCE},
+        copy_pin = self.source({'pack/demo/SKILL.md': COPY_MD.format(name='demo'), 'pack/demo/LICENSE': LICENCE},
                                source='ComposioHQ/awesome-claude-skills')
         copy_cand = self.candidate(name='demo', folder='pack/demo', source='ComposioHQ/awesome-claude-skills', pin=copy_pin,
                                    blob_id='copy_blob', domains='testing')
@@ -833,7 +892,7 @@ class AdoptionTests(unittest.TestCase):
                                source='anthropics/skills')
         orig_cand = self.candidate(name='demo', folder='pack/demo', source='anthropics/skills', pin=orig_pin,
                                    blob_id='orig_blob')
-        copy_pin = self.source({'pack/demo/SKILL.md': MD.format(name='demo'), 'pack/demo/LICENSE': LICENCE},
+        copy_pin = self.source({'pack/demo/SKILL.md': COPY_MD.format(name='demo'), 'pack/demo/LICENSE': LICENCE},
                                source='ComposioHQ/awesome-claude-skills')
         copy_cand = self.candidate(name='demo', folder='pack/demo', source='ComposioHQ/awesome-claude-skills', pin=copy_pin,
                                    blob_id='copy_blob')
@@ -916,7 +975,7 @@ class AdoptionTests(unittest.TestCase):
                                 source='anthropics/skills')
         orig_cand = self.candidate(name='demo', folder='pack/demo', source='anthropics/skills', pin=orig_pin,
                                    blob_id='orig_blob', domains='coding;testing')
-        copy_pin = self.source({'pack/demo/SKILL.md': MD.format(name='demo'), 'pack/demo/LICENSE': LICENCE},
+        copy_pin = self.source({'pack/demo/SKILL.md': COPY_MD.format(name='demo'), 'pack/demo/LICENSE': LICENCE},
                                 source='ComposioHQ/awesome-claude-skills')
         copy_cand = self.candidate(name='demo', folder='pack/demo', source='ComposioHQ/awesome-claude-skills', pin=copy_pin,
                                    blob_id='copy_blob', domains='testing')
@@ -1233,6 +1292,373 @@ class AdoptionTests(unittest.TestCase):
         self.assertEqual(rows[0]['verdict'], 'refused', rows)
         self.assertIn('reference/guide.md', rows[0]['reason'])
         self.assertFalse((self.root / 'skills/demo').exists())
+
+    def test_pinned_member_text_size_cap_boundary_and_unreadable(self):
+        """Return truncated text at MAX_BYTES, refuse MAX_BYTES + 1 before git show, and ignore missing blobs."""
+        prefix = '---\r\nname: demo\r\ndescription: Use when testing cap.\r\n---\r\n\r\n'
+        prefix_bytes = prefix.encode('utf-8')
+        at_cap = prefix_bytes + (b'a' * (adopt.MAX_BYTES - len(prefix_bytes)))
+        over_cap = at_cap + b'z'
+        self.assertEqual(len(at_cap), adopt.MAX_BYTES)
+        self.assertEqual(len(over_cap), adopt.MAX_BYTES + 1)
+        pin = self.source({'pack/cap/SKILL.md': at_cap, 'pack/over/SKILL.md': over_cap, 'LICENSE': LICENCE})
+        checkout = self.checkouts / 'owner__repo'
+        adopt.git(checkout, 'sparse-checkout', 'set', '--no-cone', '--stdin', data=b'**/LICENSE\n')
+        self.assertFalse((checkout / 'pack/cap/SKILL.md').exists())
+        self.assertFalse((checkout / 'pack/over/SKILL.md').exists())
+
+        got = adopt._pinned_member_text(checkout, pin, 'pack/cap/SKILL.md')
+        self.assertEqual(len(got), overlap.MAX_SKILL_CHARS)
+        self.assertNotIn('\r', got)
+        self.assertTrue(got.startswith('---\nname: demo\n'))
+
+        calls = []
+        real_git = adopt.git
+
+        def spy_git(repo_dir, *args, **kwargs):
+            """Record git subcommands invoked while reading pinned blobs."""
+            calls.append(args)
+            return real_git(repo_dir, *args, **kwargs)
+
+        with patch.object(adopt, 'git', side_effect=spy_git):
+            self.assertEqual(adopt._pinned_member_text(checkout, pin, 'pack/over/SKILL.md'), '')
+            self.assertEqual(adopt._pinned_member_text(checkout, pin, 'pack/missing/SKILL.md'), '')
+        self.assertTrue(any(args[:2] == ('cat-file', '-s') for args in calls))
+        self.assertFalse(any(args and args[0] == 'show' for args in calls), calls)
+        self.assertEqual(adopt._pinned_member_text(self.base / 'absent', pin, 'pack/cap/SKILL.md'), '')
+        self.assertEqual(adopt._pinned_member_text(checkout, '', 'pack/cap/SKILL.md'), '')
+
+    def test_silent_missing_licence_file_raises_and_leaves_root_unchanged(self):
+        """Fail before touching root when the download runner exits cleanly without writing LICENSES/<id>.txt."""
+        (self.root / 'LICENSES').mkdir()
+        (self.root / 'LICENSES/MIT.txt').write_text('Existing MIT\n', encoding='utf-8')
+        self.fixture()
+        self.invoke(apply=True)
+        before = snapshot(self.root)
+
+        self.candidates, self.census = [], []
+        pin = self.source({'pack/extra/SKILL.md': MD.format(name='extra'), 'pack/extra/LICENSE': 'MIT-0\n'},
+                          source='other/repo')
+        self.candidates.append({
+            'source': 'other/repo', 'path': 'pack/extra/SKILL.md',
+            'skill_name': 'extra', 'verdict': 'candidate', 'licence': 'MIT-0',
+            'licence_evidence': 'folder', 'functions': 'testing',
+        })
+        self.census.append({'source': 'other/repo', 'path': 'pack/extra/SKILL.md', 'pin': pin})
+
+        def silent_noop_runner(_cmd, *, cwd=None):
+            """Return without creating the requested output file."""
+            self.assertTrue(cwd.is_dir())
+            return b'ok'
+
+        with self.assertRaisesRegex(ValueError, r'licence download failed for MIT-0: MIT-0\.txt not written'):
+            self.invoke(apply=True, runner=silent_noop_runner)
+        self.assertEqual(snapshot(self.root), before)
+
+        direct_root = self.base / 'direct-root'
+        direct_root.mkdir()
+        direct_before = snapshot(direct_root)
+        reuse_doc = 'version = 1\n\n[[annotations]]\npath = ["skills/x/**"]\nSPDX-FileCopyrightText = "2025 x"\nSPDX-License-Identifier = "MIT-0"\n'
+        with self.assertRaisesRegex(ValueError, r'licence download failed for MIT-0: MIT-0\.txt not written'):
+            adopt.sync_licences(direct_root, reuse_doc, runner=silent_noop_runner)
+        self.assertEqual(snapshot(direct_root), direct_before)
+
+    def _concurrent_apply_fixtures(self):
+        """Prepare two independent single-skill apply inputs sharing self.root."""
+        (self.root / 'LICENSES').mkdir()
+        (self.root / 'LICENSES/MIT.txt').write_text(LICENCE, encoding='utf-8')
+        pin1 = self.source({'pack/first/SKILL.md': MD.format(name='first'), 'pack/first/LICENSE': LICENCE},
+                           source='owner/first')
+        pin2 = self.source({'pack/second/SKILL.md': MD.format(name='second'), 'pack/second/LICENSE': LICENCE},
+                           source='other/second')
+        groups = self.base / 'concurrent-groups.tsv'
+        tsv(groups, ['members'], [])
+        paths = {}
+        for idx, (name, repo, pin) in enumerate((('first', 'owner/first', pin1), ('second', 'other/second', pin2)), 1):
+            cand_path = self.base / f'cand-{idx}.tsv'
+            cen_path = self.base / f'cen-{idx}.tsv'
+            tsv(cand_path, CANDIDATE_FIELDS, [{
+                'source': repo, 'path': f'pack/{name}/SKILL.md', 'skill_name': name,
+                'verdict': 'candidate', 'licence': 'MIT', 'licence_evidence': 'folder', 'functions': 'testing',
+            }])
+            tsv(cen_path, ['source', 'path', 'pin'], [{'source': repo, 'path': f'pack/{name}/SKILL.md', 'pin': pin}])
+            paths[name] = (cand_path, cen_path)
+        return groups, paths
+
+    def test_concurrent_applies_serialize_under_output_lock(self):
+        """Serialize overlapping --apply runs so the second builds upon the first's metadata and index."""
+        groups, paths = self._concurrent_apply_fixtures()
+        t1_in_gate, release_t1, t2_past_inputs = threading.Event(), threading.Event(), threading.Event()
+        real_inputs = adopt.inputs
+        errors = []
+
+        def gate_t1(_root, _staging, _skill):
+            """Hold the first apply mid-run while the second apply attempts to acquire the lock."""
+            t1_in_gate.set()
+            self.assertTrue(release_t1.wait(timeout=5.0))
+
+        def tracked_inputs(cand_file, group_file, cen_file):
+            """Signal when the second apply reaches the lock acquisition boundary."""
+            parsed = real_inputs(cand_file, group_file, cen_file)
+            if cand_file == paths['second'][0]:
+                t2_past_inputs.set()
+            return parsed
+
+        def worker(name, gate_fn):
+            """Run one apply worker and record any unexpected failure."""
+            try:
+                cand_file, cen_file = paths[name]
+                adopt.run(cand_file, groups, cen_file, self.checkouts, self.root, apply=True,
+                          gate=gate_fn, hiss_gate=passing_gate)
+            except (OSError, ValueError, RuntimeError) as exc:
+                errors.append(exc)
+
+        with patch.object(adopt, 'inputs', side_effect=tracked_inputs):
+            first_thread = threading.Thread(target=worker, args=('first', gate_t1))
+            second_thread = threading.Thread(target=worker, args=('second', passing_gate))
+            first_thread.start()
+            self.assertTrue(t1_in_gate.wait(timeout=5.0))
+            second_thread.start()
+            self.assertTrue(t2_past_inputs.wait(timeout=5.0))
+            time.sleep(0.05)
+            release_t1.set()
+            first_thread.join(timeout=5.0)
+            second_thread.join(timeout=5.0)
+
+        self.assertEqual(errors, [])
+        self.assertTrue((self.root / '.adopt-skills.lock').is_file())
+        self.assertEqual(check_skills.check(self.root), 0)
+        for name in ('first', 'second'):
+            self.assertTrue((self.root / 'skills' / name).is_dir())
+            self.assertIn(f'skills/{name}/**', (self.root / 'REUSE.toml').read_text(encoding='utf-8'))
+            self.assertIn(f'`{name}`', (self.root / 'CREDITS.md').read_text(encoding='utf-8'))
+            self.assertIn(f'{name}\t', (self.root / 'skills/INDEX.tsv').read_text(encoding='utf-8'))
+
+    def test_apply_lock_timeout_and_preview_without_lock(self):
+        """Allow preview while locked elsewhere, fail --apply on lock timeout leaving root unchanged, and ignore lock in Git."""
+        (self.root / 'LICENSES').mkdir()
+        (self.root / 'LICENSES/MIT.txt').write_text(LICENCE, encoding='utf-8')
+        self.fixture()
+        with input_identity.output_lock(self.root / '.adopt-skills'):
+            before = snapshot(self.root)
+            preview_rows, _ = self.invoke(apply=False)
+            self.assertEqual(preview_rows[0]['verdict'], 'adopted')
+            self.assertEqual(snapshot(self.root), before)
+
+            with (patch.object(input_identity, 'LOCK_WAIT_SECONDS', 0.02),
+                  patch.object(input_identity, 'LOCK_POLL_SECONDS', 0.005)):
+                with self.assertRaisesRegex(TimeoutError, r'\.adopt-skills\.lock.*timed out'):
+                    self.invoke(apply=True)
+                self.assertEqual(snapshot(self.root), before)
+
+                stderr = io.StringIO()
+                argv = ['--candidates', str(self.base / 'candidates.tsv'),
+                        '--groups', str(self.base / 'groups.tsv'),
+                        '--census', str(self.base / 'census.tsv'),
+                        '--checkouts', str(self.checkouts), '--root', str(self.root), '--apply']
+                with redirect_stderr(stderr):
+                    rc = adopt.main(argv)
+                self.assertEqual(rc, 1)
+                self.assertIn('.adopt-skills.lock', stderr.getvalue())
+                self.assertEqual(snapshot(self.root), before)
+
+        adopt.command(['git', 'check-ignore', '-q', '.adopt-skills.lock'], cwd=REPO)
+
+    def test_adopted_member_fallback_confines_to_skills_dir(self):
+        """Refuse fallback SKILL.md paths resolving outside skills_dir while keeping in-tree copies."""
+        skills = self.root / 'skills'
+        skills.mkdir()
+        outside = self.root / 'skills-outside'
+        outside.mkdir()
+        (outside / 'SKILL.md').write_text(MD.format(name='demo'), encoding='utf-8')
+        origin_text = 'upstream: <https://github.com/owner/repo>\npath: .\n'
+        (outside / 'ORIGIN.md').write_text(origin_text, encoding='utf-8')
+
+        (skills / 'demo').symlink_to(outside)
+        self.assertEqual(adopt.get_member_skill_text('owner/repo:SKILL.md', self.checkouts, skills), '')
+        (skills / 'demo').unlink()
+
+        in_tree = skills / 'demo'
+        in_tree.mkdir()
+        (in_tree / 'ORIGIN.md').write_text(origin_text, encoding='utf-8')
+        (in_tree / 'SKILL.md').symlink_to(outside / 'SKILL.md')
+        self.assertEqual(adopt.get_member_skill_text('owner/repo:SKILL.md', self.checkouts, skills), '')
+
+        (in_tree / 'SKILL.md').unlink()
+        expected = MD.format(name='demo')
+        (in_tree / 'SKILL.md').write_text(expected, encoding='utf-8')
+        self.assertEqual(adopt.get_member_skill_text('owner/repo:SKILL.md', self.checkouts, skills), expected)
+
+    def test_refill_command_includes_judge_model_placeholder_without_env(self):
+        """Append --judge-model <model> when unset in env, and leave command unchanged when env sets it."""
+        for name, source in (('alpha', 'anthropics/skills'), ('beta', 'obra/superpowers')):
+            pin = self.source({'SKILL.md': MD.format(name=name), 'LICENSE': LICENCE}, source=source)
+            self.candidate(name=name, folder='', source=source, pin=pin, blob_id=name)
+        cand_path = self.base / 'candidates.tsv'
+        tsv(cand_path, [*CANDIDATE_FIELDS, 'blob_id'], self.candidates)
+        overlap_out = self.base / 'overlap.tsv'
+        groups_out = self.base / 'groups.tsv'
+        cache_path = self.base / 'orig-cache.json'
+        overlap.run(
+            candidates_tsv=cand_path, checkouts=self.checkouts, skills_dir=self.root / 'skills',
+            overlap_out=overlap_out, groups_out=groups_out,
+            embed_fn=lambda texts: [[1.0, 0.0] for _ in texts],
+            judge_fn=lambda _prompt: {'same_use': True, 'reason': 'same'},
+            judge_model='cli-flag-judge', cache_path=cache_path,
+            embed_model=EMBED_MODEL, provider=EMBED_PROVIDER,
+        )
+        partial_cache = self.embedding_cache({'alpha': [1.0, 0.0]})
+        env_without = {k: v for k, v in os.environ.items() if k != 'PERITIA_LLM_JUDGE_MODEL'}
+        stderr_unset = io.StringIO()
+        with patch.dict(os.environ, env_without, clear=True), redirect_stderr(stderr_unset):
+            adopt.run(cand_path, groups_out, self.base / 'census.tsv' if (self.base / 'census.tsv').exists() else self._write_census(),
+                      self.checkouts, self.root, apply=False, gate=passing_gate, hiss_gate=passing_gate,
+                      include_grouped=True, cache=partial_cache, embed_model=EMBED_MODEL, base_url=EMBED_PROVIDER)
+        self.assertIn('--judge-model <model>', stderr_unset.getvalue())
+
+        with patch.dict(os.environ, {**env_without, 'PERITIA_LLM_JUDGE_MODEL': 'env-judge'}, clear=True):
+            inputs_with_env = adopt._copy_embedding_inputs(partial_cache, EMBED_MODEL, EMBED_PROVIDER, None, None, True)
+            cmd_env = inputs_with_env.refill_command()
+        self.assertNotIn('--judge-model', cmd_env)
+
+    def _write_census(self):
+        """Write current fixture census rows and return the TSV path."""
+        census_path = self.base / 'census.tsv'
+        tsv(census_path, ['source', 'path', 'pin'], self.census)
+        return census_path
+
+    def test_hard_kill_between_publish_renames_measured(self):
+        """Measure uncatchable process exit mid-publish and what subsequent --apply runs do."""
+        if not hasattr(os, 'fork'):
+            self.skipTest('os.fork unavailable')
+        fake_runner, _ = self._two_mit0_candidates()
+        real_replace = os.replace
+        pid = os.fork()
+        if pid == 0:
+            def kill_on_second(src, dst):
+                """Exit immediately without running Python cleanup handlers."""
+                if Path(dst) == self.root / 'skills/second':
+                    os._exit(99)
+                real_replace(src, dst)
+
+            with patch.object(adopt.os, 'replace', side_effect=kill_on_second):
+                self.invoke(apply=True, runner=fake_runner)
+            os._exit(0)
+        _, status = os.waitpid(pid, 0)
+        self.assertTrue(os.WIFEXITED(status) and os.WEXITSTATUS(status) == 99)
+
+        leftovers = [p.name for p in self.root.iterdir() if p.name.startswith('.adopt-publish-')]
+        self.assertEqual(len(leftovers), 1)
+        self.assertTrue((self.root / 'LICENSES/MIT-0.txt').is_file())
+        self.assertTrue((self.root / 'skills/first').is_dir())
+        self.assertFalse((self.root / 'skills/second').exists())
+        self.assertEqual(check_skills.index_problems(self.root), ['skills/INDEX.tsv: extra row for second'])
+
+        root_withdrawn = self.base / 'root-withdrawn'
+        shutil.copytree(self.root, root_withdrawn)
+        rows_accept, _ = self.invoke(apply=True, runner=fake_runner)
+        self.assertEqual([r['verdict'] for r in rows_accept], ['present', 'adopted'])
+        self.assertEqual(check_skills.check(self.root), 0)
+
+        tsv(self.base / 'cand-one.tsv', [*CANDIDATE_FIELDS, 'domains'], [self.candidates[0]])
+        rows_withdraw, _ = adopt.run(self.base / 'cand-one.tsv', self.base / 'groups.tsv',
+                                     self.base / 'census.tsv', self.checkouts, root_withdrawn,
+                                     apply=True, gate=passing_gate, hiss_gate=passing_gate, runner=fake_runner)
+        self.assertEqual([r['verdict'] for r in rows_withdraw], ['present'])
+        self.assertEqual(check_skills.check(root_withdrawn), 0)
+        self.assertIn('skills/second/**', (root_withdrawn / 'REUSE.toml').read_text(encoding='utf-8'))
+        self.assertIn('`second`', (root_withdrawn / 'CREDITS.md').read_text(encoding='utf-8'))
+
+    def test_missing_vectors_stderr_mentions_working_tree_restore_hint(self):
+        """Print the working-tree checkout hint while preserving the refill command text."""
+        for name, source in (('alpha', 'anthropics/skills'), ('beta', 'obra/superpowers')):
+            pin = self.source({'SKILL.md': MD.format(name=name), 'LICENSE': LICENCE}, source=source)
+            self.candidate(name=name, folder='', source=source, pin=pin, blob_id=name)
+        members = [adopt.candidate_id(row) for row in self.candidates]
+        self.groups = [{'group_id': '77', 'members': ','.join(members)}]
+        cache_file = self.embedding_cache({'alpha': [1.0, 0.0]})
+        expected_cmd = adopt._copy_embedding_inputs(
+            cache_file, EMBED_MODEL, EMBED_PROVIDER, None, None, True,
+            refill_paths=(self.base / 'candidates.tsv', self.checkouts, self.root / 'skills'),
+        ).refill_command()
+
+        stderr_present = io.StringIO()
+        with redirect_stderr(stderr_present):
+            self.invoke(apply=False, include_grouped=True, cache=cache_file)
+        self.assertIn(f'run {expected_cmd}', stderr_present.getvalue())
+        self.assertIn('git -C <checkout> checkout <pin> -- <path>', stderr_present.getvalue())
+
+        beta_checkout = self.checkouts / 'obra__superpowers'
+        adopt.git(beta_checkout, 'sparse-checkout', 'set', '--no-cone', '--stdin', data=b'**/LICENSE\n')
+        self.assertFalse((beta_checkout / 'SKILL.md').exists())
+        stderr_absent = io.StringIO()
+        with redirect_stderr(stderr_absent):
+            self.invoke(apply=False, include_grouped=True, cache=cache_file)
+        self.assertIn(f'run {expected_cmd}', stderr_absent.getvalue())
+        self.assertIn('git -C <checkout> checkout <pin> -- <path>', stderr_absent.getvalue())
+
+    def test_origin_empty_path_not_present_while_dot_and_skill_md_are_present(self):
+        """Ignore existing ORIGIN.md entries lacking a path while honoring explicit . and SKILL.md paths."""
+        pin = self.source({'SKILL.md': MD.format(name='root-demo'), 'LICENSE': LICENCE}, source='owner/repo')
+        self.candidate(name='root-demo', folder='', source='owner/repo', pin=pin)
+        existing = self.root / 'skills/existing'
+        existing.mkdir(parents=True)
+        (existing / 'SKILL.md').write_text(MD.format(name='existing'), encoding='utf-8')
+        (existing / 'LICENSE').write_text(LICENCE, encoding='utf-8')
+
+        for bad_origin in (
+            f'upstream: <https://github.com/owner/repo>\ncommit: {pin}\nlicence: MIT\nchanges: none\n',
+            f'upstream: <https://github.com/owner/repo>\npath:   \ncommit: {pin}\nlicence: MIT\nchanges: none\n',
+        ):
+            (existing / 'ORIGIN.md').write_text(bad_origin, encoding='utf-8')
+            self.assertEqual(adopt.read_present_skills(self.root / 'skills'), {})
+            rows, _ = self.invoke(apply=False)
+            self.assertEqual(rows[0]['verdict'], 'adopted')
+
+        for valid_path in ('.', 'SKILL.md'):
+            (existing / 'ORIGIN.md').write_text(
+                f'upstream: <https://github.com/owner/repo>\npath: {valid_path}\ncommit: {pin}\n',
+                encoding='utf-8',
+            )
+            rows, _ = self.invoke(apply=False)
+            self.assertEqual(rows[0]['verdict'], 'present')
+            self.assertEqual(rows[0]['directory'], 'skills/existing')
+
+    def test_embedding_cache_distinct_vectors_and_conflict_check(self):
+        """Keep distinct vectors for distinct copy descriptions, enforce 0.97 boundary, and reject conflicts."""
+        orig_pin = self.source({'pack/demo/SKILL.md': MD.format(name='demo'), 'pack/demo/LICENSE': LICENCE},
+                               source='anthropics/skills')
+        orig_cand = self.candidate(name='demo', folder='pack/demo', source='anthropics/skills', pin=orig_pin,
+                                   blob_id='orig_blob')
+        copy_pin = self.source({'pack/demo/SKILL.md': COPY_MD.format(name='demo'), 'pack/demo/LICENSE': LICENCE},
+                               source='ComposioHQ/awesome-claude-skills')
+        copy_cand = self.candidate(name='demo', folder='pack/demo', source='ComposioHQ/awesome-claude-skills', pin=copy_pin,
+                                   blob_id='copy_blob')
+        orig_id, copy_id = adopt.candidate_id(orig_cand), adopt.candidate_id(copy_cand)
+        self.groups = [{'group_id': '101', 'members': f'{orig_id},{copy_id}'}]
+        cache_99 = self.embedding_cache({'orig_blob': [1.0, 0.0], 'copy_blob': [0.99, math.sqrt(1 - 0.99**2)]})
+        items = [
+            overlap.item_from_skill(orig_id, 'orig_blob', 'demo', MD.format(name='demo')),
+            overlap.item_from_skill(copy_id, 'copy_blob', 'demo', COPY_MD.format(name='demo')),
+        ]
+        loaded = overlap.load_embeddings(cache_99, items, EMBED_MODEL, EMBED_PROVIDER, require_namespace=True)
+        self.assertNotEqual(loaded[orig_id], loaded[copy_id])
+        self.assertAlmostEqual(overlap.cosine_similarity(loaded[orig_id], loaded[copy_id]), 0.99, places=6)
+
+        cache_99.unlink()
+        cache_low = self.embedding_cache({'orig_blob': [1.0, 0.0], 'copy_blob': [0.96, math.sqrt(1 - 0.96**2)]})
+        rows_low, _ = self.invoke(apply=False, include_grouped=True, cache=cache_low)
+        self.assertEqual([r['verdict'] for r in rows_low], ['adopted', 'adopted'])
+
+        self.candidates, self.census = [], []
+        dup_pin = self.source({'pack/demo/SKILL.md': MD.format(name='demo'), 'pack/demo/LICENSE': LICENCE},
+                              source='other/repo')
+        self.candidates.extend([
+            orig_cand,
+            self.candidate(name='demo', folder='pack/demo', source='other/repo', pin=dup_pin, blob_id='dup_blob'),
+        ])
+        with self.assertRaisesRegex(ValueError, 'conflicting vectors for identical embed text'):
+            self.embedding_cache({'orig_blob': [1.0, 0.0], 'dup_blob': [0.0, 1.0]})
 
 
 class RewriteFencesTests(unittest.TestCase):

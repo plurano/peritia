@@ -22,6 +22,7 @@ import sys
 import tempfile
 import urllib.parse
 from collections import Counter
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -43,7 +44,12 @@ from candidates import (
 from census import LiveReader, SourceReadError
 from check_skills import front_matter_or_empty
 from git_blob import git_blob_id
-from input_identity import provider_id, resolve_base_urls, validate_base_url
+from input_identity import (
+    output_lock,
+    provider_id,
+    resolve_base_urls,
+    validate_base_url,
+)
 from judge_groups import (
     collapse_copies,
     get_skill_text,
@@ -788,6 +794,7 @@ def _origin_folder(path: str) -> PurePosixPath:
 
 
 def read_present_skills(skills_dir: Path) -> dict[tuple[str, str], dict[str, str]]:
+    """Index already-adopted skills by normalized upstream repository and recorded origin folder."""
     if not skills_dir.is_dir():
         return {}
     present = {}
@@ -796,11 +803,14 @@ def read_present_skills(skills_dir: Path) -> dict[tuple[str, str], dict[str, str
         if not origin_file.is_file():
             continue
         try:
-            rec = check_skills.fields(origin_file.read_text(encoding='utf-8'))
+            origin_text = origin_file.read_text(encoding='utf-8')
+            rec = check_skills.fields(origin_text)
             upstream = extract_source(origin_file)
-            if not upstream or upstream == 'peritia':
+            path_match = re.search(r'^path:[ \t]*(.*)$', origin_text, re.MULTILINE)
+            raw_path = path_match.group(1).strip() if path_match else ''
+            if not upstream or upstream == 'peritia' or not raw_path:
                 continue
-            origin_path = str(_origin_folder(rec.get('path', '').strip()))
+            origin_path = str(_origin_folder(raw_path))
             commit = rec.get('commit', '').strip()
             key = (upstream.lower(), origin_path)
             if key not in present:
@@ -913,28 +923,34 @@ def write_index(root: Path, adopted_map: dict[str, dict] | None = None,
 
 
 def _pinned_member_text(checkout: Path, pin: str | None, path: str) -> str:
-    """Read the pinned skill when a sparse checkout omits its working-tree file."""
+    """Read the pinned skill up to MAX_BYTES when a sparse checkout omits its working-tree file."""
     if not pin or not checkout.is_dir():
         return ''
+    spec = f'{pin}:{path}'
     try:
-        data = git(checkout, 'show', f'{pin}:{path}')
+        size = int(git(checkout, 'cat-file', '-s', spec).decode('utf-8').strip())
+        if size < 0 or size > MAX_BYTES:
+            return ''
+        data = git(checkout, 'show', spec)
         return data.decode('utf-8', errors='replace').replace('\r\n', '\n').replace('\r', '\n')[:overlap.MAX_SKILL_CHARS]
-    except (Refused, OSError, subprocess.SubprocessError):
+    except (Refused, OSError, ValueError, subprocess.SubprocessError):
         return ''
 
 
 def _adopted_member_text(skills_dir: Path, source: str, path: str) -> str:
-    """Read an adopted member when its source text is unavailable."""
-    if not skills_dir.is_dir():
+    """Read an in-tree adopted member when its source text is unavailable."""
+    raw_path = path.strip()
+    if not raw_path or not skills_dir.is_dir():
         return ''
-    folder = _origin_folder(path)
+    folder = _origin_folder(raw_path)
     present = read_present_skills(skills_dir).get((source.lower(), str(folder)))
     if present is None:
         return ''
-    skill_md = skills_dir / present['name'] / 'SKILL.md'
-    if not skill_md.is_file():
-        return ''
     try:
+        resolved_skills = skills_dir.resolve()
+        skill_md = (skills_dir / present['name'] / 'SKILL.md').resolve()
+        if not skill_md.is_relative_to(resolved_skills) or not skill_md.is_file():
+            return ''
         with skill_md.open(encoding='utf-8', errors='replace') as handle:
             return handle.read(overlap.MAX_SKILL_CHARS)
     except OSError:
@@ -984,6 +1000,7 @@ class CopyEmbeddingInputs:
     endpoint: str
     dims: int | None
     refill_paths: tuple[Path, Path, Path] | None = None
+    judge_model: str = ''
 
     def refill_command(self) -> str:
         """Show which overlap command populates the needed cache."""
@@ -996,7 +1013,13 @@ class CopyEmbeddingInputs:
         if self.refill_paths is not None:
             for option, path in zip(('--candidates', '--checkouts', '--skills-dir'), self.refill_paths, strict=True):
                 args += [option, str(path)]
-        return shlex.join(args)
+        env_judge = os.environ.get('PERITIA_LLM_JUDGE_MODEL', '')
+        if self.judge_model and not env_judge:
+            args += ['--judge-model', self.judge_model]
+        cmd = shlex.join(args)
+        if not self.judge_model and not env_judge:
+            cmd += ' --judge-model <model>'
+        return cmd
 
     def require_cache(self) -> Path:
         """Require a cache and model only when grouped adoption reads embeddings."""
@@ -1026,8 +1049,14 @@ def _group_copy_decisions(group, items, metadata, embeddings, ranks, embedding: 
         return collapse_copies(members, items, metadata, embeddings, ranks)[1]
 
     group_id = group.get('group_id', '')
-    print(f"group {group_id}: missing embedding vectors for {', '.join(missing)}; "
-          f"run {embedding.refill_command()}", file=sys.stderr)
+    print(
+        f"group {group_id}: missing embedding vectors for {', '.join(missing)}; "
+        f"run {embedding.refill_command()} "
+        "(files absent from the working tree are skipped by overlap; restore them at the intended pin, "
+        "e.g. git -C <checkout> checkout <pin> -- <path>, before rerunning; checkouts that contain the "
+        "files can run the printed command unchanged)",
+        file=sys.stderr,
+    )
     _, copies = collapse_copies(members, items, metadata, {}, ranks)
     originals = {reason.removeprefix('copy-of:') for reason in copies.values()}
     return {**dict.fromkeys((m for m in members if m not in originals), 'missing-embedding-vector'), **copies}
@@ -1167,18 +1196,24 @@ def sync_licences(root: Path, reuse_text: str, runner=default_download_runner, *
     if not missing:
         return []
     licenses_dir = dest_root / 'LICENSES'
+    created_dir = not licenses_dir.exists()
     licenses_dir.mkdir(parents=True, exist_ok=True)
     written = []
-    for spdx_id in missing[:MAX_ROWS]:
-        lic_file = licenses_dir / f'{spdx_id}.txt'
-        cmd = ['reuse', 'download', '-o', str(lic_file), spdx_id]
-        try:
-            runner(cmd, cwd=dest_root)
-        except (ValueError, OSError, subprocess.SubprocessError) as error:
-            mapped = _download_error(cmd, error)
-            raise mapped from (error.__cause__ if mapped is error else error)
-        if lic_file.is_file():
+    try:
+        for spdx_id in missing[:MAX_ROWS]:
+            lic_file = licenses_dir / f'{spdx_id}.txt'
+            cmd = ['reuse', 'download', '-o', str(lic_file), spdx_id]
+            try:
+                runner(cmd, cwd=dest_root)
+            except (ValueError, OSError, subprocess.SubprocessError) as error:
+                mapped = _download_error(cmd, error)
+                raise mapped from (error.__cause__ if mapped is error else error)
+            if not lic_file.is_file():
+                raise ValueError(f'licence download failed for {spdx_id}: {lic_file.name} not written')
             written.append(lic_file)
+    finally:
+        if created_dir and licenses_dir.is_dir() and not any(licenses_dir.iterdir()):
+            licenses_dir.rmdir()
     return written
 
 
@@ -1209,24 +1244,88 @@ def _stage_publish(root: Path, staging: Path, saved: Path, rows: list[dict],
     return staged_licences, staged_skills, index_staged
 
 
+def _backup_publish_targets(root: Path, staging: Path, index_staged: bool) -> dict[Path, Path | None]:
+    """Copy existing root metadata and index files into staging before replacing them."""
+    backup_dir = staging / 'backup'
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    targets = [root / name for name in METADATA_FILES]
+    if index_staged:
+        targets.append(root / 'skills' / 'INDEX.tsv')
+    backups: dict[Path, Path | None] = {}
+    for idx, target in enumerate(targets):
+        if target.is_file():
+            saved = backup_dir / f'{idx}-{target.name}'
+            shutil.copy2(target, saved)
+            backups[target] = saved
+        else:
+            backups[target] = None
+    return backups
+
+
+def _apply_undo_step(kind: str, target: Path, other: Path | None) -> None:
+    """Undo one recorded filesystem change under root."""
+    if kind == 'move' and other is not None:
+        os.replace(target, other)
+    elif kind == 'restore':
+        if other is not None:
+            os.replace(other, target)
+        else:
+            target.unlink(missing_ok=True)
+    elif kind == 'unlink':
+        target.unlink(missing_ok=True)
+    elif kind == 'rmdir' and target.is_dir() and not any(target.iterdir()):
+        target.rmdir()
+
+
+def _rollback_publish(undo: list[tuple[str, Path, Path | None]]) -> None:
+    """Revert recorded publish steps in reverse order on commit failure."""
+    for kind, target, other in reversed(undo):
+        try:
+            _apply_undo_step(kind, target, other)
+        except OSError:
+            continue
+
+
+def _ensure_publish_dir(folder: Path, undo: list[tuple[str, Path, Path | None]]) -> None:
+    """Create an output directory when absent and record its removal for rollback."""
+    if not folder.exists():
+        folder.mkdir(parents=True, exist_ok=True)
+        undo.append(('rmdir', folder, None))
+
+
 def _commit_publish(root: Path, staging: Path, staged_licences: list[Path],
                     staged_skills: list[Path], index_staged: bool) -> None:
-    """Move staged artefacts into root, installing skill folders last."""
-    if staged_licences:
-        (root / 'LICENSES').mkdir(parents=True, exist_ok=True)
-        for lic in staged_licences[:MAX_ROWS]:
-            os.replace(lic, root / 'LICENSES' / lic.name)
-    for name in METADATA_FILES:
-        os.replace(staging / name, root / name)
-    if index_staged:
-        (root / 'skills').mkdir(parents=True, exist_ok=True)
-        os.replace(staging / 'INDEX.tsv', root / 'skills' / 'INDEX.tsv')
-    for staged_skill in staged_skills[:check_skills.MAX_SKILLS]:
-        dest = root / 'skills' / staged_skill.name
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        if dest.exists() or dest.is_symlink():
-            raise FileExistsError(f'{dest}: skill directory already exists')
-        os.replace(staged_skill, dest)
+    """Move staged artefacts into root, rolling back in reverse order on any failure."""
+    backups = _backup_publish_targets(root, staging, index_staged)
+    undo: list[tuple[str, Path, Path | None]] = []
+    committed = False
+    try:
+        if staged_licences:
+            _ensure_publish_dir(root / 'LICENSES', undo)
+            for lic in staged_licences[:MAX_ROWS]:
+                dest = root / 'LICENSES' / lic.name
+                os.replace(lic, dest)
+                undo.append(('unlink', dest, None))
+        for name in METADATA_FILES:
+            target = root / name
+            os.replace(staging / name, target)
+            undo.append(('restore', target, backups[target]))
+        if index_staged:
+            _ensure_publish_dir(root / 'skills', undo)
+            index_target = root / 'skills' / 'INDEX.tsv'
+            os.replace(staging / 'INDEX.tsv', index_target)
+            undo.append(('restore', index_target, backups[index_target]))
+        for staged_skill in staged_skills[:check_skills.MAX_SKILLS]:
+            _ensure_publish_dir(root / 'skills', undo)
+            dest = root / 'skills' / staged_skill.name
+            if dest.exists() or dest.is_symlink():
+                raise FileExistsError(f'{dest}: skill directory already exists')
+            os.replace(staged_skill, dest)
+            undo.append(('move', dest, staged_skill))
+        committed = True
+    finally:
+        if not committed:
+            _rollback_publish(undo)
 
 
 def publish(root, saved, rows, reuse, credits, adopted_map=None, group_map=None, runner=default_download_runner):
@@ -1269,22 +1368,53 @@ def run(candidates, groups, census, checkouts, root=Path('.'), *, apply=False,
         runner = default_download_runner
     root, checkouts = root.resolve(), checkouts.resolve()
     report_file = resolve_report_path(report, root)
-    selected, grouped, order, pins, group_rows, group_map, all_candidates = inputs(candidates, groups, census)
-    for name in ('skills', 'REUSE.toml', 'CREDITS.md'):
+    parsed = inputs(candidates, groups, census)
+    _check_output_symlinks(root, report_file)
+    opts = _RunOptions(
+        apply=apply, reader=reader, gates=GateOptions(gate=gate, hiss_gate=hiss_gate),
+        include_grouped=include_grouped, embedding=embedding, sources=sources, runner=runner,
+    )
+    with output_lock(root / '.adopt-skills') if apply else nullcontext():
+        rows = _evaluate_and_publish(root, checkouts, parsed, opts)
+    if report_file is not None:
+        report_file.parent.mkdir(parents=True, exist_ok=True)
+        report_file.write_text(report_text(rows), encoding='utf-8')
+    return rows, summary(rows, parsed[0])
+
+
+@dataclass(frozen=True)
+class _RunOptions:
+    """Execution callbacks and grouped-adoption settings for one run."""
+
+    apply: bool
+    reader: object
+    gates: GateOptions
+    include_grouped: bool
+    embedding: CopyEmbeddingInputs
+    sources: object
+    runner: object
+
+
+def _check_output_symlinks(root: Path, report_file: Path | None) -> None:
+    """Refuse symlinked root outputs or report targets before locking or writing."""
+    for name in ('skills', 'REUSE.toml', 'CREDITS.md', '.adopt-skills.lock'):
         if (root / name).is_symlink():
             raise ValueError(f'{name}: output symlink refused')
     if report_file is not None and report_file.is_symlink():
         raise ValueError('report output symlink refused')
 
-    copies_map = {}
-    if include_grouped:
-        copies_map = resolve_copies(group_rows, checkouts, root, pins, all_candidates, sources, embedding)
 
-    reuse, credits = initial_metadata(root)
-    occupied = {path.name for path in (root / 'skills').iterdir() if path.is_dir()} if (root / 'skills').exists() else set()
-    present = read_present_skills(root / 'skills')
-    rows = []
-    adopted_map = {}
+def _evaluate_and_publish(root: Path, checkouts: Path, parsed: tuple, opts: _RunOptions) -> list[dict]:
+    """Read current root state, stage selected skills, and publish when applying."""
+    selected, grouped, order, pins, group_rows, group_map, all_candidates = parsed
+    copies_map = (resolve_copies(group_rows, checkouts, root, pins, all_candidates, opts.sources, opts.embedding)
+                  if opts.include_grouped else {})
+    reuse_text, credits_text = initial_metadata(root)
+    skills_dir = root / 'skills'
+    occupied = {path.name for path in skills_dir.iterdir() if path.is_dir()} if skills_dir.exists() else set()
+    present = read_present_skills(skills_dir)
+    rows: list[dict] = []
+    adopted_map: dict[str, dict] = {}
     with tempfile.TemporaryDirectory(prefix='adopt-skills-') as tmp:
         saved = Path(tmp) / 'accepted'
         saved.mkdir()
@@ -1292,22 +1422,21 @@ def run(candidates, groups, census, checkouts, root=Path('.'), *, apply=False,
             with tempfile.TemporaryDirectory(prefix='adopt-gate-') as work:
                 staging = Path(work)
                 prepare_staging(root, staging)
-                result, skill, year = evaluate(row, grouped, order, pins, checkouts, root, staging,
-                                               occupied, apply, reader, gate=gate, hiss_gate=hiss_gate,
-                                               include_grouped=include_grouped, copies=copies_map,
-                                               present=present)
+                result, skill, year = evaluate(
+                    row, grouped, order, pins, checkouts, root, staging, occupied, opts.apply, opts.reader,
+                    gate=opts.gates.gate, hiss_gate=opts.gates.hiss_gate,
+                    include_grouped=opts.include_grouped, copies=copies_map, present=present,
+                )
                 rows.append(result)
                 if skill is not None:
-                    reuse, credits = add_metadata(reuse, credits, row, skill.name, year)
+                    reuse_text, credits_text = add_metadata(reuse_text, credits_text, row, skill.name, year)
                     occupied.add(skill.name)
                     shutil.move(str(skill), saved / skill.name)
                     adopted_map[skill.name] = row
-        if apply:
-            publish(root, saved, rows, reuse, credits, adopted_map=adopted_map, group_map=group_map, runner=runner)
-    if report_file is not None:
-        report_file.parent.mkdir(parents=True, exist_ok=True)
-        report_file.write_text(report_text(rows), encoding='utf-8')
-    return rows, summary(rows, selected)
+        if opts.apply:
+            publish(root, saved, rows, reuse_text, credits_text, adopted_map=adopted_map,
+                    group_map=group_map, runner=opts.runner)
+    return rows
 
 
 def _parse_args(argv=None):
