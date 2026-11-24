@@ -2269,6 +2269,48 @@ class AdoptionTests(unittest.TestCase):
                 self.invoke(apply=True, runner=fake_runner)
             self.assertEqual(snapshot(self.root), before)
 
+    def _moves_with_source(self, moves: list[dict], destination: str, source: str) -> list[dict]:
+        """Return moves copied with destination's source replaced, asserting destination exists."""
+        self.assertLessEqual(len(moves), 8)
+        updated = []
+        matched = 0
+        for entry in moves[:8]:
+            if entry['destination'] == destination:
+                matched += 1
+                updated.append({**entry, 'source': source})
+            else:
+                updated.append(dict(entry))
+        self.assertEqual(matched, 1, destination)
+        return updated
+
+    def test_journal_invalid_move_source_refused_without_modifying_root(self):
+        """Refuse journals whose skill or licence move source mismatches destination without modifying root."""
+        self._seed_existing_skill()
+        fake_runner, _ = self._two_mit0_candidates()
+        self._fork_kill_on_second_skill(fake_runner)
+        journal_file = self.root / adopt.JOURNAL_NAME
+        valid = json.loads(journal_file.read_text(encoding='utf-8'))
+        staging = valid['staging']
+        moves = valid['moves']
+        self.assertTrue((self.root / staging / 'skills/second').is_dir())
+        bad_payloads = [
+            {**valid, 'moves': self._moves_with_source(moves, 'skills/first', f'{staging}/skills/second')},
+            {**valid, 'moves': self._moves_with_source(moves, 'skills/first', f'{staging}/LICENSES/MIT-0.txt')},
+            {**valid, 'moves': self._moves_with_source(moves, 'LICENSES/MIT-0.txt', f'{staging}/LICENSES/other.txt')},
+            {**valid, 'moves': self._moves_with_source(moves, 'LICENSES/MIT-0.txt', f'{staging}/skills/first')},
+        ]
+        for payload in bad_payloads[:8]:
+            journal_file.write_text(json.dumps(payload), encoding='utf-8')
+            before = snapshot(self.root)
+            with self.assertRaisesRegex(ValueError, r'invalid move source'):
+                self.invoke(apply=True, runner=fake_runner)
+            self.assertEqual(snapshot(self.root), before)
+        journal_file.write_text(json.dumps(valid), encoding='utf-8')
+        rows, _ = self.invoke(apply=True, runner=fake_runner)
+        self.assertEqual([r['verdict'] for r in rows[:8]], ['adopted', 'adopted'])
+        self.assertEqual([p.name for p in list(self.root.iterdir())[:64] if p.name.startswith('.adopt-publish')], [])
+        self.assertEqual(check_skills.check(self.root), 0)
+
 
 class RewriteFencesTests(unittest.TestCase):
     def test_top_level_four_space_backticks_unchanged(self):
