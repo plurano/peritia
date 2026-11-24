@@ -526,8 +526,8 @@ class TrialIdentityTests(unittest.TestCase):
                 self.assertEqual(len(self.new_rows(before)), 12)
                 self.assertEqual(
                     stderr.getvalue().splitlines(),
-                    [f"12 legacy or unsupported trial records ignored "
-                     f"(expected record version 2 and input fingerprints): {self.trials}"],
+                    [(f"12 legacy or unsupported trial records ignored "
+                      f"(expected record version 2 and input fingerprints): {self.trials}")],
                 )
 
     def test_trial_history_over_cap_is_refused(self):
