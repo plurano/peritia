@@ -4,12 +4,13 @@
 """OpenAI-compatible HTTP API client for chat completions and embeddings."""
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import urllib.request
 from typing import Any
 
-from input_identity import validate_base_url
+from input_identity import provider_id, validate_base_url
 
 DEFAULT_CHAT_TEMPERATURE = 0.0
 DEFAULT_CHAT_SEED = 1
@@ -48,16 +49,24 @@ class LLMClient:
         self.api_key = api_key
 
     def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
-        """Performs a POST request with JSON payload to {base_url}{path}."""
-        url = f"{self.base_url}{path}"
+        """Decode a POST reply and keep transport diagnostics free of userinfo."""
         data = json.dumps(payload).encode("utf-8")
+        try:
+            raw = self._post_text(path, data)
+        except (OSError, ValueError, http.client.HTTPException):
+            raise OSError(f"LLM request failed for {provider_id(self.base_url)}{path}") from None
+        return json.loads(raw)
+
+    def _post_text(self, path: str, data: bytes) -> str:
+        """Send the JSON request and read the transport response."""
+        url = f"{self.base_url}{path}"
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         req = urllib.request.Request(url, data=data, headers=headers)
         with urllib.request.urlopen(req, timeout=self.timeout) as resp:  # noqa: S310
             raw = resp.read().decode("utf-8")
-        return json.loads(raw)
+        return raw
 
     def chat(
         self,

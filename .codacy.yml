@@ -42,6 +42,12 @@ engines:
       # argument list, by full path from shutil.which, on test input (2 findings).
       # Verdict: FACT peritia-decided-codacy-trial-verdict-27-test-subprocess.
       - "tools/test_adopt_skills.py"
+      # Semgrep_python_crypto_rule-hash-sha1 and insecure-hash-algorithm-sha1: SHA-1 is
+      # the object ID format in SHA-1 Git repositories. This compatibility checksum uses
+      # usedforsecurity=False. test_git_blob_id_matches_git_at_chunk_boundaries in
+      # tools/test_overlap.py pins known Git blob IDs (2 findings on pull request 45).
+      # Verdict: FACT peritia-decided-codacy-verdict-45-git-blob-sha1.
+      - "tools/git_blob.py"
   bandit:
     exclude_paths:
       # B603 subprocess without shell: same calls as the opengrep entry above (2 findings).

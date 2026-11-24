@@ -6,6 +6,7 @@ import hashlib
 import io
 import os
 import tempfile
+import traceback
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
@@ -54,15 +55,29 @@ class InputIdentityTests(unittest.TestCase):
         self.assertEqual(provider_id("http://[::1]:8000/"), "http://[::1]:8000")
 
     def test_invalid_provider_urls_are_redacted(self):
-        """Refuse queries, fragments and scheme-less endpoints without leaking userinfo."""
-        urls = (("https:", "?x=1"), (" https:", "?x=1"), ("https:", "#x"), ("", ""), ("https:", "?"))
-        for prefix, suffix in urls:
-            with self.subTest(prefix=prefix, suffix=suffix):
-                url = f"{prefix}//fixture-user:fixture-pass@example.test/v1{suffix}"
-                with self.assertRaisesRegex(ValueError, "example.test/v1") as error:
+        """Keep all URL material out of validation failures and their tracebacks."""
+        for authority, suffix in (
+            ("example.test:fixture-port", ""), ("[fixture-authority]", ""),
+            ("example.test", "?fixture-query"), ("example.test", "#fixture-fragment"),
+            ("example.test", "?"), ("example.test", "#"),
+        ):
+            with self.subTest(authority=authority, suffix=suffix):
+                url = f"https://fixture-user:fixture-pass@{authority}/fixture-path{suffix}"
+                with self.assertRaisesRegex(ValueError, "--base-url") as error:
                     provider_id(url)
-                self.assertNotIn("fixture-user", str(error.exception))
-                self.assertNotIn("fixture-pass", str(error.exception))
+                rendered = "".join(traceback.format_exception(error.exception))
+                self.assertNotIn("fixture-", rendered)
+                self.assertNotIn("example.test", rendered)
+        with self.assertRaisesRegex(ValueError, "--base-url"):
+            provider_id("//example.test/v1")
+
+    def test_endpoint_errors_identify_the_supplied_setting(self):
+        """Name an inherited endpoint variable or the explicit embedding option."""
+        with (patch.dict(os.environ, {"PERITIA_LLM_BASE_URL": "invalid"}),
+              self.assertRaisesRegex(ValueError, "for PERITIA_LLM_BASE_URL$")):
+            input_identity.resolve_base_urls(None)
+        with self.assertRaisesRegex(ValueError, "for --embed-base-url$"):
+            input_identity.resolve_base_urls("https://example.test/v1", "")
 
     def test_torn_tsv_tail_is_separated(self):
         """Preserve a partial row and start the next record on a new line."""

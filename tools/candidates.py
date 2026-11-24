@@ -24,8 +24,8 @@ _TOOLS_DIR = Path(__file__).resolve().parent
 if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
-from check_skills import front_matter_or_empty  # noqa: E402
-from classify import DOMAINS, FUNCTIONS, latest_classifications  # noqa: E402
+from check_skills import front_matter_or_empty
+from classify import DOMAINS, FUNCTIONS, latest_classifications
 
 CORE_FUNCTIONS = frozenset({
     "coding",

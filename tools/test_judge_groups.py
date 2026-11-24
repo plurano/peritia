@@ -164,7 +164,7 @@ class CopyCollapseTests(unittest.TestCase):
         self.ranks = {s.repository: s.rank for s in judge_groups.load_sources(judge_groups.DEFAULT_SOURCES)}
 
     def collapse(self, cosine=0.99, metadata=None, ranks=None, members=None):
-        embeddings = {"upstream-blob": [1, 0], "copy-blob": [cosine, math.sqrt(1 - cosine ** 2)]}
+        embeddings = {self.original: [1, 0], self.copy: [cosine, math.sqrt(1 - cosine ** 2)]}
         return judge_groups.collapse_copies(members or [self.copy, self.original], self.items,
                                             metadata or {}, embeddings, ranks or self.ranks)
 
@@ -362,12 +362,13 @@ class EndToEndAndResumeTests(unittest.TestCase):
             self.assertEqual(args.embed_base_url, "https://embed.test/v1")
 
     def test_cli_reports_malformed_cached_vector(self):
-        """Return a cache path and blob for a malformed vector without a traceback."""
+        """Return the cache path and input hash for a malformed vector."""
         with tempfile.TemporaryDirectory() as folder:
             paths, _, cache = setup_copy_env(Path(folder))
             groups, tasks, candidates, verdicts, trials, checkouts, skills = paths
             data = json.loads(cache.read_text())
-            next(iter(data["namespaces"].values()))["vectors"]["original"]["vector"] = "damaged"
+            key = input_identity.text_sha256("pdf: original")
+            next(iter(data["namespaces"].values()))["vectors"][key]["vector"] = "damaged"
             cache.write_text(json.dumps(data))
             args = ["run", "--groups", str(groups), "--eval-tasks", str(tasks), "--candidates", str(candidates),
                     "--checkouts", str(checkouts), "--skills-dir", str(skills), "--out", str(verdicts),
@@ -377,7 +378,7 @@ class EndToEndAndResumeTests(unittest.TestCase):
             with redirect_stderr(stderr):
                 self.assertEqual(judge_groups.main(args), 1)
             self.assertIn(str(cache), stderr.getvalue())
-            self.assertIn("original", stderr.getvalue())
+            self.assertIn(key, stderr.getvalue())
             self.assertNotIn("Traceback", stderr.getvalue())
 
     def test_other_embedding_model_does_not_infer_copy(self):
@@ -450,6 +451,24 @@ class TrialIdentityTests(unittest.TestCase):
         data["classes"]["coding"][0][field] = value
         self.tasks.write_text(json.dumps(data), encoding="utf-8")
 
+    def test_duplicate_task_id_is_refused_before_running_trials(self):
+        """Reject two trial inputs with the same task ID and different prompts."""
+        self.set_task_field("id", "code-1")
+        with self.assertRaisesRegex(ValueError, r"duplicate trial task ID 'code-1'"):
+            judge_groups.run(**self.options)
+        self.assert_calls(0, 0)
+        self.assertFalse(self.trials.exists())
+
+    def test_duplicate_group_member_is_refused_before_running_trials(self):
+        """Reject repeated group-member inputs within or across rows."""
+        groups = self.options["groups_tsv"]
+        for rows in ("1\tcand-1,cand-1\n", "1\tcand-1\n1\tcand-1\n"):
+            with self.subTest(rows=rows):
+                groups.write_text(f"group_id\tmembers\n{rows}", encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, r"duplicate trial group/member ID \('1', 'cand-1'\)"):
+                    judge_groups.run(**self.options)
+                self.assert_calls(0, 0)
+                self.assertFalse(self.trials.exists())
     def test_identical_answers_still_record_each_slot(self):
         """Persist six logical slots per seed and reuse inference across them."""
         (self.checkouts / "cand-2").write_text("cand-1")

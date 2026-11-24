@@ -32,9 +32,23 @@ from candidates import AGGREGATOR_UPSTREAM_KEYS, parse_github_repo
 from census import load_sources
 from check_skills import front_matter_or_empty
 from classify import FUNCTIONS, latest_classifications
-from input_identity import append_separator, bounded_history, fingerprint, provider_id, resolve_base_urls, text_sha256
+from input_identity import (
+    append_separator,
+    bounded_history,
+    fingerprint,
+    provider_id,
+    resolve_base_urls,
+    text_sha256,
+)
 from llm_client import LLMClient, structured_request_parameters
-from overlap import Item, cosine_similarity, load_candidates, load_embeddings, load_existing_skills, normalize_name
+from overlap import (
+    Item,
+    cosine_similarity,
+    load_candidates,
+    load_embeddings,
+    load_existing_skills,
+    normalize_name,
+)
 
 DEFAULT_MODEL = os.environ.get("PERITIA_LLM_MODEL")
 DEFAULT_JUDGE_MODEL = os.environ.get("PERITIA_LLM_JUDGE_MODEL")
@@ -114,7 +128,7 @@ def _copy_original(
     name_a, name_b = normalize_name(items[a].skill_name), normalize_name(items[b].skill_name)
     if not name_a or name_a != name_b:
         return None
-    va, vb = embeddings.get(items[a].blob_id), embeddings.get(items[b].blob_id)
+    va, vb = embeddings.get(a), embeddings.get(b)
     if not va or not vb or len(va) != len(vb) or not cosine_similarity(va, vb) >= 0.97:
         return None
     if any(sources[m] not in ranks for m in (a, b)):
@@ -168,14 +182,19 @@ def load_eval_tasks(eval_tasks_path: Path) -> dict[str, list[Task]]:
     result: dict[str, list[Task]] = {}
     for cls_name, tasks_list in classes.items():
         parsed_tasks = []
+        task_ids = set()
         for t in tasks_list:
+            task_id = t["id"]
+            if task_id in task_ids:
+                raise ValueError(f"{cls_name}: duplicate trial task ID {task_id!r}")
+            task_ids.add(task_id)
             for pat in t.get("must_match", []):
                 re.compile(pat, GRADER_FLAGS)
             for pat in t.get("must_not_match", []):
                 re.compile(pat, GRADER_FLAGS)
             parsed_tasks.append(
                 Task(
-                    id=t["id"],
+                    id=task_id,
                     prompt=t["prompt"],
                     must_match=tuple(t.get("must_match", [])),
                     must_not_match=tuple(t.get("must_not_match", [])),
@@ -277,15 +296,22 @@ def grade_answer(
 
 
 def load_groups(groups_tsv: Path) -> list[dict[str, Any]]:
-    """Loads groups from groups.tsv."""
+    """Load groups and reject duplicate group/member trial input IDs."""
     groups: list[dict[str, Any]] = []
+    seen_members: set[tuple[str, str]] = set()
     if not groups_tsv.exists():
         return groups
     with groups_tsv.open(newline="", encoding="utf-8") as handle:
         for row in csv.DictReader(handle, delimiter="\t"):
+            group_id = row.get("group_id", "")
             members = [m.strip() for m in row.get("members", "").split(",") if m.strip()]
+            for member in members:
+                key = group_id, member
+                if key in seen_members:
+                    raise ValueError(f"duplicate trial group/member ID {key!r}")
+                seen_members.add(key)
             groups.append({
-                "group_id": row.get("group_id", ""),
+                "group_id": group_id,
                 "members": members,
                 "edges": row.get("edges", ""),
                 "has_existing": row.get("has_existing", "false") == "true",

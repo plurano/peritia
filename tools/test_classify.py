@@ -162,7 +162,7 @@ class RunTests(unittest.TestCase):
 
     def test_run_rejects_query_in_provider_before_inference(self):
         """Refuse a provider URL whose query could differ from the identity."""
-        with self.assertRaisesRegex(ValueError, r"models\.invalid/v1"):
+        with self.assertRaisesRegex(ValueError, "invalid base URL for --base-url"):
             self.classify(provider="https://models.invalid/v1?x=1")
         self.assertFalse(self.out.exists())
 
@@ -211,6 +211,12 @@ class RunTests(unittest.TestCase):
         """Reclassify every item after a schema boundary changes."""
         self.classify()
         with patch.object(classify, "MAX_LABELS", 4):
+            self.assertEqual(self.classify(), ["x", "y"])
+
+    def test_changed_schema_name_asks_for_each_item(self):
+        """Reclassify each item when the schema name alone changes."""
+        self.classify()
+        with patch.object(classify, "LABEL_SCHEMA_NAME", "renamed"):
             self.assertEqual(self.classify(), ["x", "y"])
 
     def test_changed_taxonomy_asks_for_each_item(self):

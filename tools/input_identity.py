@@ -13,7 +13,7 @@ from collections.abc import Iterable, Iterator
 from itertools import islice
 from pathlib import Path
 from typing import Any, BinaryIO, TextIO, TypeVar
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 FINGERPRINT_VERSION = 1
 MAX_LEGACY_TSV_ROWS = 500_000
@@ -35,30 +35,36 @@ def fingerprint(kind: str, fields: dict) -> str:
     return "sha256:" + text_sha256(canonical_json({"kind": kind, "version": FINGERPRINT_VERSION, **fields}))
 
 
-def validate_base_url(base_url: str) -> str:
-    """Return a usable transport URL or report its endpoint without userinfo."""
-    endpoint = base_url.partition("?")[0].partition("#")[0]
-    scheme, separator, address = endpoint.partition("//")
-    if not separator:
-        scheme, address = "", endpoint
-    authority, slash, path = address.partition("/")
-    display = scheme + separator + authority.rsplit("@", 1)[-1] + slash + path
+def _split_base_url(base_url: str, option: str) -> tuple[SplitResult, str, int | None]:
+    """Parse the endpoint and keep any parser diagnostics private."""
+    message = f"invalid base URL for {option}"
     try:
         url = urlsplit(base_url)
-        host, _port = url.hostname, url.port
-    except ValueError as error:
-        raise ValueError(f"invalid base URL {display!r}") from error
+        host, port = url.hostname, url.port
+    except ValueError:
+        raise ValueError(message) from None
     if not url.scheme or not host or "?" in base_url or "#" in base_url:
-        raise ValueError(f"invalid base URL {display!r}: expected a scheme and host with no query or fragment")
+        raise ValueError(message)
+    return url, host, port
+
+
+def validate_base_url(base_url: str, option: str = "--base-url (PERITIA_LLM_BASE_URL)") -> str:
+    """Return a usable transport URL or identify the setting that supplied it."""
+    _split_base_url(base_url, option)
     return base_url
 
 
-def resolve_base_urls(base_url: str | None, embed_base_url: str | None = None) -> tuple[str, str]:
+def resolve_base_urls(
+    base_url: str | None, embed_base_url: str | None = None, *, inherit: bool = True,
+) -> tuple[str, str]:
     """Resolve and validate chat and embedding endpoints using the same CLI and API defaults."""
-    chat = base_url or os.environ.get("PERITIA_LLM_BASE_URL", "")
-    if chat:
-        validate_base_url(chat)
-    embed = validate_base_url(embed_base_url) if embed_base_url else chat
+    if base_url:
+        chat = validate_base_url(base_url, "--base-url")
+    else:
+        chat = os.environ.get("PERITIA_LLM_BASE_URL", "") if inherit else ""
+        if chat:
+            validate_base_url(chat, "PERITIA_LLM_BASE_URL")
+    embed = chat if embed_base_url is None else validate_base_url(embed_base_url, "--embed-base-url")
     return chat, embed
 
 
@@ -66,12 +72,11 @@ def provider_id(base_url: str | None) -> str:
     """Keep only the endpoint scheme, host, port and path."""
     if not base_url:
         return ""
-    url = urlsplit(validate_base_url(base_url))
-    host = url.hostname
+    url, host, port = _split_base_url(base_url, "--base-url (PERITIA_LLM_BASE_URL)")
     if ":" in host:
         host = f"[{host}]"
-    if url.port is not None:
-        host = f"{host}:{url.port}"
+    if port is not None:
+        host = f"{host}:{port}"
     return urlunsplit((url.scheme, host, url.path.rstrip("/"), "", ""))
 
 

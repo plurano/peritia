@@ -145,14 +145,15 @@ pairs alongside candidate and group totals. [Overlap tests](tools/test_overlap.p
 
 The optional embedding cache is JSON with `version: 2` and `namespaces`. Each
 namespace is keyed by model, endpoint, preprocessing, and dimensions. Its
-`vectors` map stores the embedding and input text hash for each blob. Legacy
-vectors are preserved under `legacy_unbound` when saved and are ineligible for
-reuse. Select the model with `--embed-model` or `PERITIA_LLM_EMBED_MODEL` and
+`vectors` map keys each embedding by the hash of the exact input text. Existing
+version 2 entries can be reused by their stored text hash. Legacy vectors with
+no input hash are preserved under `legacy_unbound` when saved. Select the model
+with `--embed-model` or `PERITIA_LLM_EMBED_MODEL` and
 the embedding endpoint for overlap with `--base-url` or `PERITIA_LLM_BASE_URL`.
 Base URLs require a scheme and host and reject queries and fragments.
 Use `--embed-dims` to assert vector length or select between cached lengths.
 Invalid namespace keys or dimensions are skipped with a warning. Malformed
-vectors in a selected namespace fail with the cache path and blob ID.
+vectors in a selected namespace fail with the cache path and entry key.
 [Embedding cache tests](tools/test_overlap.py) cover reuse and migration.
 
 `python3 -B tools/judge_groups.py run --groups groups.tsv --candidates candidates.tsv
@@ -195,7 +196,8 @@ under `legacy_unbound`. Classification and overlap archive legacy TSVs as
 to produce the current pair snapshot. Trial JSONL appends v2 records and
 preserves older lines. In Python, use `load_embeddings` in place of
 `load_cache` and `latest_classifications` in place of `done_blobs`.
-`get_embeddings` takes a cache path and embedding identity, and
+`get_embeddings` and `load_embeddings` return vectors keyed by item ID.
+`get_embeddings` takes a cache path and embedding identity.
 `resolve_copies` takes a `CopyEmbeddingInputs` object for cache identity.
 `load_done_trials` returns a `TrialHistory` with separate reuse and slot indexes.
 
@@ -205,7 +207,9 @@ preserves older lines. In Python, use `load_embeddings` in place of
 `--embed-model` or `PERITIA_LLM_EMBED_MODEL`. Use `--embed-base-url` and
 `--embed-dims` as in group judging. If the namespace is missing or incompatible,
 populate it with `python3 tools/overlap.py run --cache <path> --embed-model <name>`
-using the embedding endpoint and dimensions. Without `--include-grouped`,
+using the embedding endpoint and dimensions. If a matching namespace lacks
+current vectors, adoption reports each affected group and defers members whose
+copy decisions lack explicit provenance. Without `--include-grouped`,
 grouped candidates wait for the group judge and adoption needs no cache or
 embedding model. Grouped adoption reads `tools/census-sources.json` ranks and
 refuses copies as `copy-of:<original candidate>`. Surviving members run the

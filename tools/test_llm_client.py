@@ -9,7 +9,9 @@ import json
 import os
 import sys
 import threading
+import traceback
 import unittest
+import urllib.error
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -156,6 +158,15 @@ class LLMTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             self.client.embed("test-model", ["text1", "text2"])
+
+    def test_transport_failure_traceback_uses_safe_endpoint(self) -> None:
+        """Sanitize both the displayed request endpoint and the underlying error."""
+        base = "https://fixture-user:fixture-pass@example.test:8443/v1"
+        failure = urllib.error.URLError(f"{base}?fixture-query#fixture-fragment")
+        with (patch("llm_client.urllib.request.urlopen", side_effect=failure),
+              self.assertRaisesRegex(OSError, r"https://example\.test:8443/v1/embeddings$") as error):
+            LLMClient(base).embed("model", ["sample"])
+        self.assertNotIn("fixture-", "".join(traceback.format_exception(error.exception)))
 
     def test_boundary_empty_texts_to_embed(self) -> None:
         """Empty texts list to embed sends empty input and returns empty list."""

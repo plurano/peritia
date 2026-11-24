@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import hashlib
 import io
 import json
 import math
@@ -22,13 +21,15 @@ import sys
 import tempfile
 import urllib.error
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, BinaryIO, Callable
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from check_skills import front_matter_or_empty
+from git_blob import _hash_git_blob, git_blob_id
 from input_identity import (
     bounded_history,
     fingerprint,
@@ -55,7 +56,6 @@ EMBED_PREPROCESSING = fingerprint("embed-prep", {
 })
 ATTEMPTS = 2
 PAIR_SCHEMA_NAME = "skill_overlap"
-GIT_BLOB_CHUNK = 65_536
 DEFAULT_K = 5
 DEFAULT_EMBED_MODEL = os.environ.get("PERITIA_LLM_EMBED_MODEL")
 DEFAULT_JUDGE_MODEL = os.environ.get("PERITIA_LLM_JUDGE_MODEL")
@@ -73,23 +73,6 @@ JUDGE_SYSTEM_PROMPT = (
     "Answer in JSON with 'same_use' (boolean: true if they serve the same use, false otherwise) "
     "and 'reason' (brief explanation, at most 200 characters)."
 )
-
-
-def git_blob_id(data: bytes) -> str:
-    """Compute the Git blob object ID for bytes in memory."""
-    return _hash_git_blob(io.BytesIO(data), len(data))
-
-
-def _hash_git_blob(handle: BinaryIO, size: int) -> str:
-    """Hash a bounded byte stream. Git object IDs in SHA-1 repositories use SHA-1 by format."""
-    digest = hashlib.sha1(f"blob {size}\0".encode(), usedforsecurity=False)
-    for offset in range(0, size, GIT_BLOB_CHUNK):
-        expected = min(GIT_BLOB_CHUNK, size - offset)
-        chunk = handle.read(expected)
-        if len(chunk) != expected:
-            raise OSError("Git blob source was truncated while reading")
-        digest.update(chunk)
-    return digest.hexdigest()
 
 
 def normalize_name(name: str) -> str:
@@ -208,7 +191,7 @@ def normalize_vector(vec: list[float]) -> list[float]:
 
 def normalize_embeddings(embeddings: dict[str, list[float]]) -> dict[str, list[float]]:
     """Returns a new mapping with every embedding vector normalised to unit length."""
-    return {blob_id: normalize_vector(vec) for blob_id, vec in embeddings.items()}
+    return {item_id: normalize_vector(vec) for item_id, vec in embeddings.items()}
 
 
 def dot_product(a: list[float], b: list[float]) -> float:
@@ -324,16 +307,18 @@ class MissingEmbeddingNamespace(ValueError):
     """Signal that a compatible embedding space needs to be populated."""
 
 
-def _embedding_texts(items: list[Item]) -> dict[str, str]:
-    """Index the exact input text for each blob in the embedding request."""
+def _embedding_texts(items: list[Item]) -> tuple[dict[str, str], dict[str, str]]:
+    """Deduplicate exact model inputs and identify the input used by each item."""
     texts: dict[str, str] = {}
+    item_keys: dict[str, str] = {}
     for item in items:
         if not item.blob_id:
             continue
         text = make_embed_text(item)
-        if texts.setdefault(item.blob_id, text) != text:
-            raise ValueError(f"embedding blob {item.blob_id}: conflicting input texts")
-    return texts
+        key = text_sha256(text)
+        texts[key] = text
+        item_keys[item.item_id] = key
+    return texts, item_keys
 
 
 def _check_vector(model: str, dims: int | None, vector: list[float]) -> int:
@@ -353,14 +338,17 @@ def _matching_embeddings(
 ) -> dict[str, list[float]]:
     """Validate selected vectors and keep entries for exact current input texts."""
     matched = {}
-    for blob, entry in entries.items():
+    for key, entry in entries.items():
         try:
             vector = entry["vector"]
             _check_vector(model, dims, vector)
         except (KeyError, TypeError, ValueError, OverflowError) as error:
-            raise ValueError(f"{path}: invalid embedding vector for blob {blob}: {error}") from error
-        if blob in texts and entry.get("text_sha256") == text_sha256(texts[blob]):
-            matched[blob] = vector
+            raise ValueError(f"{path}: invalid embedding vector for input {key}: {error}") from error
+        text_hash = entry.get("text_sha256")
+        # Version 2 caches also contain entries keyed by the original blob ID.
+        if isinstance(text_hash, str) and text_hash in texts:
+            if key == text_hash or text_hash not in matched:
+                matched[text_hash] = vector
     return matched
 
 
@@ -372,31 +360,39 @@ def _embed_missing(
     additions = {}
     for start in range(0, len(missing), MAX_BATCH_SIZE):
         batch = missing[start : start + MAX_BATCH_SIZE]
-        vectors = embed_fn([texts[blob] for blob in batch])
+        vectors = embed_fn([texts[key] for key in batch])
         if len(vectors) != len(batch):
             raise ValueError(f"embedding model {model}: expected {len(batch)} vectors, got {len(vectors)}")
-        for blob, vector in zip(batch, vectors):
+        for key, vector in zip(batch, vectors, strict=True):
             try:
                 dims = _check_vector(model, dims, vector)
             except (TypeError, ValueError, OverflowError) as error:
-                raise ValueError(f"invalid embedding response for blob {blob}: {error}") from error
-            additions[blob] = vector
+                raise ValueError(f"invalid embedding response for input {key}: {error}") from error
+            additions[key] = vector
     return dims, additions
 
 
 def _save_embedding_additions(
     path: Path, cache: dict, migrated: bool, space: EmbeddingSpace, dims: int | None,
-    entries: dict, texts: dict[str, str], additions: dict[str, list[float]],
+    entries: dict, additions: dict[str, list[float]],
 ) -> None:
     """Save new entries in their namespace and retain any unbound history."""
     if additions:
         updated = dict(entries)
-        updated.update({blob: {"text_sha256": text_sha256(texts[blob]), "vector": vector}
-                        for blob, vector in additions.items()})
+        updated.update({key: {"text_sha256": key, "vector": vector} for key, vector in additions.items()})
         cache["namespaces"][space.key(dims)] = {**space.fields(), "dims": dims, "vectors": updated}
     save_cache(path, cache)
     if migrated:
         print(f"{path}: moved legacy embedding vectors to legacy_unbound", file=sys.stderr)
+
+
+def _report_missing_namespace(path: Path | None, model: str, migrated: bool, required: bool) -> None:
+    """Tell a cache reader how to distinguish an absent namespace from a partial hit."""
+    legacy_note = " (legacy vectors are unbound)" if migrated else ""
+    message = f"{path}: no matching embedding namespace for model {model}{legacy_note}"
+    if required:
+        raise MissingEmbeddingNamespace(message)
+    print(message, file=sys.stderr)
 
 
 def load_embeddings(
@@ -405,7 +401,7 @@ def load_embeddings(
     embed_fn: Callable[[list[str]], list[list[float]]] | None = None,
     require_namespace: bool = False,
 ) -> dict[str, list[float]]:
-    """Read embeddings for current inputs and optionally generate missing vectors."""
+    """Return vectors by item ID and optionally embed missing exact inputs."""
     space = EmbeddingSpace(model, provider_id(provider), EMBED_PREPROCESSING)
     if cache_path is None and embed_fn is None and not require_namespace:
         return {}
@@ -416,23 +412,18 @@ def load_embeddings(
     dims = space.resolve(namespaces, embed_dims)
     entries = space.vectors(namespaces, dims)
     if entries is None and embed_fn is None:
-        legacy_note = " (legacy vectors are unbound)" if migrated else ""
-        message = f"{cache_path}: no matching embedding namespace for model {model}{legacy_note}"
-        if require_namespace:
-            raise MissingEmbeddingNamespace(message)
-        print(message, file=sys.stderr)
+        _report_missing_namespace(cache_path, model, migrated, require_namespace)
         return {}
 
-    texts = _embedding_texts(items)
+    texts, item_keys = _embedding_texts(items)
     result = _matching_embeddings(texts, entries or {}, model, dims, cache_path)
-    if embed_fn is None:
-        return result
-    missing = [blob for blob in texts if blob not in result]
-    dims, additions = _embed_missing(texts, missing, dims, model, embed_fn)
-    if cache_path is not None and (additions or migrated):
-        _save_embedding_additions(cache_path, cache, migrated, space, dims, entries or {}, texts, additions)
-    result.update(additions)
-    return result
+    if embed_fn is not None:
+        missing = [key for key in texts if key not in result]
+        dims, additions = _embed_missing(texts, missing, dims, model, embed_fn)
+        if cache_path is not None and (additions or migrated):
+            _save_embedding_additions(cache_path, cache, migrated, space, dims, entries or {}, additions)
+        result.update(additions)
+    return {item_id: result[key] for item_id, key in item_keys.items() if key in result}
 
 
 def get_embeddings(
@@ -460,16 +451,18 @@ def find_candidate_pairs(
     pairs_map: dict[tuple[str, str], CandidatePair] = {}
 
     for cand in candidates:
-        cand_emb = norm_embeddings.get(cand.blob_id)
+        cand_emb = norm_embeddings.get(cand.item_id)
         if cand_emb is None:
             continue
 
+        cand_blob = cand.content_blob_id or cand.blob_id
         eligible: list[tuple[float, Item]] = []
         for target in all_items:
-            # Never pair an item with itself or two rows of the same blob
-            if target.item_id == cand.item_id or target.blob_id == cand.blob_id:
+            # Reconsider a census duplicate if the current files have diverged.
+            same_blob = target.blob_id == cand.blob_id and (target.content_blob_id or target.blob_id) == cand_blob
+            if target.item_id == cand.item_id or same_blob:
                 continue
-            target_emb = norm_embeddings.get(target.blob_id)
+            target_emb = norm_embeddings.get(target.item_id)
             if target_emb is None:
                 continue
             cos = min(1.0, max(-1.0, dot_product(cand_emb, target_emb)))

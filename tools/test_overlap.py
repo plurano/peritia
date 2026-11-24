@@ -7,15 +7,20 @@ import io
 import json
 import math
 import os
-import subprocess
 import tempfile
 import unittest
+import urllib.error
 from contextlib import redirect_stderr
+from dataclasses import replace
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import adopt_skills
+import judge_groups
+import llm_client
 import overlap
+from git_blob import git_blob_id
+from input_identity import text_sha256
 
 CANDIDATES_HEADER = [
     "blob_id", "source", "path", "skill_name", "functions", "domains",
@@ -38,6 +43,11 @@ def write_skill_file(folder: Path, rel_path: str, text: str) -> Path:
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(text, encoding="utf-8")
     return target
+
+
+def by_item_id(items, vectors):
+    """Label ranking fixture vectors with their item IDs."""
+    return {item.item_id: vectors[item.blob_id] for item in items if item.blob_id in vectors}
 
 
 class OverlapRankingTests(unittest.TestCase):
@@ -71,7 +81,7 @@ class OverlapRankingTests(unittest.TestCase):
             "b_same": [0.10, 0.9, 0.0],
         }
 
-        pairs = overlap.find_candidate_pairs([cand], all_items, embeddings, k=5)
+        pairs = overlap.find_candidate_pairs([cand], all_items, by_item_id(all_items, embeddings), k=5)
         paired_ids = {p.b if p.a == cand.item_id else p.a for p in pairs}
 
         # Nearest 5 and same-name item are included
@@ -106,7 +116,7 @@ class OverlapRankingTests(unittest.TestCase):
         }
 
         all_items = [cand1, cand2, other1, other2]
-        pairs = overlap.find_candidate_pairs([cand1], all_items, embeddings, k=5)
+        pairs = overlap.find_candidate_pairs([cand1], all_items, by_item_id(all_items, embeddings), k=5)
         pair = next((p for p in pairs if {p.a, p.b} == {cand1.item_id, cand2.item_id}), None)
         self.assertIsNotNone(pair)
         self.assertAlmostEqual(pair.cosine, 0.75, places=2)
@@ -134,7 +144,7 @@ class OverlapRankingTests(unittest.TestCase):
             "blob_other": [0.99, 0.01],
         }
 
-        pairs = overlap.find_candidate_pairs([cand], all_items, embeddings, k=5)
+        pairs = overlap.find_candidate_pairs([cand], all_items, by_item_id(all_items, embeddings), k=5)
         for p in pairs:
             self.assertNotEqual(p.a, p.b)
             self.assertNotEqual(p.item_a.blob_id, p.item_b.blob_id)
@@ -150,7 +160,7 @@ class OverlapRankingTests(unittest.TestCase):
         all_items = [cand1, cand2]
         embeddings = {"b1": [1.0, 0.0], "b2": [0.9, 0.1]}
 
-        pairs = overlap.find_candidate_pairs([cand1, cand2], all_items, embeddings, k=5)
+        pairs = overlap.find_candidate_pairs([cand1, cand2], all_items, by_item_id(all_items, embeddings), k=5)
         self.assertEqual(len(pairs), 1)
 
         calls = []
@@ -212,7 +222,7 @@ class OverlapRankingTests(unittest.TestCase):
             old_ranked.append((c, t.item_id))
         old_ranked.sort(key=lambda x: (-x[0], x[1]))
 
-        pairs = overlap.find_candidate_pairs([cand], all_items, fixed_vectors, k=5)
+        pairs = overlap.find_candidate_pairs([cand], all_items, by_item_id(all_items, fixed_vectors), k=5)
         self.assertEqual(len(pairs), len(targets))
         pairs_by_rank = sorted(pairs, key=lambda p: p.rank)
         for i, pair in enumerate(pairs_by_rank):
@@ -507,6 +517,13 @@ class OverlapResumeTests(unittest.TestCase):
                     self.assertEqual(self.run_overlap(same_use=False), (3, 0))
                 self.assertEqual(len(self.judge_calls), 3)
 
+    def test_changed_pair_seed_rejudges_every_pair(self):
+        """Rejudge pairs when the seed alone changes."""
+        self.assertEqual(self.run_overlap(), (3, 1))
+        with patch.object(llm_client, "DEFAULT_CHAT_SEED", 2):
+            self.assertEqual(self.run_overlap(), (3, 1))
+        self.assertEqual(len(self.judge_calls), 3)
+
     def test_changed_skill_rejudges_only_its_pairs(self):
         """Rejudge two prompts after changing one description under the same ID."""
         self.assertEqual(self.run_overlap(), (3, 1))
@@ -591,7 +608,7 @@ class OverlapEmbeddingIdentityTests(unittest.TestCase):
         self.embed_calls.clear()
         res = overlap.get_embeddings([self.item], self.embed, self.cache, model="embed")
         self.assertEqual(self.embed_calls, [])
-        self.assertEqual(res, {"b1": [0.1, 0.2, 0.3]})
+        self.assertEqual(res, {self.item.item_id: [0.1, 0.2, 0.3]})
 
     def test_changed_embed_model_keeps_both_namespaces(self):
         """Treat model names as independent cache identities and retain the original vectors."""
@@ -614,14 +631,59 @@ class OverlapEmbeddingIdentityTests(unittest.TestCase):
         self.assertEqual(len(self.load_cache_json()["namespaces"]), 2)
 
     def test_changed_embed_text_under_same_blob_misses(self):
-        """Replace the cached vector entry when its description changes under the same blob."""
+        """Cache new text independently and retain the old input's vector."""
         overlap.get_embeddings([self.item], self.embed, self.cache, model="embed")
         self.embed_calls.clear()
-        revised = overlap.Item(self.item.item_id, self.item.blob_id, self.item.skill_name, "revised")
+        revised = replace(self.item, description="revised")
         overlap.get_embeddings([revised], self.embed, self.cache, model="embed")
         self.assertEqual(self.embed_calls, ["name1: revised"])
-        self.assertEqual(overlap.load_embeddings(self.cache, [self.item], "embed", ""), {})
-        self.assertEqual(overlap.load_embeddings(self.cache, [revised], "embed", ""), {"b1": [0.1, 0.2, 0.3]})
+        self.assertEqual(overlap.load_embeddings(self.cache, [self.item], "embed", ""),
+                         {self.item.item_id: [0.1, 0.2, 0.3]})
+        keys = next(iter(self.load_cache_json()["namespaces"].values()))["vectors"]
+        self.assertEqual(set(keys), {text_sha256("name1: revised"), text_sha256("name1: desc1")})
+
+    def test_same_census_blob_uses_both_current_embeddings(self):
+        """Retain the untouched vector and separate pair and copy evidence after an edit."""
+        checkouts = self.cache.parent / "checkouts"
+        a, b = "owner/a", "owner/b"
+        candidates = write_candidates(self.cache.parent, [
+            {"source": source, "path": "SKILL.md", "blob_id": "shared", "verdict": "candidate"}
+            for source in (a, b)
+        ])
+        for source in (a, b):
+            write_skill_file(checkouts, f"{source.replace('/', '__')}/SKILL.md",
+                             "---\nname: review\ndescription: unchanged\n---\n")
+        items = overlap.load_candidates(candidates, checkouts)
+        def embed(texts):
+            """Return orthogonal vectors for the two same-name inputs."""
+            self.embed_calls.extend(texts)
+            return [[1.0, 0.0] if text.endswith("unchanged") else [0.0, 1.0] for text in texts]
+
+        overlap.get_embeddings(items, embed, self.cache, model="embed")
+        self.assertEqual(self.embed_calls, ["review: unchanged"])
+        write_skill_file(checkouts, "owner__b/SKILL.md", "---\nname: review\ndescription: edited\n---\n")
+
+        self.embed_calls.clear()
+        items = overlap.load_candidates(candidates, checkouts)
+        vectors = overlap.get_embeddings(items, embed, self.cache, model="embed")
+        self.assertEqual(self.embed_calls, ["review: edited"])
+        self.assertEqual(vectors, {items[0].item_id: [1.0, 0.0], items[1].item_id: [0.0, 1.0]})
+        self.assertEqual([pair.cosine for pair in overlap.find_candidate_pairs(items, items, vectors)], [0.0])
+        by_id = {item.item_id: item for item in items}
+        self.assertEqual(judge_groups.collapse_copies(list(by_id), by_id, {}, vectors, {a: 1, b: 2}),
+                         (list(by_id), {}))
+
+    def test_blob_keyed_version_two_cache_reuses_exact_text(self):
+        """Read a previously stored text fingerprint even when the item has a different blob ID."""
+        overlap.get_embeddings([self.item], self.embed, self.cache, model="embed")
+        data = self.load_cache_json()
+        vectors = next(iter(data["namespaces"].values()))["vectors"]
+        vectors["old-blob-id"] = vectors.pop(text_sha256(overlap.make_embed_text(self.item)))
+        self.cache.write_text(json.dumps(data))
+        self.embed_calls.clear()
+        self.assertEqual(overlap.get_embeddings([self.item], self.embed, self.cache, model="embed"),
+                         {self.item.item_id: [0.1, 0.2, 0.3]})
+        self.assertEqual(self.embed_calls, [])
 
     def test_explicit_dims_reject_wrong_response_length(self):
         """Reject a three-dimensional response when the caller requests two dimensions."""
@@ -653,7 +715,8 @@ class OverlapEmbeddingIdentityTests(unittest.TestCase):
         """Refuse an implicit choice between matching namespaces of different dimensions."""
         overlap.get_embeddings([self.item], self.embed, self.cache, model="embed", embed_dims=3)
         overlap.get_embeddings([self.item], lambda texts: [[1.0, 0.0]], self.cache, model="embed", embed_dims=2)
-        self.assertEqual(overlap.load_embeddings(self.cache, [self.item], "embed", "", 2), {"b1": [1.0, 0.0]})
+        self.assertEqual(overlap.load_embeddings(self.cache, [self.item], "embed", "", 2),
+                         {self.item.item_id: [1.0, 0.0]})
         with self.assertRaisesRegex(ValueError, "--embed-dims"):
             overlap.get_embeddings([self.item], self.embed, self.cache, model="embed")
 
@@ -679,7 +742,7 @@ class OverlapEmbeddingIdentityTests(unittest.TestCase):
         stderr = io.StringIO()
         with redirect_stderr(stderr):
             self.assertEqual(overlap.load_embeddings(self.cache, [self.item], "embed", ""),
-                             {"b1": [0.1, 0.2, 0.3]})
+                             {self.item.item_id: [0.1, 0.2, 0.3]})
         for key in damaged:
             self.assertIn(key, stderr.getvalue())
 
@@ -688,8 +751,21 @@ class OverlapEmbeddingIdentityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "--embed-dims"):
             overlap.get_embeddings([self.item], self.embed, self.cache, model="embed", embed_dims=True)
 
+    def test_zero_embedding_dims_refused_with_empty_candidates(self):
+        """Reject zero CLI dimensions even when no vector gets sent or validated."""
+        root = self.cache.parent
+        args = ["run", "--candidates", str(write_candidates(root, [])), "--checkouts", str(root),
+                "--skills-dir", str(root / "skills"), "--out", str(root / "out.tsv"),
+                "--groups", str(root / "groups.tsv"), "--base-url", "https://embed.test/v1",
+                "--embed-model", "embed", "--judge-model", "judge", "--embed-dims", "0"]
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            self.assertEqual(overlap.main(args), 1)
+        self.assertIn("--embed-dims must be a positive integer", stderr.getvalue())
+        self.assertFalse((root / "out.tsv").exists())
+
     def test_overlap_cli_reports_malformed_cached_vector(self):
-        """Report a malformed vector with its cache path and blob, even when unused."""
+        """Report a malformed vector with its cache path and input hash."""
         self.write_damaged_cache()
         args = ["run", "--candidates", str(write_candidates(self.cache.parent, [])),
                 "--skills-dir", str(self.cache.parent / "skills"), "--out", str(self.cache.parent / "out.tsv"),
@@ -699,14 +775,35 @@ class OverlapEmbeddingIdentityTests(unittest.TestCase):
         with redirect_stderr(stderr):
             self.assertEqual(overlap.main(args), 1)
         self.assertIn(str(self.cache), stderr.getvalue())
-        self.assertIn("b1", stderr.getvalue())
+        self.assertIn(text_sha256(overlap.make_embed_text(self.item)), stderr.getvalue())
         self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_overlap_cli_transport_failure_uses_safe_endpoint(self):
+        """Report only the safe endpoint when an embedding request fails."""
+        root = self.cache.parent
+        write_skill_file(root, "owner__repo/SKILL.md", "---\nname: fixture\n---\n")
+        candidates = write_candidates(root, [
+            {"source": "owner/repo", "path": "SKILL.md", "blob_id": "dummy", "verdict": "candidate"},
+        ])
+        base = "https://fixture-user:fixture-pass@example.test:8443/v1"
+        failure = urllib.error.URLError(f"{base}?fixture-query#fixture-fragment")
+        args = ["run", "--candidates", str(candidates), "--checkouts", str(root),
+                "--skills-dir", str(root / "skills"), "--out", str(root / "out.tsv"),
+                "--groups", str(root / "groups.tsv"), "--base-url", base, "--embed-model", "embed",
+                "--judge-model", "judge"]
+        stderr = io.StringIO()
+        with (patch.object(llm_client.urllib.request, "urlopen", side_effect=failure),
+              redirect_stderr(stderr)):
+            self.assertEqual(overlap.main(args), 1)
+        self.assertIn("https://example.test:8443/v1/embeddings", stderr.getvalue())
+        self.assertNotIn("fixture-", stderr.getvalue())
 
     def write_damaged_cache(self):
         """Write a selected namespace containing one invalid vector value."""
         overlap.get_embeddings([self.item], self.embed, self.cache, model="embed", provider="https://embed.test/v1")
         data = self.load_cache_json()
-        next(iter(data["namespaces"].values()))["vectors"]["b1"]["vector"] = {"bad": True}
+        key = text_sha256(overlap.make_embed_text(self.item))
+        next(iter(data["namespaces"].values()))["vectors"][key]["vector"] = {"bad": True}
         self.cache.write_text(json.dumps(data))
 
     def test_adoption_cli_reports_malformed_cached_vector(self):
@@ -721,7 +818,7 @@ class OverlapEmbeddingIdentityTests(unittest.TestCase):
               redirect_stderr(stderr)):
             self.assertEqual(adopt_skills.main(args), 1)
         self.assertIn(str(self.cache), stderr.getvalue())
-        self.assertIn("b1", stderr.getvalue())
+        self.assertIn(text_sha256(overlap.make_embed_text(self.item)), stderr.getvalue())
         self.assertNotIn("Traceback", stderr.getvalue())
 
     def test_grouped_adoption_refuses_missing_or_incompatible_namespace(self):
@@ -730,7 +827,7 @@ class OverlapEmbeddingIdentityTests(unittest.TestCase):
                                provider="https://embed.test/v1")
         for cache in (self.cache, None, self.cache.with_name("missing.json")):
             with (self.subTest(cache=cache),
-                  self.assertRaisesRegex(ValueError, r"overlap run --cache .* --embed-model embed"),
+                  self.assertRaisesRegex(ValueError, r"python3 tools/overlap\.py run --cache .* --embed-model embed"),
                   patch.object(adopt_skills, "inputs", return_value=([], {}, {}, {}, [], {}, []))):
                 adopt_skills.run(None, None, None, self.cache.parent, self.cache.parent, include_grouped=True,
                                  cache=cache, embed_model="embed", embed_base_url="https://embed.test/v1")
@@ -752,6 +849,26 @@ class OverlapEmbeddingIdentityTests(unittest.TestCase):
             with patch("sys.stdout", new_callable=io.StringIO):
                 self.assertEqual(adopt_skills.main(args), 0)
 
+    def test_ungrouped_adoption_ignores_invalid_inherited_endpoint(self):
+        """Ignore the unused environment endpoint while still validating explicit options."""
+        root = self.cache.parent
+        (root / "REUSE.toml").write_text("")
+        (root / "CREDITS.md").write_text("")
+        args = ["--candidates", "unused", "--groups", "unused", "--census", "unused",
+                "--checkouts", str(root), "--root", str(root)]
+        with (patch.object(adopt_skills, "inputs", return_value=([], {}, {}, {}, [], {}, [])),
+              patch.dict(os.environ, {"PERITIA_LLM_BASE_URL": "invalid"}),
+              patch("sys.stdout", new_callable=io.StringIO)):
+            self.assertEqual(adopt_skills.run(None, None, None, root, root)[0], [])
+            self.assertEqual(adopt_skills.main(args), 0)
+            with self.assertRaisesRegex(ValueError, "for --base-url$"):
+                adopt_skills.run(None, None, None, root, root, base_url="")
+            for option in ("--base-url", "--embed-base-url"):
+                stderr = io.StringIO()
+                with redirect_stderr(stderr), self.assertRaises(SystemExit):
+                    adopt_skills.main([*args, option, "invalid"])
+                self.assertIn(f"invalid base URL for {option}", stderr.getvalue())
+
     def test_legacy_cache_preserves_unbound_vectors_without_reusing_them(self):
         """Re-embed a legacy entry and preserve the old vector as unbound history."""
         legacy = {"b1": [9.0, 9.0, 9.0]}
@@ -760,7 +877,7 @@ class OverlapEmbeddingIdentityTests(unittest.TestCase):
         with redirect_stderr(stderr):
             result = overlap.get_embeddings([self.item], self.embed, self.cache, model="embed")
         self.assertEqual(self.embed_calls, ["name1: desc1"])
-        self.assertEqual(result, {"b1": [0.1, 0.2, 0.3]})
+        self.assertEqual(result, {self.item.item_id: [0.1, 0.2, 0.3]})
         self.assertEqual(self.load_cache_json()["version"], 2)
         self.assertEqual(self.load_cache_json()["legacy_unbound"], legacy)
         self.assertIn(str(self.cache), stderr.getvalue())
@@ -781,22 +898,21 @@ class OverlapEmbeddingAndCacheTests(unittest.TestCase):
                 with self.subTest(size=size):
                     data = bytes(size)
                     path.write_bytes(data)
-                    self.assertEqual(overlap.git_blob_id(data), expected)
-                    self.assertEqual(overlap._read_candidate_skill(path)[1], overlap.git_blob_id(data))
-
-    def test_download_runner_sets_subprocess_options(self):
-        """Capture both streams, apply a deadline and handle process status locally."""
-        result = subprocess.CompletedProcess(["reuse", "download", "MIT"], 0, b"licence", b"")
-        with patch.object(adopt_skills.subprocess, "run", Mock(return_value=result)) as run:
-            self.assertEqual(adopt_skills.default_download_runner(result.args), b"licence")
-        run.assert_called_once_with(result.args, cwd=None, capture_output=True, check=False,
-                                    timeout=adopt_skills.TIMEOUT)
+                    self.assertEqual(git_blob_id(data), expected)
+                    self.assertEqual(overlap._read_candidate_skill(path)[1], expected)
 
     def test_overlap_cli_rejects_invalid_endpoint(self):
-        """Reject unbound URL components during argument parsing."""
-        for url in ("https://host.test/v1?x=1", "https://host.test/v1#x", "//host.test/v1"):
-            with self.subTest(url=url), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-                overlap.parse_args(["run", "--base-url", url, "--embed-model", "embed", "--judge-model", "judge"])
+        """Name the endpoint option without exposing any part of rejected URLs."""
+        for authority, suffix in (("host.test:fixture-port", ""), ("[fixture-authority]", ""),
+                                  ("host.test", "?fixture-query"), ("host.test", "#fixture-fragment")):
+            url = f"https://fixture-user:fixture-pass@{authority}/fixture-path{suffix}"
+            stderr = io.StringIO()
+            with self.subTest(url=url):
+                with redirect_stderr(stderr), self.assertRaises(SystemExit):
+                    overlap.parse_args(["run", "--base-url", url, "--embed-model", "embed", "--judge-model", "judge"])
+                self.assertIn("invalid base URL for --base-url", stderr.getvalue())
+                self.assertNotIn("fixture-", stderr.getvalue())
+                self.assertNotIn("host.test", stderr.getvalue())
 
     def test_batching_never_exceeds_64(self):
         """Split a hundred input texts into batches of sixty-four or fewer."""

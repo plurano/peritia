@@ -156,14 +156,18 @@ class AdoptionTests(unittest.TestCase):
     def embedding_cache(self, vectors):
         """Write fixture embeddings using overlap's item preprocessing and cache format."""
         items = []
+        by_text = {}
         for row in self.candidates:
+            if row['blob_id'] not in vectors:
+                continue
             path = self.checkouts / row['source'].replace('/', '__') / row['path']
             with path.open(encoding='utf-8') as handle:
-                items.append(overlap.item_from_skill(adopt.candidate_id(row), row['blob_id'], row['skill_name'],
-                                                     handle.read(overlap.MAX_SKILL_CHARS)))
+                item = overlap.item_from_skill(adopt.candidate_id(row), row['blob_id'], row['skill_name'],
+                                               handle.read(overlap.MAX_SKILL_CHARS))
+            items.append(item)
+            by_text.setdefault(overlap.make_embed_text(item), vectors[item.blob_id])
         path = self.base / 'cache.json'
-        fixture_vectors = iter(vectors[item.blob_id] for item in items)
-        overlap.get_embeddings(items, lambda texts: [next(fixture_vectors) for _ in texts], path,
+        overlap.get_embeddings(items, lambda texts: [by_text[text] for text in texts], path,
                                model=EMBED_MODEL, provider=EMBED_PROVIDER)
         return path
 
@@ -560,9 +564,12 @@ class AdoptionTests(unittest.TestCase):
             'members': f'{orig_cand["source"]}:{orig_cand["path"]},{copy_cand["source"]}:{copy_cand["path"]}',
         }]
         cache_file = self.embedding_cache({'orig_blob': [1.0, 0.0], 'copy_blob': [0.99, math.sqrt(1 - 0.99**2)]})
-        with self.assertRaisesRegex(ValueError, r'overlap run --cache .* --embed-model other-model') as error:
+        with self.assertRaisesRegex(ValueError, r'python3 tools/overlap\.py run --cache .* --embed-model other-model') as error:
             self.invoke(apply=False, include_grouped=True, cache=cache_file, embed_model='other-model')
         self.assertIn(str(cache_file), str(error.exception))
+        copy_checkout = self.checkouts / copy_cand['source'].replace('/', '__')
+        adopt.git(copy_checkout, 'sparse-checkout', 'set', '--no-cone', '--stdin', data=b'**/LICENSE\n')
+        self.assertFalse((copy_checkout / copy_cand['path']).exists())
         rows, _ = self.invoke(apply=True, include_grouped=True, cache=cache_file)
         self.assertEqual(len(rows), 2)
         # Anthropics original adopted
@@ -585,6 +592,50 @@ class AdoptionTests(unittest.TestCase):
         self.assertEqual(parts[3], 'coding;testing')
         self.assertEqual(parts[4], '101')
         self.assertEqual(check_skills.check(self.root), 0)
+
+    def test_partial_group_cache_is_reported_before_apply(self):
+        """Defer both members when a matching namespace lacks a current vector."""
+        for name, source in (('alpha', 'anthropics/skills'), ('beta', 'obra/superpowers')):
+            pin = self.source({'SKILL.md': MD.format(name=name), 'LICENSE': LICENCE}, source=source)
+            self.candidate(name=name, folder='', source=source, pin=pin, blob_id=name)
+        members = [adopt.candidate_id(row) for row in self.candidates]
+        self.groups = [{'group_id': '42', 'members': ','.join(members)}]
+        cache_file = self.embedding_cache({'alpha': [1.0, 0.0]})
+        stderr = io.StringIO()
+
+        def publish_after_report(*args, **kwargs):
+            """Check that the missing-vector report precedes application."""
+            self.assertIn(f'group 42: missing embedding vectors for {members[1]}', stderr.getvalue())
+            self.assertIn('python3 tools/overlap.py run --cache', stderr.getvalue())
+            publish(*args, **kwargs)
+
+        publish = adopt.publish
+        with redirect_stderr(stderr), patch.object(adopt, 'publish', side_effect=publish_after_report):
+            rows, _ = self.invoke(include_grouped=True, cache=cache_file)
+        self.assertEqual([row['reason'] for row in rows], ['missing-embedding-vector'] * 2)
+        self.assertFalse((self.root / 'skills/alpha').exists())
+        self.assertFalse((self.root / 'skills/beta').exists())
+
+    def test_partial_group_cache_still_resolves_explicit_provenance(self):
+        """Adopt the named original and refuse its copy without vector evidence for either."""
+        upstream = 'anthropics/skills'
+        for name, source, provenance in (
+            ('original', upstream, ''), ('copy', 'obra/superpowers', f'\nsource_repo: {upstream}'),
+            ('unrelated', 'owner/repo', ''),
+        ):
+            text = MD.format(name=name).replace('\n---\n', f'{provenance}\n---\n')
+            pin = self.source({'SKILL.md': text, 'LICENSE': LICENCE}, source=source)
+            self.candidate(name=name, folder='', source=source, pin=pin, blob_id=name)
+        members = [adopt.candidate_id(row) for row in self.candidates]
+        self.groups = [{'group_id': '43', 'members': ','.join(members)}]
+        cache_file = self.embedding_cache({'unrelated': [1.0, 0.0]})
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            rows, _ = self.invoke(include_grouped=True, cache=cache_file)
+        self.assertIn(f'group 43: missing embedding vectors for {members[0]}, {members[1]}', stderr.getvalue())
+        self.assertEqual([row['verdict'] for row in rows], ['adopted', 'refused', 'refused'])
+        self.assertEqual(rows[1]['reason'], f'copy-of:{members[0]}')
+        self.assertEqual(rows[2]['reason'], 'missing-embedding-vector')
 
     def test_group_different_skills_adopts_both_with_group_id(self):
         """Adopt both members when their current embeddings show distinct uses."""
@@ -734,11 +785,22 @@ class AdoptionTests(unittest.TestCase):
         argv = ['--candidates', 'candidates.tsv', '--groups', 'groups.tsv', '--census', 'census.tsv',
                 '--checkouts', 'checkouts', '--cache', 'cache.json', '--include-grouped']
         stderr = io.StringIO()
-        with (patch.dict('os.environ', {'PERITIA_LLM_EMBED_MODEL': ''}), redirect_stderr(stderr),
+        with (patch.dict(os.environ, {'PERITIA_LLM_EMBED_MODEL': ''}), redirect_stderr(stderr),
               self.assertRaises(SystemExit) as error):
+            os.environ.pop('PERITIA_LLM_BASE_URL', None)
             adopt.main(argv)
         self.assertEqual(error.exception.code, 2)
-        self.assertIn('--embed-model', stderr.getvalue())
+        self.assertIn('--include-grouped requires --cache and --embed-model', stderr.getvalue())
+
+    def test_root_skill_member_falls_back_to_adopted_text(self):
+        """Find a root-level member by the dot path in the adopted-skill index."""
+        skills = self.root / 'skills'
+        adopted = skills / 'demo'
+        adopted.mkdir(parents=True)
+        text = MD.format(name='demo')
+        (adopted / 'SKILL.md').write_text(text, encoding='utf-8')
+        (adopted / 'ORIGIN.md').write_text('upstream: <https://github.com/owner/repo>\npath: .\n', encoding='utf-8')
+        self.assertEqual(adopt.get_member_skill_text('owner/repo:SKILL.md', self.checkouts, skills), text)
 
     def test_fresh_candidate_with_colliding_name_gets_owner_suffix(self):
         pin_other = self.source({'pack/demo/SKILL.md': MD.format(name='demo'), 'pack/demo/LICENSE': LICENCE},

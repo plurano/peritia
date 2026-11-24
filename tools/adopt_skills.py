@@ -29,11 +29,22 @@ from pathlib import Path, PurePosixPath
 import census
 import check_skills
 import overlap
-from candidates import LICENSE_FILENAMES, MAX_ROWS, find_folder_licence_file, normalize_name
+from candidates import (
+    LICENSE_FILENAMES,
+    MAX_ROWS,
+    find_folder_licence_file,
+    normalize_name,
+)
 from census import LiveReader, SourceReadError
 from check_skills import front_matter_or_empty
-from input_identity import provider_id, resolve_base_urls
-from judge_groups import collapse_copies, get_skill_text, is_existing_skill, load_sources
+from git_blob import git_blob_id
+from input_identity import provider_id, resolve_base_urls, validate_base_url
+from judge_groups import (
+    collapse_copies,
+    get_skill_text,
+    is_existing_skill,
+    load_sources,
+)
 
 MAX_FILES = 200
 MAX_BYTES = 2 * 1024 * 1024
@@ -751,6 +762,12 @@ def extract_source(origin_path: Path) -> str:
     return upstream or 'peritia'
 
 
+def _origin_folder(path: str) -> PurePosixPath:
+    """Derive the indexed folder from a source folder or SKILL.md path."""
+    target = PurePosixPath(path)
+    return target.parent if target.name == 'SKILL.md' else target
+
+
 def read_present_skills(skills_dir: Path) -> dict[tuple[str, str], dict[str, str]]:
     if not skills_dir.is_dir():
         return {}
@@ -764,13 +781,7 @@ def read_present_skills(skills_dir: Path) -> dict[tuple[str, str], dict[str, str
             upstream = extract_source(origin_file)
             if not upstream or upstream == 'peritia':
                 continue
-            raw_path = rec.get('path', '').strip()
-            if raw_path.endswith('/SKILL.md'):
-                origin_path = str(PurePosixPath(raw_path).parent)
-            elif raw_path:
-                origin_path = str(PurePosixPath(raw_path))
-            else:
-                origin_path = '.'
+            origin_path = str(_origin_folder(rec.get('path', '').strip()))
             commit = rec.get('commit', '').strip()
             key = (upstream.lower(), origin_path)
             if key not in present:
@@ -874,7 +885,7 @@ def _adopted_member_text(skills_dir: Path, source: str, path: str) -> str:
     """Read an adopted member when its source text is unavailable."""
     if not skills_dir.is_dir():
         return ''
-    folder = PurePosixPath(path).parent if path.endswith('/SKILL.md') else PurePosixPath(path)
+    folder = _origin_folder(path)
     present = read_present_skills(skills_dir).get((source.lower(), str(folder)))
     if present is None:
         return ''
@@ -913,12 +924,12 @@ def _copy_item(member: str, candidate: dict | None, text: str, skills_dir: Path)
     if is_existing_skill(member):
         rel = member.removeprefix('skills/').strip('/')
         path = skills_dir / rel / 'SKILL.md'
-        blob_id = overlap.git_blob_id(path.read_bytes()) if path.is_file() else ''
+        blob_id = git_blob_id(path.read_bytes()) if path.is_file() else ''
         return overlap.item_from_skill(member, blob_id, rel, text, is_existing=True)
     candidate = candidate or {}
     blob_id = candidate.get('blob_id', '').strip()
     if not blob_id and text:
-        blob_id = overlap.git_blob_id(text.encode())
+        blob_id = git_blob_id(text.encode())
     return overlap.item_from_skill(member, blob_id, candidate.get('skill_name', ''), text)
 
 
@@ -930,15 +941,19 @@ class CopyEmbeddingInputs:
     model: str
     endpoint: str
     dims: int | None
+    refill_paths: tuple[Path, Path, Path] | None = None
 
     def refill_command(self) -> str:
         """Show which overlap command populates the needed cache."""
-        args = ['overlap', 'run', '--cache', str(self.cache or 'embed-cache.json'),
+        args = ['python3', 'tools/overlap.py', 'run', '--cache', str(self.cache or 'embed-cache.json'),
                 '--embed-model', self.model or 'MODEL']
         if self.endpoint:
             args += ['--base-url', provider_id(self.endpoint)]
         if self.dims is not None:
             args += ['--embed-dims', str(self.dims)]
+        if self.refill_paths is not None:
+            for option, path in zip(('--candidates', '--checkouts', '--skills-dir'), self.refill_paths, strict=True):
+                args += [option, str(path)]
         return shlex.join(args)
 
     def require_cache(self) -> Path:
@@ -946,6 +961,34 @@ class CopyEmbeddingInputs:
         if self.cache is None or not self.model:
             raise ValueError(f'--include-grouped requires --cache and --embed-model; run {self.refill_command()}')
         return self.cache
+
+
+def _copy_embedding_inputs(cache, model, base_url, embed_base_url, dims, include_grouped, *, refill_paths=None):
+    """Resolve the embedding endpoint only for grouped adoption or explicit options."""
+    if base_url == '':
+        validate_base_url(base_url, '--base-url')
+    _, endpoint = resolve_base_urls(base_url, embed_base_url, inherit=include_grouped and embed_base_url is None)
+    embedding = CopyEmbeddingInputs(Path(cache) if cache is not None else None,
+                                    model or os.environ.get('PERITIA_LLM_EMBED_MODEL', ''),
+                                    endpoint, dims, refill_paths)
+    if include_grouped:
+        embedding.require_cache()
+    return embedding
+
+
+def _group_copy_decisions(group, items, metadata, embeddings, ranks, embedding: CopyEmbeddingInputs):
+    """Defer adoption where current vectors or explicit provenance cannot support it."""
+    members = [m.strip() for m in group['members'].split(',') if m.strip()]
+    missing = [m for m in members if m not in embeddings]
+    if not missing:
+        return collapse_copies(members, items, metadata, embeddings, ranks)[1]
+
+    group_id = group.get('group_id', '')
+    print(f"group {group_id}: missing embedding vectors for {', '.join(missing)}; "
+          f"run {embedding.refill_command()}", file=sys.stderr)
+    _, copies = collapse_copies(members, items, metadata, {}, ranks)
+    originals = {reason.removeprefix('copy-of:') for reason in copies.values()}
+    return {**dict.fromkeys((m for m in members if m not in originals), 'missing-embedding-vector'), **copies}
 
 
 def resolve_copies(group_rows, checkouts, root, pins, all_candidates, sources, embedding: CopyEmbeddingInputs):
@@ -962,7 +1005,8 @@ def resolve_copies(group_rows, checkouts, root, pins, all_candidates, sources, e
     for m in all_members:
         text = get_member_skill_text(m, checkouts, skills_dir, pins)
         metadata[m] = front_matter_or_empty(text)
-        items[m] = _copy_item(m, cand_by_cid.get(m), text, skills_dir)
+        if text:
+            items[m] = _copy_item(m, cand_by_cid.get(m), text, skills_dir)
     try:
         embeddings = overlap.load_embeddings(cache_path, list(items.values()), embedding.model, embedding.endpoint,
                                              embedding.dims, require_namespace=True)
@@ -971,10 +1015,7 @@ def resolve_copies(group_rows, checkouts, root, pins, all_candidates, sources, e
 
     copies_map = {}
     for grow in group_rows:
-        members = [m.strip() for m in grow['members'].split(',') if m.strip()]
-        _, g_copies = collapse_copies(members, items, metadata, embeddings, ranks)
-        for copy_member, reason in g_copies.items():
-            copies_map[copy_member] = reason
+        copies_map.update(_group_copy_decisions(grow, items, metadata, embeddings, ranks, embedding))
     return copies_map
 
 
@@ -1030,8 +1071,7 @@ def evaluate(row, grouped, order, pins, checkouts, root, staging, occupied, appl
 
 
 def default_download_runner(args, *, cwd=None):
-    """Download licence text with the adoption command deadline."""
-    proc = subprocess.run(args, cwd=cwd, capture_output=True, check=False, timeout=TIMEOUT)
+    proc = subprocess.run(args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if proc.returncode != 0:
         detail = proc.stderr.decode('utf-8', errors='replace').strip()[:500]
         spdx_id = args[-1] if args else 'unknown'
@@ -1089,12 +1129,8 @@ def run(candidates, groups, census, checkouts, root=Path('.'), *, apply=False,
         include_grouped=False, cache=None, sources=None, embed_model=None, base_url=None, embed_dims=None,
         embed_base_url=None):
     """Preview or apply adoption using the selected overlap cache namespace."""
-    _, embed_endpoint = resolve_base_urls(base_url, embed_base_url)
-    embedding = CopyEmbeddingInputs(Path(cache) if cache is not None else None,
-                                    embed_model or os.environ.get('PERITIA_LLM_EMBED_MODEL', ''),
-                                    embed_endpoint, embed_dims)
-    if include_grouped:
-        embedding.require_cache()
+    embedding = _copy_embedding_inputs(cache, embed_model, base_url, embed_base_url, embed_dims, include_grouped,
+                                       refill_paths=(candidates, checkouts, root / 'skills'))
     if download_runner is not None:
         runner = download_runner
     if runner is None:
@@ -1159,10 +1195,8 @@ def _parse_args(argv=None):
     parser.add_argument('--embed-dims', type=int, help='dimension of the cached embedding vectors')
     args = parser.parse_args(argv)
     try:
-        args.base_url, args.embed_base_url = resolve_base_urls(args.base_url, args.embed_base_url)
-        if args.include_grouped:
-            CopyEmbeddingInputs(args.cache, args.embed_model or '', args.embed_base_url,
-                                args.embed_dims).require_cache()
+        _copy_embedding_inputs(args.cache, args.embed_model, args.base_url, args.embed_base_url,
+                               args.embed_dims, args.include_grouped)
     except ValueError as error:
         parser.error(str(error))
     return args
