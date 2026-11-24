@@ -15,23 +15,32 @@ import sys
 import tempfile
 import unittest
 from collections import Counter
-from contextlib import redirect_stdout
+from contextlib import closing, redirect_stdout
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from hashlib import sha256
+from itertools import islice
 from pathlib import Path
 from unittest.mock import patch
 
-from markdown_it import MarkdownIt
 import yaml
+from markdown_it import MarkdownIt
 
 try:
     from install_user_skills import read_install_set
-    from licence_policy import LICENCE_POINTERS, candidate_licence_id
+    from licence_policy import (
+        candidate_licence_id,
+        find_folder_licence_file,
+        licence_pointer_name,
+    )
     from licence_text import MAX_LICENCE_BYTES, read_utf8, verify_licence
 except ImportError:
     from tools.install_user_skills import read_install_set
-    from tools.licence_policy import LICENCE_POINTERS, candidate_licence_id
+    from tools.licence_policy import (
+        candidate_licence_id,
+        find_folder_licence_file,
+        licence_pointer_name,
+    )
     from tools.licence_text import MAX_LICENCE_BYTES, read_utf8, verify_licence
 
 COMMONMARK = MarkdownIt("commonmark")
@@ -40,6 +49,7 @@ MAX_SKILL_ENTRIES = 1000  # bounds the entries walked in one skill (HISS-02)
 MAX_SKILL_MD_BYTES = 2 * 1024 * 1024
 MAX_ORIGIN_BYTES = 256 * 1024
 MAX_YAML_MAPPING_KEYS = 1000
+MAX_YAML_EVENTS = 32_000
 MAX_LICENCE_EXCEPTIONS = 128
 LICENCE_EXCEPTIONS_FILE = "skills/licence-exceptions.yaml"
 LICENCE_EXCEPTION_KEYS = frozenset({"rule", "path", "spdx", "sha256", "reason", "category", "entered", "expires"})
@@ -64,45 +74,85 @@ def fields(text):
     return {m.group("key"): m.group("value").strip() for m in FIELD.finditer(text)}
 
 
+class _YamlReadError(ValueError):
+    """A YAML document could not be parsed or safely constructed."""
+
+
+class _YamlMappingError(ValueError):
+    """A strict YAML mapping failed key validation."""
+
+
 class _UniqueKeyLoader(yaml.SafeLoader):
     """Load validation YAML with unique keys at every mapping level."""
 
     def _require_unique_keys(self, node):
-        """Check keys before merge expansion and again on the effective mapping."""
+        """Check mapping keys before constructing values."""
         if len(node.value) > MAX_YAML_MAPPING_KEYS:
-            raise ValueError(f"mapping exceeds {MAX_YAML_MAPPING_KEYS} keys")
+            raise _YamlMappingError(f"mapping exceeds {MAX_YAML_MAPPING_KEYS} keys")
         seen = set()
         for key_node, _ in node.value:
             tag = key_node.tag
-            key = key_node.value if tag.endswith((":merge", ":value")) else self.construct_object(key_node)
+            key = key_node.value if tag == "tag:yaml.org,2002:value" else self.construct_object(key_node)
             try:
                 if key in seen:
-                    raise ValueError(f"duplicate key {key!r}")
+                    raise _YamlMappingError(f"duplicate key {key!r}")
                 seen.add(key)
             except TypeError as exc:
-                raise ValueError(f"unhashable YAML key {key!r}") from exc
+                raise _YamlMappingError(f"unhashable YAML key {key!r}") from exc
 
     def construct_mapping(self, node, deep=False):
-        """Refuse duplicate literal and merged keys before constructing values."""
-        self._require_unique_keys(node)
-        self.flatten_mapping(node)
+        """Refuse duplicate literal keys before constructing values."""
         self._require_unique_keys(node)
         return super().construct_mapping(node, deep=deep)
 
 
+def _check_yaml_events(text: str, loader: type[yaml.SafeLoader]) -> None:
+    """Reject YAML references and cap parser events before composing nodes."""
+    with closing(yaml.parse(text, Loader=loader)) as events:
+        for count, event in enumerate(islice(events, MAX_YAML_EVENTS + 1), 1):
+            if count > MAX_YAML_EVENTS:
+                raise ValueError(f"document exceeds {MAX_YAML_EVENTS} YAML events")
+            if getattr(event, "anchor", None) is not None:
+                raise ValueError("YAML anchors and aliases are not allowed")
+
+
+def _check_yaml_nodes(node: yaml.Node) -> None:
+    """Reject merge keys before PyYAML can expand a mapping."""
+    pending = [node]
+    for _ in range(MAX_YAML_EVENTS):
+        if not pending:
+            return
+        current = pending.pop()
+        if isinstance(current, yaml.MappingNode):
+            for key, value in current.value:
+                if key.tag == "tag:yaml.org,2002:merge" or (isinstance(key, yaml.ScalarNode) and key.value == "<<"):
+                    raise ValueError("YAML merge keys are not allowed")
+                pending.extend((key, value))
+        elif isinstance(current, yaml.SequenceNode):
+            pending.extend(current.value)
+    raise ValueError(f"document exceeds {MAX_YAML_EVENTS} YAML nodes")
+
+
 def _load_yaml(text: str, loader: type[yaml.SafeLoader], *, error_prefix: str = "") -> object:
-    """Construct the typed SafeLoader subclass directly to expose the safe call to scanners."""
+    """Validate the YAML structure before constructing values with a safe loader."""
     try:
+        _check_yaml_events(text, loader)
         parser = loader(text)
         try:
-            return parser.get_single_data()
+            node = parser.get_single_node()
+            if node is None:
+                return None
+            _check_yaml_nodes(node)
+            return parser.construct_document(node)
         finally:
             parser.dispose()
-    except (yaml.YAMLError, RecursionError) as exc:
+    except _YamlMappingError:
+        raise
+    except (yaml.YAMLError, AttributeError, IndexError, KeyError, OverflowError, RecursionError, TypeError, ValueError) as exc:
         message = str(exc)
         if error_prefix:
             message = error_prefix + " ".join(message.split())
-        raise ValueError(message) from exc
+        raise _YamlReadError(message) from exc
 
 
 @dataclass(frozen=True)
@@ -116,13 +166,17 @@ class _LicenceException:
 
 
 @dataclass
-class _LicenceScan:
+class LicenceScan:
     """Track pending register entries and counts of verified licences and pins."""
 
     pending: dict[str, _LicenceException]
     today: date
     pinned: int = 0
     verified: Counter[str] = field(default_factory=Counter)
+
+    def copy(self) -> "LicenceScan":
+        """Start independent validation using the same entries and check date."""
+        return LicenceScan(self.pending.copy(), self.today)
 
 
 def _exception_fields(entry: object) -> dict[str, str]:
@@ -153,11 +207,15 @@ def _exception_date(entry: dict[str, str], key: str) -> date:
         raise ValueError(f"{key}: invalid date {value!r}") from exc
 
 
-def _exception_expiry(entry: dict[str, str]) -> date:
+def _exception_expiry(entry: dict[str, str], today: date) -> date:
     """Apply the declared category's expiry interval."""
     category = entry["category"]
     entered = _exception_date(entry, "entered")
     expires = _exception_date(entry, "expires")
+    if entered > today:
+        raise ValueError(f"entered: {entered} is after check date {today}")
+    if expires < entered:
+        raise ValueError(f"expires: {expires} is before entered date {entered}")
     if category == "A":
         return expires
     days = LICENCE_EXCEPTION_DAYS.get(category)
@@ -172,7 +230,7 @@ def _exception_expiry(entry: dict[str, str]) -> date:
     return expires
 
 
-def _parse_licence_exception(raw: object) -> _LicenceException:
+def _parse_licence_exception(raw: object, today: date) -> _LicenceException:
     """Validate the rule, skill path, SPDX ID, byte hash and expiry."""
     entry = _exception_fields(raw)
     if entry["rule"] != "skill-licence-text":
@@ -187,10 +245,10 @@ def _parse_licence_exception(raw: object) -> _LicenceException:
     digest = entry["sha256"]
     if not re.fullmatch(r"[0-9a-f]{64}", digest):
         raise ValueError("sha256: expected 64 lowercase hexadecimal characters")
-    return _LicenceException(path, spdx, digest, _exception_expiry(entry))
+    return _LicenceException(path, spdx, digest, _exception_expiry(entry, today))
 
 
-def _read_licence_exceptions(root: Path) -> dict[str, _LicenceException]:
+def _read_licence_exceptions(root: Path, today: date | None = None) -> dict[str, _LicenceException]:
     """Read the optional register and index validated entries by skill licence path."""
     try:
         text = read_utf8(root / LICENCE_EXCEPTIONS_FILE, MAX_LICENCE_BYTES, refuse_links=True)
@@ -204,16 +262,27 @@ def _read_licence_exceptions(root: Path) -> dict[str, _LicenceException]:
         raise TypeError("exceptions: expected a list")
     if len(entries) > MAX_LICENCE_EXCEPTIONS:
         raise ValueError(f"exceptions: expected at most {MAX_LICENCE_EXCEPTIONS} entries, found {len(entries)}")
+    check_date = datetime.now(UTC).date() if today is None else today
     by_path = {}
     for index, raw in enumerate(entries, 1):
         try:
-            entry = _parse_licence_exception(raw)
+            entry = _parse_licence_exception(raw, check_date)
         except (TypeError, ValueError) as exc:
             raise ValueError(f"entry {index}: {exc}") from exc
         if entry.path in by_path:
             raise ValueError(f"entry {index}: duplicate path {entry.path}")
         by_path[entry.path] = entry
     return by_path
+
+
+def read_licence_scan(root: Path, *, today: date | None = None) -> LicenceScan:
+    """Read reviewed licences using a single check date for entry and expiry validation."""
+    check_date = datetime.now(UTC).date() if today is None else today
+    try:
+        entries = _read_licence_exceptions(root, check_date)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{LICENCE_EXCEPTIONS_FILE}: {exc}") from exc
+    return LicenceScan(entries, check_date)
 
 
 def _load_front_matter(text: str, loader: type[yaml.SafeLoader]) -> dict:
@@ -293,7 +362,7 @@ def _skill_md_link_problems(skill: Path, text: str) -> list[str]:
     return out
 
 
-def _front_licence_problem(meta: dict, spdx: str) -> str | None:
+def _front_licence_problem(meta: dict, spdx: str, path: Path | None) -> str | None:
     """Require each front matter licence to be an agreeing ID or a complete pointer."""
     for key in ("license", "licence"):
         if key not in meta:
@@ -304,7 +373,11 @@ def _front_licence_problem(meta: dict, spdx: str) -> str | None:
             return f"{label} has type {type(raw).__name__}; expected a string"
         if not raw.strip():
             return f"{label} is an empty string"
-        if " ".join(raw.casefold().split()) in LICENCE_POINTERS:
+        if name := licence_pointer_name(raw):
+            if path is None:
+                return f"{label} pointer names {name}, but no licence file was found"
+            if name != path.name:
+                return f"{label} pointer names {name}, discovered {path.name}"
             continue
         front_id = candidate_licence_id(raw)
         if front_id is None:
@@ -344,16 +417,15 @@ def _pinned_licence_problem(path: Path, spdx: str, entry: _LicenceException,
     return None
 
 
-def _licence_text_problem(skill: Path, template_dir: Path, spdx: str,
-                          scan: _LicenceScan | None, entry: _LicenceException | None) -> str | None:
+def _licence_text_problem(path: Path, template_dir: Path, spdx: str,
+                          scan: LicenceScan | None, entry: _LicenceException | None) -> str | None:
     """Check the canonical text first and consult a pin only for a body difference."""
-    path = skill / "LICENSE"
     try:
         verify_licence(path, template_dir, spdx)
     except (ValueError, FileNotFoundError) as exc:
         difference = str(exc)
         if scan is None or entry is None or not difference.startswith(f"LICENSE differs from {spdx} at "):
-            return f"{skill.name}: {difference}"
+            return f"{path.parent.name}: {difference}"
         if problem := _pinned_licence_problem(path, spdx, entry, scan.today, difference):
             return problem
         scan.pinned += 1
@@ -364,37 +436,29 @@ def _licence_text_problem(skill: Path, template_dir: Path, spdx: str,
 
 
 def _licence_problem(skill: Path, declared: str, meta: dict, template_dir: Path,
-                     scan: _LicenceScan | None) -> str | None:
+                     scan: LicenceScan | None) -> str | None:
     """Report the first licence problem or record the verified SPDX ID."""
     relative_path = f"skills/{skill.name}/LICENSE"
     entry = scan.pending.pop(relative_path, None) if scan is not None else None
     spdx = candidate_licence_id(declared)
     if spdx is None:
         return f"{skill.name}/ORIGIN.md: licence {declared} not recognised"
-    front_problem = _front_licence_problem(meta, spdx)
+    path = find_folder_licence_file(skill)
+    front_problem = _front_licence_problem(meta, spdx, path)
     if front_problem:
         return f"{skill.name}/SKILL.md: {front_problem}"
-    if problem := _licence_text_problem(skill, template_dir, spdx, scan, entry):
+    if entry is not None and path is not None and path.name != "LICENSE":
+        return f"{entry.path}: no applicable skill licence; remove the exception"
+    if problem := _licence_text_problem(path or (skill / "LICENSE"), template_dir, spdx, scan, entry):
         return problem
     if scan is not None:
         scan.verified[spdx] += 1
     return None
 
 
-def skill_problems(
-    skill: Path, *, template_dir: Path | None = None, licence_scan: _LicenceScan | None = None,
-) -> list[str]:
-    """Problems of one skill directory, each naming the file and the rule."""
+def _skill_content_problems(skill: Path, text: str, meta: dict) -> list[str]:
+    """Check the front matter, Markdown, links and folder contents in reporting order."""
     out = []
-    md, origin = skill / "SKILL.md", skill / "ORIGIN.md"
-    try:
-        text = read_utf8(md, MAX_SKILL_MD_BYTES)
-    except (ValueError, FileNotFoundError) as exc:
-        return [f"{skill.name}: {exc}"]
-    try:
-        meta = _load_front_matter(text, _UniqueKeyLoader)
-    except ValueError as exc:
-        return [f"{skill.name}/SKILL.md: front matter is not valid YAML: {' '.join(str(exc).split())}"]
     if str(meta.get("name")).strip() != skill.name:
         out.append(f"{skill.name}/SKILL.md: front matter name must be {skill.name!r}")
     desc = meta.get("description")
@@ -405,23 +469,42 @@ def skill_problems(
             out.append(f"{skill.name}/SKILL.md:{n}: installs or fetches code at run time")
     out.extend(_skill_md_link_problems(skill, text))
     out.extend(_workbench_problems(skill))
+    return out
+
+
+def _origin_problems(skill: Path, meta: dict, template_dir: Path,
+                     licence_scan: LicenceScan | None) -> list[str]:
+    """Validate the provenance record and its licence for an adapted skill."""
     try:
-        rec = fields(read_utf8(origin, MAX_ORIGIN_BYTES))
+        rec = fields(read_utf8(skill / "ORIGIN.md", MAX_ORIGIN_BYTES))
     except (ValueError, FileNotFoundError) as exc:
-        return out + [f"{skill.name}: {exc}"]
+        return [f"{skill.name}: {exc}"]
     if rec.get("upstream") == "own":
-        return out
-    for key in ("upstream", "path", "commit", "licence", "changes"):
-        if not rec.get(key):
-            out.append(f"{skill.name}/ORIGIN.md: needs '{key}:'")
+        return []
+    out = [f"{skill.name}/ORIGIN.md: needs '{key}:'"
+           for key in ("upstream", "path", "commit", "licence", "changes") if not rec.get(key)]
     if rec.get("commit") and not COMMIT.match(rec["commit"]):
         out.append(f"{skill.name}/ORIGIN.md: commit must be the full 40-hex SHA")
-    if declared := rec.get("licence"):
-        if template_dir is None:
-            template_dir = skill.parent.parent / "LICENSES"
-        if problem := _licence_problem(skill, declared, meta, template_dir, licence_scan):
-            out.append(problem)
+    if (declared := rec.get("licence")) and (problem := _licence_problem(skill, declared, meta, template_dir, licence_scan)):
+        out.append(problem)
     return out
+
+
+def skill_problems(
+    skill: Path, *, template_dir: Path | None = None, licence_scan: LicenceScan | None = None,
+) -> list[str]:
+    """Problems of one skill directory, each naming the file and the rule."""
+    try:
+        text = read_utf8(skill / "SKILL.md", MAX_SKILL_MD_BYTES)
+    except (ValueError, FileNotFoundError) as exc:
+        return [f"{skill.name}: {exc}"]
+    try:
+        meta = _load_front_matter(text, _UniqueKeyLoader)
+    except ValueError as exc:
+        return [f"{skill.name}/SKILL.md: front matter is not valid YAML: {' '.join(str(exc).split())}"]
+    if template_dir is None:
+        template_dir = skill.parent.parent / "LICENSES"
+    return _skill_content_problems(skill, text, meta) + _origin_problems(skill, meta, template_dir, licence_scan)
 
 
 def check_install_set(root):
@@ -477,16 +560,20 @@ def index_problems(root, skills=None):
 def check(root: Path, *, today: date | None = None) -> int:
     """Check the skill tree and report verified licence counts."""
     skills = []
-    scan = _LicenceScan({}, datetime.now(UTC).date() if today is None else today)
+    scan = LicenceScan({}, datetime.now(UTC).date() if today is None else today)
+    problems = []
     try:
-        scan.pending = _read_licence_exceptions(root)
+        scan.pending = _read_licence_exceptions(root, scan.today)
     except (TypeError, ValueError) as exc:
-        problems = [f"{LICENCE_EXCEPTIONS_FILE}: {' '.join(str(exc).split())}"]
+        problems.append(f"{LICENCE_EXCEPTIONS_FILE}: {' '.join(str(exc).split())}")
+        scan_skills = isinstance(exc, _YamlReadError)
     else:
+        scan_skills = True
+    if scan_skills:
         skills_dir = root / "skills"
         if skills_dir.is_dir():
             skills = sorted(p for p in skills_dir.iterdir() if p.is_dir())[:MAX_SKILLS]
-        problems = [p for s in skills for p in skill_problems(s, licence_scan=scan)]
+        problems.extend(p for s in skills for p in skill_problems(s, licence_scan=scan))
         problems.extend(f"{path}: no applicable skill licence; remove the exception" for path in sorted(scan.pending))
         problems.extend(check_install_set(root))
         problems.extend(index_problems(root, skills))
@@ -677,7 +764,7 @@ def _selftest_licences(tmp, good_md, good_origin):
         ("null-front", mit, "MIT", "null", "front matter license has type NoneType"),
         ("padded-front", mit, "MIT", '" MIT "', None),
         ("mit-alias", mit, "MIT", '"MIT license"', None),
-        ("license-pointer", apache, "Apache-2.0", "Complete terms in LICENSE.txt", None),
+        ("license-pointer", apache, "Apache-2.0", "Complete terms in LICENSE", None),
         ("rewrapped-mit", wrapped_mit, "MIT", "MIT", None),
         ("absent-front", mit_zero, "MIT-0", None, None),
         ("cc-zero", _fixture_licence("CC0-1.0"), "CC0-1.0", '"CC0-1.0"', None),
@@ -754,6 +841,81 @@ class _LicenceRegressionTests(unittest.TestCase):
             with self.subTest(name=name):
                 self._refused(self._plant(body, declared, name=name), message)
 
+    def test_spdx_metadata_must_agree(self):
+        """Reject conflicting metadata in each supported comment syntax."""
+        # REUSE-IgnoreStart
+        for prefix in ("SPDX-License-Identifier:", "# REUSE-License:", "// SPDX-License-Identifier:",
+                       "/* SPDX-License-Identifier:", "<!-- REUSE-License:"):
+            # REUSE-IgnoreEnd
+            suffix = {"/*": " */", "<!--": " -->"}.get(prefix.split()[0], "")
+            with self.subTest(prefix=prefix):
+                body = f"{prefix} Apache-2.0{suffix}\n{self.mit}"
+                self._refused(self._plant(body), "Apache-2.0; declared MIT")
+                body = f"{prefix} miT{suffix}\n{self.mit}"
+                self.assertEqual(skill_problems(self._plant(body)), [])
+
+    def test_copyright_notice_cannot_hide_terms(self):
+        """Keep restrictions and malformed notices in the licence comparison."""
+        for notice in ("Copyright 2024 X. Licensee may not use this commercially.",
+                       "Copyright X. Licensee may not use this commercially.",
+                       "Copyright 2024 Acme no commercial use",
+                       "Copyright 2024 you may not sell this software",
+                       "Copyright Acme no commercial use",
+                       "copyright 2024 acme corp",
+                       "Copyright 2024", "Copyright 2024 All rights reserved.",
+                       "Copyright 2024 " + " ".join(["Holder"] * 13)):
+            with self.subTest(notice=notice):
+                self._refused(self._plant(f"{notice}\n{self.mit}"), "differs from MIT")
+
+    def test_copyright_holder_attribution(self):
+        """Accept attribution with corporate punctuation, connectors and an email."""
+        for notice in ("Copyright (c) 2024 Meta Platforms, Inc. and affiliates.",
+                       "Copyright Meta Platforms, Inc. and affiliates.",
+                       "Copyright 2024 The Project Authors",
+                       "© 2024 Jane Doe <jane@example.org>",
+                       "© 2024 Jane Doe <jane@example.org>."):
+            with self.subTest(notice=notice):
+                self.assertEqual(skill_problems(self._plant(f"{notice}\n{self.mit}")), [])
+
+    def test_copyright_holder_token_cap(self):
+        """Count an optional email toward the same twelve-token holder limit."""
+        holder = "Copyright 2024 " + "Holder " * 11
+        email = "<holder@example.org>"
+        self.assertEqual(skill_problems(self._plant(f"{holder}{email}\n{self.mit}")), [])
+        self._refused(self._plant(f"{holder}Holder {email}\n{self.mit}"), "differs from MIT")
+
+    def test_numbered_clauses_must_agree(self):
+        """Refuse changes to section and clause identifiers."""
+        for original, changed in (("3. Grant of Patent License.", "7. Grant of Patent License."),
+                                  ("(a) You must give", "(z) You must give")):
+            with self.subTest(label=original):
+                modified = self.apache.replace(original, changed, 1)
+                self.assertNotEqual(modified, self.apache)
+                self._refused(self._plant(modified, "Apache-2.0"), "differs from Apache-2.0")
+
+    def test_unknown_spdx_ids(self):
+        """Refuse unsupported identifiers even when a local template exists."""
+        for spdx in ("LGPL-NONSENSE", "MIT-only", "Apache-2.0-or-later"):
+            with self.subTest(spdx=spdx):
+                (self.templates / f"{spdx}.txt").write_text(self.mit, encoding="utf-8")
+                self.assertIsNone(candidate_licence_id(spdx))
+                self._refused(self._plant(self.mit, spdx), f"licence {spdx} not recognised")
+
+    def test_pointer_requires_discovered_file(self):
+        """Require the declared pointer and discovered licence file to agree."""
+        skill = self._plant(self.mit, front="license: See LICENSE.txt\n")
+        self._refused(skill, "pointer names LICENSE.txt, discovered LICENSE")
+        (skill / "LICENSE.txt").write_text(self.mit, encoding="utf-8")
+        self._refused(skill, "pointer names LICENSE.txt, discovered LICENSE")
+        (skill / "LICENSE").unlink()
+        (skill / "LICENSE.txt").unlink()
+        self._refused(skill, "pointer names LICENSE.txt, but no licence file was found")
+        skill = self._plant(None, front="license: See LICENSE.rst\n")
+        (skill / "LICENSE.rst").write_text(self.mit, encoding="utf-8")
+        self.assertEqual(skill_problems(skill), [])
+        (skill / "LICENSE.rst").write_text("Altered text.\n", encoding="utf-8")
+        self._refused(skill, "differs from MIT")
+
     def test_candidate_families(self):
         """Admit additional candidate families only when their template exists."""
         ids = ("ISC", "BSD-2-Clause", "BSD-3-Clause", "0BSD", "Zlib", "Unlicense",
@@ -775,8 +937,8 @@ class _LicenceRegressionTests(unittest.TestCase):
             ("mit-origin", "MIT", "mit licence", self.mit, None),
             ("apache-name", "Apache 2.0", "Apache-2.0", self.apache, "not recognised"),
             ("see-licence", "SEE LICENSE IN LICENSE", "MIT", self.mit, None),
-            ("see-txt", "SEE LICENSE IN LICENSE.txt", "MIT", self.mit, None),
-            ("complete-txt", "Complete terms in LICENSE.txt", "MIT", self.mit, None),
+            ("see-txt", "SEE LICENSE IN LICENSE.txt", "MIT", self.mit, "discovered LICENSE"),
+            ("complete-txt", "Complete terms in LICENSE.txt", "MIT", self.mit, "discovered LICENSE"),
             ("see-arbitrary", "SEE LICENSE ON EXAMPLE.INVALID", "MIT", self.mit, "not recognised"),
             ("list", "[MIT]", "MIT", self.mit, "type list"),
             ("integer", "4", "MIT", self.mit, "type int"),
@@ -808,13 +970,59 @@ class _LicenceRegressionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "while parsing a flow node"):
             front_matter("---\nname: [\n---\n")
 
+    def test_yaml_references_and_merge_keys(self):
+        """Refuse YAML aliases and merge keys in both checked documents."""
+        alias_bomb = "a: &a [x, x]\nb: &b [*a, *a]\nc: [*b, *b]\n"
+        left = ", ".join(f"k{i}: value" for i in range(600))
+        right = ", ".join(f"k{i}: value" for i in range(600, 1200))
+        merge = f"metadata: {{<<: [{{{left}}}, {{{right}}}]}}\n"
+        register = self.root / LICENCE_EXCEPTIONS_FILE
+        register.parent.mkdir()
+        for yaml_text, detail in ((alias_bomb, "anchors and aliases"),
+                                  ("metadata: *undefined\n", "anchors and aliases"),
+                                  (merge, "merge keys")):
+            with self.subTest(detail=detail):
+                self._refused(self._plant(self.mit, front=yaml_text), detail)
+                register.write_text(f"exceptions: []\n{yaml_text}", encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, detail):
+                    _read_licence_exceptions(self.root)
+
+    def test_yaml_event_cap(self):
+        """Refuse front matter that exceeds the parser event limit."""
+        skill = self._plant(self.mit, front="metadata: [one, two, three, four]\n")
+        with patch.object(sys.modules[__name__], "MAX_YAML_EVENTS", 10, create=True):
+            self._refused(skill, "document exceeds 10 YAML events")
+
+    def test_yaml_invalid_explicit_scalars(self):
+        """Report invalid tagged scalars and continue checking other skills."""
+        self._plant(self.mit, name="valid")
+        register = self.root / LICENCE_EXCEPTIONS_FILE
+        write_index(self.root, [{"skill": "planted"}, {"skill": "valid"}])
+        for scalar in ("!!timestamp 2026-13-45", "!!timestamp nonsense", "!!int x"):
+            with self.subTest(scalar=scalar):
+                self._plant(self.mit, front=f"metadata: {scalar}\n")
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(check(self.root), 1)
+                self.assertIn("planted/SKILL.md: front matter is not valid YAML", output.getvalue())
+                self.assertIn("skills: 2 checked, 1 problems", output.getvalue())
+                self.assertIn("verified licences: MIT=1", output.getvalue())
+        self._plant(self.mit)
+        register.write_text("exceptions: [!!timestamp 2026-13-45]\n", encoding="utf-8")
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(check(self.root), 1)
+        self.assertIn("licence-exceptions.yaml: invalid YAML", output.getvalue())
+        self.assertIn("skills: 2 checked, 1 problems", output.getvalue())
+        self.assertIn("verified licences: MIT=2", output.getvalue())
+
     def test_unsafe_yaml_tags(self):
         """Refuse Python-specific YAML tags in discovery and validation."""
         document = "---\nname: fixture\nmetadata: !!python/object:types.SimpleNamespace {}\n---\n"
         for exact_license in (False, True):
-            with self.subTest(exact_license=exact_license):
-                with self.assertRaisesRegex(ValueError, "could not determine a constructor"):
-                    front_matter(document, exact_license=exact_license)
+            with (self.subTest(exact_license=exact_license),
+                  self.assertRaisesRegex(ValueError, "could not determine a constructor")):
+                front_matter(document, exact_license=exact_license)
 
         register = self.root / LICENCE_EXCEPTIONS_FILE
         register.parent.mkdir()
@@ -881,7 +1089,8 @@ class _LicenceRegressionTests(unittest.TestCase):
         end_marker = "END OF TERMS AND CONDITIONS"
         apache_end = self.apache.index(end_marker) + len(end_marker)
         formatted_apache = self.apache.replace("http://", "https://").replace(
-            "non-exclusive", "non–exclusive").replace("1. Definitions.", "• Definitions.")
+            "non-exclusive", "non–exclusive").replace("1. Definitions.", "• 1) Definitions.")
+        formatted_apache = formatted_apache.replace("(a) You must give", "a. You must give", 1)
         cases = (
             ("apache-no-appendix", self.apache[:apache_end], "Apache-2.0"),
             ("apache-formatting", formatted_apache, "Apache-2.0"),
@@ -891,7 +1100,13 @@ class _LicenceRegressionTests(unittest.TestCase):
             ("normalisation", self.mit.lower().replace('"', "“").replace("license", "licence"), "MIT"),
             ("title-absent", self.mit.removeprefix("MIT License\n"), "MIT"),
             ("title-alias", self.mit.replace("MIT License", "The MIT License", 1), "MIT"),
+            # REUSE-IgnoreStart
             ("metadata-lines", "# SPDX-License-Identifier: MIT\n© 2026 Owner\n" + self.mit, "MIT"),
+            ("attribution-metadata", "# SPDX-FileCopyrightText: 2026 Owner\n// SPDX-FileContributor: A. Name\n"
+             "# REUSE-Copyright: 2026 Another Owner\n" + self.mit, "MIT"),
+            # REUSE-IgnoreEnd
+            ("copyright-notices", "Copyright(c) 2022, 2024 - present O’Neil & Co. <holder@example.org> "
+             "All rights reserved.\n(c) 2024 Other Owner\nCopyright GitHub, Inc.\n" + self.mit, "MIT"),
         )
         for name, body, declared in cases:
             with self.subTest(name=name):
@@ -928,11 +1143,8 @@ class _LicenceRegressionTests(unittest.TestCase):
     def _check_licence_exceptions(self, *messages, today=date(2027, 3, 23)):
         """Expect either one refusal with the given details or one accepted pin."""
         output = io.StringIO()
-        now = datetime(today.year, today.month, today.day, tzinfo=UTC)
-        with (patch.object(sys.modules[__name__], "datetime", create=True) as clock,
-              redirect_stdout(output)):
-            clock.now.return_value = now
-            result = check(self.root)
+        with redirect_stdout(output):
+            result = check(self.root, today=today)
         report = output.getvalue()
         self.assertEqual(result, int(bool(messages)), report)
         if messages:
@@ -977,6 +1189,17 @@ class _LicenceRegressionTests(unittest.TestCase):
         self._write_licence_exceptions([self._plant_licence_exception()])
         self._check_licence_exceptions(today=date(2027, 3, 24))
 
+    def test_pinned_licence_date_order(self):
+        """Reject future entry dates and expiry before entry."""
+        entry = self._plant_licence_exception() | {"category": "A", "expires": "2026-11-24"}
+        self._write_licence_exceptions([entry])
+        self._check_licence_exceptions(today=date(2026, 11, 24))
+        with self.subTest(case="entered after check date"):
+            self._check_licence_exceptions("entered", "after check date", today=date(2026, 11, 23))
+        with self.subTest(case="expires before entered"):
+            self._write_licence_exceptions([entry | {"expires": "2026-11-23"}])
+            self._check_licence_exceptions("expires", "before entered", today=date(2026, 11, 24))
+
     def test_stale_licence_exception(self):
         """Require removal when the file now matches the canonical licence."""
         entry = self._plant_licence_exception()
@@ -1005,17 +1228,18 @@ class _LicenceRegressionTests(unittest.TestCase):
             ("date", entry | {"entered": "20261124"}, "entered", "YYYY-MM-DD"),
             ("impossible-date", entry | {"entered": "2026-11-31"}, "entered", "invalid date"),
             ("category-arithmetic", entry | {"category": "B"}, "expires", "2026-11-27"),
-            ("category-overflow", entry | {"entered": "9999-12-31"}, "entered", "leaves no expiry date"),
             ("hash-shape", entry | {"sha256": "A" * 64}, "sha256", "64 lowercase hexadecimal"),
         )
         for name, invalid, key, detail in cases:
             with self.subTest(case=name):
                 self._write_licence_exceptions([invalid])
                 self._check_licence_exceptions("licence-exceptions.yaml", "entry 1", key, detail)
+        self._write_licence_exceptions([entry | {"entered": "9999-12-31", "expires": "9999-12-31"}])
+        self._check_licence_exceptions("licence-exceptions.yaml", "leaves no expiry date", today=date.max)
 
     def test_licence_exception_invalid_structure(self):
         """Reject a malformed register, document or entry with one diagnostic."""
-        self._plant_licence_exception()
+        self._plant_licence_exception(self.mit)
         register = self._write_licence_exceptions([])
         cases = (
             ("exceptions: [", "invalid YAML"),

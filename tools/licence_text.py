@@ -4,21 +4,47 @@
 
 import re
 import stat
-from itertools import zip_longest
+from itertools import islice, zip_longest
 from pathlib import Path
 
 MAX_LICENCE_BYTES = 256 * 1024
+MAX_HOLDER_TOKENS = 12
 APACHE_END = "end of terms and conditions"
 PUNCTUATION = str.maketrans({
     c: '"' for c in "\"'‘’“”„‟«»‹›`"
 } | dict.fromkeys("‐‑‒–—―−", "-"))
-BULLET = re.compile(r"^(?:[-*•◦▪]|[0-9]+(?:\.[0-9]+)*[.)]|\((?:[a-z]|[0-9]+)\)|[a-z][.)])\s+")
+BULLET = re.compile(r"^[-*•◦▪]\s+")
+_LABEL = r"[a-z]|[0-9]+(?:\.[0-9]+)*"
+CLAUSE_LABEL = re.compile(rf"(?<!\S)(?:\(({_LABEL})\)|({_LABEL})[.)])(?=\s|$)")
+_COMMENT = r"(?:(?P<comment><!--|/\*|//|--|[#;*])\s*)?"
 METADATA = re.compile(
-    r"^(?:(?:[#;*]|//)\s*)?(?:"
-    r"copyright\s+(?=\(c\)|©|[0-9<\[])|©\s*|\(c\)\s+(?=[0-9<\[])"
-    r"|(?:spdx-(?:filecopyrighttext|license-identifier|filecontributor)|reuse-(?:copyright|license)):"
-    r")"
+    rf"^{_COMMENT}(?P<kind>spdx-(?:filecopyrighttext|license-identifier|filecontributor)"
+    r"|reuse-(?:copyright|license)):\s*(?P<value>.*)$",
+    re.IGNORECASE,
 )
+_IDENTIFIER_METADATA = frozenset({"spdx-license-identifier", "reuse-license"})
+_COMMENT_END = {"/*": "*/", "<!--": "-->"}
+COPYRIGHT = re.compile(
+    rf"^{_COMMENT}(?:copyright(?: *(?:\(c\)|©)|(?= ))|\(c\)|©) *(?P<notice>.+)$",
+    re.IGNORECASE,
+)
+_YEAR_RANGE = r"[0-9]{4}(?: *- *(?:[0-9]{4}|present))?"
+_YEAR_LIST = rf"{_YEAR_RANGE}(?: *, *{_YEAR_RANGE})*"
+COPYRIGHT_YEARS = re.compile(rf"^(?:{_YEAR_LIST}|\[{_YEAR_LIST}\]|<year>|\[yyyy\])(?= |$) *", re.IGNORECASE)
+_HOLDER_WORD = r"\w+(?:[-.'\"&+]\w+)*[.+]?,?"
+_HOLDER_NAME_TOKEN = re.compile(_HOLDER_WORD)
+_HOLDER_EMAIL = re.compile(r"<[^<>\s@]+@[^<>\s@]+>")
+_HOLDER_BRACKETS = re.compile(r"\[(?P<square>[^\[\]<>]+)\]|<(?P<angle>[^\[\]<>]+)>")
+_HOLDER_PLACEHOLDER = re.compile(rf"\[{_HOLDER_WORD}\]|<{_HOLDER_WORD}>")
+_HOLDER_PLACEHOLDERS = frozenset({"[name of copyright owner]", "<copyright holder>", "<copyright holders>"})
+_HOLDER_CONNECTORS = frozenset({
+    "and", "of", "the", "et", "al.", "de", "van", "von", "der", "da", "contributors", "authors", "affiliates", "its",
+    "developers", "team",
+    # Exact lowercase handles present in vendored licence notices.
+    "agenttrace", "alfredtech2026", "avelikiy", "awesome-skills", "ch040602", "hyhmrright", "optim-agent",
+    "thecsdoctor", "tubeagentkit", "wolfejam", "xiehuan123", "zhuli",
+})
+_RIGHTS_RESERVED = re.compile(r"(?:^| )all rights reserved\.$", re.IGNORECASE)
 TITLE = re.compile(
     r"(?:[a-z0-9-]+(?: [a-z0-9-]+){0,7} license(?: (?:v\.? )?\d+(?:\.\d+)*)?"
     r"|mit no attribution|creative commons legal code|cc0 1\.0 universal|the unlicense)"
@@ -52,24 +78,78 @@ def read_utf8(path: Path, limit: int, *, refuse_links: bool = False) -> str:
         raise ValueError(f"{path.name} has invalid UTF-8 at byte {exc.start}") from exc
 
 
-def _normalised_lines(text: str) -> list[str]:
-    """Normalise presentation and remove standalone copyright and SPDX/REUSE notices."""
+def _copyright_notice(line: str, *, leading: bool = False) -> bool:
+    """Recognise a complete attribution line with a bounded holder name."""
+    match = COPYRIGHT.fullmatch(line)
+    if match is None:
+        return False
+    notice = match["notice"].removesuffix(_COMMENT_END.get(match["comment"], "")).rstrip()
+    years = COPYRIGHT_YEARS.match(notice)
+    if years is None and not leading:
+        return False
+    holder = _RIGHTS_RESERVED.sub("", notice[years.end():] if years else notice)
+    return _copyright_holder(holder)
+
+
+def _copyright_holder(holder: str) -> bool:
+    """Accept a bounded name or a standard placeholder using original-case tokens."""
+    bracketed = holder.removesuffix(".")
+    if bracketed.lower() in _HOLDER_PLACEHOLDERS:
+        return True
+    brackets = _HOLDER_BRACKETS.fullmatch(bracketed)
+    if brackets and " " in holder:
+        holder = brackets["square"] or brackets["angle"]
+    tokens = holder.split(" ", MAX_HOLDER_TOKENS)
+    return len(tokens) <= MAX_HOLDER_TOKENS and all(_holder_token(token) for token in tokens)
+
+
+def _holder_token(token: str) -> bool:
+    """Recognise an explicit connector, placeholder, email or name token."""
+    bracketed = token.removesuffix(".")
+    if token in {"&", "+", ","} or _HOLDER_EMAIL.fullmatch(bracketed) or _HOLDER_PLACEHOLDER.fullmatch(bracketed):
+        return True
+    if token.startswith("(") and token.endswith(")"):
+        token = token[1:-1]
+    if not _HOLDER_NAME_TOKEN.fullmatch(token):
+        return False
+    word = token.removesuffix(",")
+    return (word[0].isupper() or word[0].isdecimal()
+            or word in _HOLDER_CONNECTORS or word.removesuffix(".") in _HOLDER_CONNECTORS)
+
+
+def _validate_metadata(match: re.Match[str], spdx: str) -> None:
+    """Require standalone identifier metadata to agree with the declared SPDX ID."""
+    if match["kind"].casefold() in _IDENTIFIER_METADATA:
+        found = match["value"].removesuffix(_COMMENT_END.get(match["comment"], "")).strip()
+        if found.casefold() != spdx.casefold():
+            raise ValueError(f"LICENSE metadata names {found or '<empty>'}; declared {spdx}")
+
+
+def _normalised_lines(text: str, spdx: str) -> list[str]:
+    """Normalise line layout and remove standalone notices while retaining case."""
     lines = []
-    for raw in text.splitlines():
-        flat = " ".join(raw.lower().translate(PUNCTUATION).split())
-        flat = re.sub(r"\b((?:sub)?licen)c(e[s]?)\b", r"\1s\2", flat).replace("https://", "http://")
-        if flat and not METADATA.match(flat):
+    for raw in islice(text.splitlines(), MAX_LICENCE_BYTES):
+        if metadata := METADATA.fullmatch(raw.strip()):
+            _validate_metadata(metadata, spdx)
+            continue
+        flat = " ".join(raw.translate(PUNCTUATION).split())
+        if flat and not _copyright_notice(flat):
             lines.append(BULLET.sub("", flat))
     return lines
+
+
+def _comparison_text(text: str) -> str:
+    """Normalise case, licence spelling and URL schemes for text comparison."""
+    return re.sub(r"\b((?:sub)?licen)c(e[s]?)\b", r"\1s\2", text.lower()).replace("https://", "http://")
 
 
 def _title_lines(lines: list[str], spdx: str) -> list[str]:
     """Read only title-shaped lines in the leading block of the canonical text."""
     titles = []
-    for line in lines[:4]:
-        if line == spdx.lower() or TITLE.fullmatch(line):
-            titles.append(line)
-        elif spdx == "Apache-2.0" and titles and APACHE_TITLE_CONTINUATION.fullmatch(line):
+    for raw in lines[:4]:
+        line = _comparison_text(raw)
+        if (line == spdx.lower() or TITLE.fullmatch(line)
+                or (spdx == "Apache-2.0" and titles and APACHE_TITLE_CONTINUATION.fullmatch(line))):
             titles.append(line)
         else:
             break
@@ -79,11 +159,13 @@ def _title_lines(lines: list[str], spdx: str) -> list[str]:
 def _body(lines: list[str], titles: list[str], spdx: str) -> str:
     """Remove optional leading titles and undated copyright notices."""
     identifier = spdx.lower()
-    for index, line in enumerate(lines):
+    for index, raw in enumerate(islice(lines, MAX_LICENCE_BYTES)):
+        line = _comparison_text(raw)
         title_id = line.removeprefix("the ").removesuffix(" license")
-        if line in titles or title_id == identifier or line.startswith("copyright "):
+        if line in titles or title_id == identifier or _copyright_notice(raw, leading=True):
             continue
-        return " ".join(lines[index:])
+        body = _comparison_text(" ".join(lines[index:]))
+        return CLAUSE_LABEL.sub(lambda match: f"({match[1] or match[2]})", body)
     return ""
 
 
@@ -109,12 +191,12 @@ def verify_licence(path: Path, template_dir: Path, spdx: str) -> None:
         template = read_utf8(template_dir / f"{spdx}.txt", MAX_LICENCE_BYTES, refuse_links=True)
     except FileNotFoundError as exc:
         raise ValueError(f"LICENSES/{spdx}.txt missing; run reuse download {spdx}") from exc
-    template_lines = _normalised_lines(template)
+    template_lines = _normalised_lines(template, spdx)
     titles = _title_lines(template_lines, spdx)
     expected = _body(template_lines, titles, spdx)
     if not expected:
         raise ValueError(f"LICENSES/{spdx}.txt has no licence body")
-    actual = _body(_normalised_lines(text), titles, spdx).split()
+    actual = _body(_normalised_lines(text, spdx), titles, spdx).split()
     mismatch = _first_difference(actual, expected.split())
     if mismatch is None:
         return

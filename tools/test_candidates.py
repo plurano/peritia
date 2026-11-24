@@ -77,6 +77,16 @@ def write_skill(
 
 
 class CandidatesTests(unittest.TestCase):
+    def test_only_supported_spdx_ids_have_licence_classes(self) -> None:
+        """Keep unsupported SPDX identifiers outside the candidate classes."""
+        for spdx in ("LGPL-NONSENSE", "GPL-NONSENSE", "MIT-only", "Apache-2.0-or-later"):
+            with self.subTest(spdx=spdx):
+                self.assertEqual(candidates.licence_class(spdx), "other")
+                self.assertEqual(candidates.normalise_licence(spdx), (spdx, spdx, False))
+                self.assertIsNone(candidates.licence_policy.candidate_licence_id(spdx))
+        self.assertEqual(candidates.normalise_licence("lgpl-2.0-OR-LATER"), ("LGPL-2.0-or-later", "LGPL-2.0", True))
+        self.assertEqual(candidates.licence_class("LGPL-2.0-or-later"), "weak")
+
     def test_licence_path_folder(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             folder = Path(tmp)
@@ -122,6 +132,7 @@ class CandidatesTests(unittest.TestCase):
             self.assertEqual(reader.calls, ["orig/lib"])
 
     def test_licence_path_repository_non_aggregator(self) -> None:
+        """Use repository evidence to accept or refuse each licence family."""
         with tempfile.TemporaryDirectory() as tmp:
             folder = Path(tmp)
             checkouts = folder / "checkouts"
@@ -131,7 +142,7 @@ class CandidatesTests(unittest.TestCase):
             cases = (
                 ("0BSD", "permissive", "candidate", ""),
                 ("LGPL-3.0-only", "weak", "candidate", ""),
-                ("LGPL-3.0?", "weak", "refused", "licence:LGPL-3.0? evidence:repository"),
+                ("LGPL-3.0?", "other", "refused", "licence:LGPL-3.0? evidence:repository"),
             )
             for spdx, licence_class, verdict, reason in cases:
                 with self.subTest(spdx=spdx):

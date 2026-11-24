@@ -182,6 +182,8 @@ Upstream text keeps its own licence, recorded per file in `REUSE.toml` and
 shipped beside the skill as `LICENSE`. The repository follows the
 [REUSE](https://reuse.software) specification.
 
+Peritia supplies the canonical Apache-2.0 text in [`skills/carrier-relationship-management/LICENSE`](skills/carrier-relationship-management/LICENSE). The pinned upstream skill folder contains only `SKILL.md`, which declares Apache-2.0, and the upstream repository root carries MIT. [CREDITS.md](CREDITS.md) records both licences for the source.
+
 <!-- praetor:readme-governance:start -->
 [![HISS Adopted][praetor-hiss-badge]][praetor-hiss-agents]
 [![Documentation Governance][praetor-docs-badge]][praetor-docs-runs]

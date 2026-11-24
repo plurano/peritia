@@ -21,7 +21,7 @@ import check_skills
 REPO = Path(__file__).resolve().parent.parent
 MD = '---\nname: {name}\ndescription: Use when testing adoption.\n---\n\n# Example\n\nCheck the result.\n'
 LICENCE = (REPO / 'LICENSES/MIT.txt').read_text(encoding='utf-8').replace(
-    'Copyright (c) <year> <copyright holders>', 'Copyright (c) 2025 owner',
+    'Copyright (c) <year> <copyright holders>', 'Copyright (c) 2025 Owner',
 )
 MIT_ZERO_LICENCE = (REPO / 'LICENSES/MIT-0.txt').read_text(encoding='utf-8')
 CANDIDATE_FIELDS = ['source', 'path', 'skill_name', 'verdict', 'licence', 'licence_evidence', 'functions']
@@ -53,15 +53,17 @@ class DefaultDownloadRunnerTests(unittest.TestCase):
         command.assert_called_once_with(args, cwd=cwd, timeout=adopt.TIMEOUT)
 
     def test_failure_names_licence_and_includes_stderr(self):
+        """Report the requested licence and the downloader's failure detail."""
         error = adopt.Refused('command: reuse: network error')
-        with patch.object(adopt, 'command', side_effect=error):
-            with self.assertRaisesRegex(ValueError, '^licence download failed for MIT-0: network error$'):
-                adopt.default_download_runner(['reuse', 'download', 'MIT-0'])
+        with (patch.object(adopt, 'command', side_effect=error),
+              self.assertRaisesRegex(ValueError, '^licence download failed for MIT-0: network error$')):
+            adopt.default_download_runner(['reuse', 'download', 'MIT-0'])
 
     def test_empty_args_name_unknown_licence(self):
-        with patch.object(adopt, 'command') as command:
-            with self.assertRaisesRegex(ValueError, '^licence download failed for unknown$'):
-                adopt.default_download_runner([])
+        """Reject a download request with no licence argument."""
+        with (patch.object(adopt, 'command') as command,
+              self.assertRaisesRegex(ValueError, '^licence download failed for unknown$')):
+            adopt.default_download_runner([])
         command.assert_not_called()
 
 
@@ -154,6 +156,7 @@ class AdoptionTests(unittest.TestCase):
                          include_grouped=include_grouped, cache=cache, sources=sources)
 
     def test_folder_licence_origin_reuse_and_checker(self):
+        """Verify the copied licence and the generated REUSE entry."""
         self.fixture(extra={'pack/demo/scripts/helper.py': 'print("example")\n'})
         checkout = self.checkouts / 'owner__repo'
         self.assertFalse((checkout / 'pack/demo/scripts/helper.py').exists())
@@ -499,23 +502,63 @@ class AdoptionTests(unittest.TestCase):
         self.assertEqual((self.root / 'LICENSES/MIT-0.txt').read_text(encoding='utf-8'), MIT_ZERO_LICENCE)
         self.assertEqual(check_skills.check(self.root), 0)
 
-    def test_failed_licence_download_fails_run(self):
-        """Leave the target tree alone when a required template cannot be downloaded."""
-        files = {'pack/demo/SKILL.md': MD.format(name='demo'), 'pack/demo/LICENSE': MIT_ZERO_LICENCE}
+    def test_bad_licence_templates_refuse_rows_and_continue(self):
+        """Reject unavailable or unsupported templates and publish the eligible row."""
+        licences = {'unavailable': ('MIT-0', MIT_ZERO_LICENCE), 'unsupported': ('LGPL-NONSENSE', LICENCE),
+                    'good': ('MIT', LICENCE)}
+        files = {f'pack/{name}/{file}': text for name, (_, body) in licences.items()
+                 for file, text in [('SKILL.md', MD.format(name=name)), ('LICENSE', body)]}
         pin = self.source(files)
-        row = dict(source='owner/repo', path='pack/demo/SKILL.md', skill_name='demo',
-                   verdict='candidate', licence='MIT-0', licence_evidence='folder', functions='testing')
-        self.candidates.append(row)
-        self.census.append({'source': 'owner/repo', 'path': 'pack/demo/SKILL.md', 'pin': pin})
+        for name, (spdx, _) in licences.items():
+            self.candidate(name=name, folder=f'pack/{name}', pin=pin)['licence'] = spdx
+        downloads = []
 
         def failing_runner(cmd, *, cwd=None):
+            """Record the requested licence and simulate a download failure."""
+            downloads.append(cmd[-1])
             raise OSError('network error')
 
-        with self.assertRaises(ValueError) as ctx:
-            self.invoke(apply=True, runner=failing_runner)
-        self.assertIn('MIT-0', str(ctx.exception))
-        self.assertFalse((self.root / 'skills/demo').exists())
+        rows, _ = self.invoke(apply=True, runner=failing_runner)
+        self.assertEqual([row['verdict'] for row in rows], ['refused', 'refused', 'adopted'], rows)
+        self.assertIn('licence download failed for MIT-0: network error', rows[0]['reason'])
+        self.assertIn('licence LGPL-NONSENSE not recognised', rows[1]['reason'])
+        self.assertEqual(downloads, ['MIT-0'])
+        self.assertEqual(sorted(path.name for path in (self.root / 'skills').iterdir()), ['INDEX.tsv', 'good'])
         self.assertFalse((self.root / 'LICENSES/MIT-0.txt').exists())
+
+    def test_staged_licence_requires_exact_reviewed_pin(self):
+        """Require the staged licence bytes to match the reviewed exception."""
+        body = LICENCE + '\nReviewed upstream note.\n'
+        self.fixture(extra={'pack/demo/LICENSE': body})
+        rows, _ = self.invoke(apply=False)
+        self.assertEqual(rows[0]['verdict'], 'refused', rows)
+        self.assertIn('LICENSE differs from MIT', rows[0]['reason'])
+        (self.root / 'skills').mkdir()
+        register = self.root / 'skills/licence-exceptions.yaml'
+        for exact in (False, True):
+            with self.subTest(exact=exact):
+                digest = hashlib.sha256(body.encode()).hexdigest() if exact else '0' * 64
+                register.write_text(
+                    'exceptions:\n  - rule: skill-licence-text\n    path: skills/demo/LICENSE\n'
+                    f'    spdx: MIT\n    sha256: "{digest}"\n    reason: Reviewed upstream note.\n'
+                    '    category: A\n    entered: "2000-01-01"\n    expires: "9999-12-31"\n', encoding='utf-8',
+                )
+                rows, _ = self.invoke(apply=exact)
+                self.assertEqual(rows[0]['verdict'], 'adopted' if exact else 'refused', rows)
+                if not exact:
+                    self.assertIn('hash mismatch', rows[0]['reason'])
+        self.assertEqual((self.root / 'skills/demo/LICENSE').read_bytes(), body.encode())
+        self.assertEqual(check_skills.check(self.root), 0)
+
+    def test_adoption_keeps_the_discovered_licence_named_by_front_matter(self):
+        """Preserve the discovered filename referenced from front matter."""
+        markdown = MD.format(name='demo').replace('\n---\n', '\nlicense: See LICENSE.rst\n---\n', 1)
+        pin = self.source({'pack/demo/SKILL.md': markdown, 'pack/demo/LICENSE.rst': LICENCE})
+        self.candidate(pin=pin)
+        rows, _ = self.invoke()
+        self.assertEqual(rows[0]['verdict'], 'adopted', rows)
+        self.assertEqual((self.root / 'skills/demo/LICENSE.rst').read_text(), LICENCE)
+        self.assertEqual(check_skills.check(self.root), 0)
 
     def test_report_path_written_and_root_refused(self):
         self.fixture()
@@ -763,9 +806,8 @@ class AdoptionTests(unittest.TestCase):
         if not node_bin:
             self.fail('node executable not found on PATH')
         for bad in (str(outside), '../outside.md', 'link.md'):
-            with self.subTest(input=bad):
-                with self.assertRaisesRegex(adopt.Refused, 'refusing Markdown input'):
-                    adopt.command([node_bin, str(script), bad], cwd=folder)
+            with self.subTest(input=bad), self.assertRaisesRegex(adopt.Refused, 'refusing Markdown input'):
+                adopt.command([node_bin, str(script), bad], cwd=folder)
         self.assertEqual(outside.read_text(encoding='utf-8'), '# Outside\n')
 
     def test_whitespace_arbiter_omits_a_file_the_normalizer_changes_beyond_whitespace(self):
