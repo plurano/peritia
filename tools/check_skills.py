@@ -88,6 +88,7 @@ FETCH = re.compile(r"\b(?:pip install|uv pip install|uvx |npx |npm install|pnpm 
 
 def fields(text):
     """Read the scalar provenance fields in ORIGIN.md."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
     values = {}
     for match in islice(FIELD.finditer(text), MAX_ORIGIN_BYTES):
         key = match["key"]
@@ -103,6 +104,10 @@ class _YamlReadError(ValueError):
 
 class _YamlMappingError(ValueError):
     """A strict YAML mapping failed key validation."""
+
+
+class _YamlStructureError(ValueError):
+    """YAML events violated the supported document structure or limits."""
 
 
 class _UniqueKeyLoader(yaml.SafeLoader):
@@ -135,13 +140,17 @@ def _check_yaml_events(text: str, loader: type[yaml.SafeLoader]) -> None:
     with closing(yaml.parse(text, Loader=loader)) as events:
         for count, event in enumerate(islice(events, MAX_YAML_EVENTS + 1), 1):
             if count > MAX_YAML_EVENTS:
-                raise ValueError(f"document exceeds {MAX_YAML_EVENTS} YAML events")
+                raise _YamlStructureError(
+                    f"document exceeds {MAX_YAML_EVENTS} YAML events"
+                )
             if isinstance(event, yaml.AliasEvent):
-                raise ValueError("YAML aliases are not allowed")
+                raise _YamlStructureError("YAML aliases are not allowed")
             if isinstance(event, yaml.CollectionStartEvent):
                 depth += 1
                 if depth > MAX_YAML_DEPTH:
-                    raise ValueError(f"YAML nesting depth exceeds {MAX_YAML_DEPTH}")
+                    raise _YamlStructureError(
+                        f"YAML nesting depth exceeds {MAX_YAML_DEPTH}"
+                    )
             elif isinstance(event, yaml.CollectionEndEvent):
                 depth -= 1
 
@@ -310,7 +319,7 @@ def _read_licence_exceptions(root: Path, today: date | None = None) -> dict[str,
 def _licence_notice_entry(raw: object, index: int) -> str:
     """Require one canonical, bounded notice string."""
     if not isinstance(raw, str):
-        raise ValueError(f"notice {index}: expected a string")
+        raise TypeError(f"notice {index}: expected a string")
     if len(raw) > MAX_LICENCE_NOTICE_CHARS:
         raise ValueError(f"notice {index}: expected at most {MAX_LICENCE_NOTICE_CHARS} characters")
     if raw != " ".join(raw.split()) or not is_licence_notice(raw):
@@ -321,7 +330,7 @@ def _licence_notice_entry(raw: object, index: int) -> str:
 def validate_licence_notices(entries: object) -> frozenset[str]:
     """Validate loaded or staged notice lines before comparison or publication."""
     if not isinstance(entries, list):
-        raise ValueError("notices: expected a list")
+        raise TypeError("notices: expected a list")
     if len(entries) > MAX_LICENCE_NOTICES:
         raise ValueError(f"notices: expected at most {MAX_LICENCE_NOTICES} entries, found {len(entries)}")
     notices = set()
@@ -347,7 +356,7 @@ def read_licence_notices(root: Path) -> frozenset[str]:
         return validate_licence_notices(data["notices"])
     except FileNotFoundError:
         return frozenset()
-    except ValueError as exc:
+    except (TypeError, ValueError) as exc:
         raise ValueError(f"{LICENCE_NOTICES_FILE}: {exc}") from exc
 
 
@@ -380,10 +389,16 @@ def _load_front_matter(text: str, loader: type[yaml.SafeLoader]) -> dict:
     return data
 
 
-def front_matter(text: str, *, exact_license: bool = False) -> dict[str, str]:
-    """Project up to 100 YAML fields to strings for upstream discovery."""
+def front_matter(
+    text: str, *, exact_license: bool = False, require_string_licence: bool = False,
+) -> dict[str, str]:
+    """Project up to 100 YAML fields, optionally requiring string licence values."""
     loader = _UniqueKeyLoader if exact_license else yaml.SafeLoader
     data = _load_front_matter(text, loader)
+    if require_string_licence:
+        for field in ("license", "licence"):
+            if field in data and not isinstance(data[field], str):
+                raise TypeError(f"{field} must be a string")
     meta: dict[str, str] = {}
     for i, (k, v) in enumerate(data.items()):
         if i >= 100:
@@ -979,15 +994,40 @@ class _LicenceRegressionTests(unittest.TestCase):
 
     def test_non_notice_prefixes_remain_in_body(self):
         """Compare text whose prefix differs in case or spacing."""
-        for line in ("copyright 2024 Acme", "Copyright(c) 2024 Acme", "# Copyright 2024 Acme"):
+        for line in (
+            "copyright 2024 Acme", "Copyright(c) 2024 Acme", "# Copyright 2024 Acme",
+            "(c) Acme", "(C) Acme",
+        ):
             with self.subTest(line=line):
                 self._refused(self._plant(f"{line}\n{self.mit}"), "LICENSE differs from MIT at word offset")
+
+    def test_lettered_clause_lines_are_required(self):
+        """Compare each clause's first physical line in non-Apache templates."""
+        for label in ("(c)", "(C)"):
+            with self.subTest(label=label):
+                spdx = "MPL-2.0"
+                clause = f"{label} under Patents to make, use, sell, offer for sale,"
+                rest = "import and otherwise transfer the Contribution.\n"
+                body = f"Mozilla Public License\nPatent grant.\n{clause}\n{rest}"
+                (self.templates / f"{spdx}.txt").write_text(body, encoding="utf-8")
+                self.assertEqual(skill_problems(self._plant(body, spdx)), [])
+                self._refused(self._plant(body.replace(f"{clause}\n", ""), spdx),
+                              "LICENSE differs from MPL-2.0 at word offset")
+
+    def test_copyright_symbol_without_space_requires_review(self):
+        """Require exact review of a compact copyright notice."""
+        line = "©2026 Owner"
+        skill = self._plant(f"{line}\n{self.mit}")
+        self._refused(skill, f"unreviewed copyright notice {line!r}")
+        self._write_licence_notices([line])
+        self.assertEqual(read_licence_notices(self.root), {line})
+        self.assertEqual(skill_problems(skill), [])
 
     def test_reviewed_notices_verify_exactly(self):
         """Accept every seeded line and each supported prefix after whitespace collapse."""
         repo = Path(__file__).resolve().parent.parent
         seeded = yaml.safe_load((repo / "skills/licence-notices.yaml").read_text(encoding="utf-8"))["notices"]
-        notices = sorted({*seeded, "(C) Acme", "(c) Acme", "© 2026 Owner"})
+        notices = sorted({*seeded, "© 2026 Owner"})
         self._write_licence_notices(notices)
         for line in notices:
             with self.subTest(line=line):
@@ -1016,12 +1056,27 @@ class _LicenceRegressionTests(unittest.TestCase):
             (["Copyright Z", "Copyright A"], "must be sorted"),
             ([longest + "X"], "at most 200 characters"),
             (["copyright Acme"], "expected a copyright notice"),
-            ([42], "expected a string"),
+            (["(c) Acme"], "notice 1: expected a copyright notice"),
+            (["(C) Acme"], "notice 1: expected a copyright notice"),
         ):
             with self.subTest(message=message):
                 self._write_licence_notices(entries)
                 with self.assertRaisesRegex(ValueError, f"skills/licence-notices.yaml: .*{message}"):
                     read_licence_notices(self.root)
+
+    def test_licence_notice_type_errors_are_reported(self):
+        """Keep type errors distinct while retaining the register diagnostic."""
+        for entries, message in (
+            ([42], "notice 1: expected a string"), (42, "notices: expected a list"),
+        ):
+            with self.subTest(message=message):
+                self._write_licence_notices(entries)
+                with self.assertRaisesRegex(
+                    ValueError, f"skills/licence-notices.yaml: {message}",
+                ):
+                    read_licence_notices(self.root)
+                with self.assertRaisesRegex(TypeError, message):
+                    validate_licence_notices(entries)
 
     def test_wrapped_apache_clause_c_remains_in_body(self):
         """Accept reflow of section 4(c) and require its substantive terms."""
@@ -1029,6 +1084,12 @@ class _LicenceRegressionTests(unittest.TestCase):
         wrapped = self.apache.replace(phrase, "any Derivative Works\n          that You distribute", 1)
         self.assertNotEqual(wrapped, self.apache)
         self.assertEqual(skill_problems(self._plant(wrapped, "Apache-2.0")), [])
+        three_lines = wrapped.replace(
+            "that You distribute, all copyright",
+            "that You\n          distribute, all copyright", 1,
+        )
+        self.assertNotEqual(three_lines, wrapped)
+        self.assertEqual(skill_problems(self._plant(three_lines, "Apache-2.0")), [])
         changed = wrapped.replace("that You distribute, all copyright", "that You distribute, some copyright", 1)
         self._refused(self._plant(changed, "Apache-2.0"), "LICENSE differs from Apache-2.0")
         omitted = "\n".join(line for line in self.apache.splitlines() if not line.lstrip().startswith("(c) "))
@@ -1102,6 +1163,26 @@ class _LicenceRegressionTests(unittest.TestCase):
             with self.subTest(key=key, value=value):
                 origin.write_text(f"{key}: {value}\n{single}", encoding="utf-8")
                 self._refused(skill, f"ORIGIN.md: duplicate provenance key {key!r}")
+
+    def test_origin_line_endings(self):
+        """Read every provenance field in LF, CRLF and lone-CR files."""
+        skill = self._plant(self.mit)
+        origin = skill / "ORIGIN.md"
+        single = origin.read_bytes()
+        expected = {
+            "upstream": "https://github.com/o/r", "path": "skills/x",
+            "commit": "a" * 40,
+            "licence": "MIT", "changes": "register rewritten",
+        }
+        for ending in (b"\n", b"\r\n", b"\r"):
+            with self.subTest(ending=ending):
+                origin.write_bytes(single.replace(b"\n", ending))
+                self.assertEqual(fields(read_utf8(origin, MAX_ORIGIN_BYTES)), expected)
+                self.assertEqual(skill_problems(skill), [])
+        for value in (b"MIT", b"Apache-2.0"):
+            with self.subTest(value=value):
+                origin.write_bytes(b"licence: " + value + b"\r\n" + single)
+                self._refused(skill, "ORIGIN.md: duplicate provenance key 'licence'")
 
     def test_front_matter(self):
         """Accept shared ID forms and exact file pointers, reject other values."""

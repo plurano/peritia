@@ -22,8 +22,9 @@ import tempfile
 import tomllib
 import urllib.parse
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from itertools import islice
 from pathlib import Path, PurePosixPath
 
 import census
@@ -47,7 +48,11 @@ from licence_policy import (
     LICENSE_BASENAME_PATTERN,
     candidate_licence_id,
 )
-from licence_text import LICENCE_NOTICES_FILE, unreviewed_licence_notices
+from licence_text import (
+    LICENCE_NOTICES_FILE,
+    MAX_LICENCE_BYTES,
+    unreviewed_licence_notices,
+)
 from overlap import Item, git_blob_id, load_cache
 
 MAX_FILES = 200
@@ -57,6 +62,9 @@ TIMEOUT = 60
 REPORT_FIELDS = ['candidate', 'verdict', 'directory', 'reason']
 INDEX_FIELDS = ['skill', 'source', 'functions', 'domains', 'overlap_group']
 INDEX_HEADER = '\t'.join(INDEX_FIELDS)
+PUBLICATION_OUTPUTS = (
+    'LICENSES', 'REUSE.toml', 'CREDITS.md', 'skills/INDEX.tsv', LICENCE_NOTICES_FILE,
+)
 REPOSITORY = re.compile(r'[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9][A-Za-z0-9._-]*\Z')
 NAME = re.compile(r'[a-z0-9][a-z0-9-]*\Z')
 MARKDOWN_EXTENSIONS = ('.md', '.markdown', '.mdx')
@@ -1042,7 +1050,7 @@ def _staged_notice_scan(
     if new:
         try:
             staged_scan.notices = check_skills.validate_licence_notices(sorted(scan.notices | new))
-        except ValueError as error:
+        except (TypeError, ValueError) as error:
             raise Refused(f'{LICENCE_NOTICES_FILE}: {error}') from error
     return staged_scan, new
 
@@ -1157,17 +1165,28 @@ class Publication:
     group_map: dict[str, str]
     runner: Callable
     template_cache: Path
-    notices: frozenset[str] | None = None
+    notice_register: bytes | None = None
+
+
+def _render_notice_register(notices: frozenset[str]) -> bytes:
+    """Serialize a notice register within the checker's UTF-8 byte limit."""
+    data = check_skills.licence_notices_yaml(notices).encode('utf-8')
+    if len(data) > MAX_LICENCE_BYTES:
+        raise ValueError(
+            f'{LICENCE_NOTICES_FILE}: serialized size {len(data)} bytes '
+            f'exceeds {MAX_LICENCE_BYTES} bytes'
+        )
+    return data
 
 
 def publish(root, rows, publication: Publication):
     """Publish verified skills and their metadata after installing their licence templates."""
     # All gates have completed before publishing any skill. Never overwrite a skill.
     sync_licences(root, publication.reuse, runner=publication.runner, template_cache=publication.template_cache)
-    if publication.notices is not None:
+    if publication.notice_register is not None:
         register = root / LICENCE_NOTICES_FILE
         register.parent.mkdir(parents=True, exist_ok=True)
-        register.write_text(check_skills.licence_notices_yaml(publication.notices), encoding='utf-8')
+        register.write_bytes(publication.notice_register)
     for row in rows[:MAX_ROWS]:
         if row['verdict'] == 'adopted':
             shutil.copytree(publication.saved / Path(row['directory']).name, root / row['directory'])
@@ -1192,12 +1211,25 @@ def resolve_report_path(report: Path | None, root: Path) -> Path | None:
 
 
 def _validate_outputs(root: Path, report_file: Path | None) -> None:
-    """Refuse output symlinks before evaluating a batch."""
+    """Refuse output symlinks and fixed report collisions before staging."""
     for name in ('skills', 'REUSE.toml', 'CREDITS.md', LICENCE_NOTICES_FILE):
         if (root / name).is_symlink():
             raise ValueError(f'{name}: output symlink refused')
     if report_file is not None and report_file.is_symlink():
         raise ValueError('report output symlink refused')
+    _validate_report_overlap(root, report_file, PUBLICATION_OUTPUTS)
+
+
+def _validate_report_overlap(
+    root: Path, report_file: Path | None, outputs: Iterable[str],
+) -> None:
+    """Reject report files that would occupy or obstruct publication paths."""
+    if report_file is None:
+        return
+    for name in islice(outputs, check_skills.MAX_SKILLS):
+        output = (root / name).resolve()
+        if report_file.is_relative_to(output) or output.is_relative_to(report_file):
+            raise ValueError(f'report path overlaps publication output: {name}')
 
 
 def _evaluate_candidates(selected, stage: StageInputs, evaluation: EvaluationInputs, saved, metadata):
@@ -1249,9 +1281,17 @@ def run(candidates, groups, census, checkouts, root=Path('.'), *, apply=False,
         template_cache = Path(tmp) / 'templates'
         stage = StageInputs(checkouts, root, occupied, apply, reader, template_cache, runner, licence_scan)
         rows, adopted_map, reuse, credits_text = _evaluate_candidates(selected, stage, evaluation, saved, metadata)
+        skill_outputs = (f'skills/{name}' for name in adopted_map)
+        _validate_report_overlap(root, report_file, skill_outputs)
+        updated = licence_scan.notices
+        register = (
+            _render_notice_register(updated) if updated != existing_notices else None
+        )
         if apply:
-            notices = licence_scan.notices if licence_scan.notices != existing_notices else None
-            publication = Publication(saved, reuse, credits_text, adopted_map, group_map, runner, template_cache, notices)
+            publication = Publication(
+                saved, reuse, credits_text, adopted_map, group_map, runner,
+                template_cache, register,
+            )
             publish(root, rows, publication)
     if report_file is not None:
         report_file.parent.mkdir(parents=True, exist_ok=True)

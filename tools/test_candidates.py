@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 
 import candidates
+from licence_text import MAX_LICENCE_BYTES
 
 CENSUS_FIELDS = [
     "source", "pin", "path", "skill_name", "blob_id", "size", "folder_file_count",
@@ -138,6 +139,9 @@ class CandidatesTests(unittest.TestCase):
                 ("license: &terms GPL-3.0-only\ncopy: *terms\n---\n", "YAML aliases are not allowed"),
                 ("license: [\n---\n", "while parsing a flow node"),
                 ("license: MIT\n", "missing its closing delimiter"),
+                ("license: [MIT]\n---\n", "license must be a string"),
+                ("license: {id: MIT}\n---\n", "license must be a string"),
+                ("licence: [MIT]\n---\n", "licence must be a string"),
             ):
                 write_skill(checkouts, source, path, f"---\nname: s2\n{front}")
                 for aggregators in ([], [source]):
@@ -147,6 +151,33 @@ class CandidatesTests(unittest.TestCase):
                                          ("unreadable", "frontmatter", "refused"))
                         self.assertIn("front matter unreadable", row.reason)
                         self.assertIn(detail, row.reason)
+
+    def test_folder_licence_byte_limit(self) -> None:
+        """Read a licence at the byte cap and refuse an oversized file by name."""
+        with tempfile.TemporaryDirectory() as tmp:
+            checkouts = Path(tmp)
+            source, path = "a/repo", "skills/demo/SKILL.md"
+            row = candidates.CensusRow(
+                source=source, path=path, skill_name="demo", blob_id="b1", pin="",
+                folder_license="y", repository_license="MIT", ineligible="",
+                dup_of_blob="", failure_reason="",
+            )
+            tracer = candidates.UpstreamTracer(FakeGitHubReader())
+            prefix = "MIT License\n"
+            at_limit = prefix + "x" * (MAX_LICENCE_BYTES - len(prefix))
+            write_skill(checkouts, source, path, folder_license_text=at_limit)
+            self.assertEqual(
+                candidates.resolve_licence(row, checkouts, set(), tracer),
+                candidates.LicenceResolution("MIT", "folder"),
+            )
+            write_skill(checkouts, source, path, folder_license_text=at_limit + "x")
+            self.assertEqual(
+                candidates.resolve_licence(row, checkouts, set(), tracer),
+                candidates.LicenceResolution(
+                    "unreadable", "folder", verdict="refused",
+                    reason="LICENSE exceeds 256 KiB",
+                ),
+            )
 
     def test_licence_path_upstream_aggregator(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

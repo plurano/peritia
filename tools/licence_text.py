@@ -10,7 +10,7 @@ from pathlib import Path
 
 MAX_LICENCE_BYTES = 256 * 1024
 LICENCE_NOTICES_FILE = "skills/licence-notices.yaml"
-NOTICE_PREFIXES = ("Copyright ", "© ", "(c) ", "(C) ")
+NOTICE_PREFIXES = ("Copyright ", "©")
 APACHE_END = "end of terms and conditions"
 PUNCTUATION = str.maketrans({
     c: '"' for c in "\"'‘’“”„‟«»‹›`"
@@ -83,40 +83,20 @@ def _collapsed_licence_lines(text: str) -> Iterator[str]:
             yield line
 
 
-def _apache_clause_line(template: str, spdx: str) -> str:
-    """Find Apache section 4(c) in the canonical terms before the appendix."""
-    if spdx != "Apache-2.0":
-        return ""
-    for line in _collapsed_licence_lines(template):
-        if line.casefold() == APACHE_END:
-            break
-        if line.startswith(("(c) ", "(C) ")):
-            return _comparison_text(line.translate(PUNCTUATION))
-    return ""
-
-
-def _is_notice_line(line: str, apache_clause: str) -> bool:
-    """Keep an exact, possibly reflowed prefix of Apache section 4(c) in the body."""
-    if not is_licence_notice(line):
-        return False
-    if apache_clause and line.startswith(("(c) ", "(C) ")):
-        comparison = _comparison_text(line.translate(PUNCTUATION))
-        return comparison != apache_clause and not apache_clause.startswith(comparison + " ")
-    return True
-
-
-def _notice_lines(text: str, apache_clause: str) -> frozenset[str]:
+def _notice_lines(text: str) -> frozenset[str]:
     """Collect exact notice lines for comparison with the template or register."""
-    return frozenset(line for line in _collapsed_licence_lines(text) if _is_notice_line(line, apache_clause))
+    return frozenset(
+        line for line in _collapsed_licence_lines(text) if is_licence_notice(line)
+    )
 
 
-def _normalised_lines(text: str, spdx: str, notices: frozenset[str], apache_clause: str) -> list[str]:
+def _normalised_lines(text: str, spdx: str, notices: frozenset[str]) -> list[str]:
     """Remove reviewed notices and metadata, then normalise the remaining lines."""
     lines = []
     for line in _collapsed_licence_lines(text):
         if metadata := METADATA.fullmatch(line):
             _validate_metadata(metadata, spdx)
-        elif _is_notice_line(line, apache_clause):
+        elif is_licence_notice(line):
             if line not in notices:
                 raise ValueError(f"unreviewed copyright notice {line!r}; review {LICENCE_NOTICES_FILE}")
         else:
@@ -183,22 +163,21 @@ def unreviewed_licence_notices(path: Path, template_dir: Path, spdx: str,
     """Read the new notice lines in a staged, bounded licence file."""
     text = read_utf8(path, MAX_LICENCE_BYTES, refuse_links=True)
     template = _read_licence_template(template_dir, spdx)
-    apache_clause = _apache_clause_line(template, spdx)
-    return _notice_lines(text, apache_clause) - _notice_lines(template, apache_clause) - reviewed
+    return _notice_lines(text) - _notice_lines(template) - reviewed
 
 
 def verify_licence(path: Path, template_dir: Path, spdx: str, *, reviewed: frozenset[str] = frozenset()) -> None:
     """Raise a diagnostic unless the complete body matches the declared SPDX template."""
     text = read_utf8(path, MAX_LICENCE_BYTES, refuse_links=True)
     template = _read_licence_template(template_dir, spdx)
-    apache_clause = _apache_clause_line(template, spdx)
-    template_notices = _notice_lines(template, apache_clause)
-    template_lines = _normalised_lines(template, spdx, template_notices, apache_clause)
+    template_notices = _notice_lines(template)
+    template_lines = _normalised_lines(template, spdx, template_notices)
     titles = _title_lines(template_lines, spdx)
     expected = _body(template_lines, titles, spdx)
     if not expected:
         raise ValueError(f"LICENSES/{spdx}.txt has no licence body")
-    actual = _body(_normalised_lines(text, spdx, template_notices | reviewed, apache_clause), titles, spdx).split()
+    actual_lines = _normalised_lines(text, spdx, template_notices | reviewed)
+    actual = _body(actual_lines, titles, spdx).split()
     if not actual:
         raise ValueError("LICENSE has no licence body")
     mismatch = _first_difference(actual, expected.split())

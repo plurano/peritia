@@ -21,10 +21,11 @@ from pathlib import Path
 from typing import Any, Iterable
 
 if __package__:
-    from . import check_skills, licence_policy
+    from . import check_skills, licence_policy, licence_text
 else:
     import check_skills
     import licence_policy
+    import licence_text
 
 _TOOLS_DIR = Path(__file__).resolve().parent
 if str(_TOOLS_DIR) not in sys.path:
@@ -349,6 +350,17 @@ def _resolve_aggregator_licence(
     return LicenceResolution(traced_lic, evidence)
 
 
+def _folder_licence_resolution(path: Path) -> LicenceResolution:
+    """Identify a folder licence within the checker byte limit."""
+    try:
+        text = licence_text.read_utf8(path, licence_text.MAX_LICENCE_BYTES)
+    except (FileNotFoundError, ValueError) as exc:
+        return LicenceResolution(
+            "unreadable", "folder", verdict="refused", reason=str(exc),
+        )
+    return LicenceResolution(identify_licence_text(text), "folder")
+
+
 def _resolve_non_aggregator_licence(
     census_row: CensusRow,
     meta: dict[str, str],
@@ -357,8 +369,7 @@ def _resolve_non_aggregator_licence(
     """Resolve evidence from the folder, front matter or repository."""
     folder_lic_file = find_folder_licence_file(folder)
     if folder_lic_file is not None:
-        folder_spdx = identify_licence_text(folder_lic_file.read_text(encoding="utf-8", errors="replace"))
-        return LicenceResolution(folder_spdx, "folder")
+        return _folder_licence_resolution(folder_lic_file)
 
     fm_raw = meta.get("license") or meta.get("licence")
     if fm_raw is not None and fm_raw.strip() != "":
@@ -373,12 +384,10 @@ def _resolve_non_aggregator_licence(
         if m_file:
             named_cand = folder / m_file.group(0)
             if named_cand.is_file():
-                folder_spdx = identify_licence_text(named_cand.read_text(encoding="utf-8", errors="replace"))
-                return LicenceResolution(folder_spdx, "folder")
+                return _folder_licence_resolution(named_cand)
             cand_any = find_folder_licence_file(folder)
             if cand_any is not None:
-                folder_spdx = identify_licence_text(cand_any.read_text(encoding="utf-8", errors="replace"))
-                return LicenceResolution(folder_spdx, "folder")
+                return _folder_licence_resolution(cand_any)
 
         # Fail closed: never fall through to repository licence
         return LicenceResolution(
@@ -419,8 +428,8 @@ def resolve_licence(
 
     try:
         text = check_skills.read_utf8(skill_path, check_skills.MAX_SKILL_MD_BYTES)
-        meta = check_skills.front_matter(text)
-    except (FileNotFoundError, ValueError) as exc:
+        meta = check_skills.front_matter(text, require_string_licence=True)
+    except (FileNotFoundError, TypeError, ValueError) as exc:
         detail = " ".join(str(exc).split())
         return LicenceResolution("unreadable", "frontmatter", verdict="refused",
                                  reason=f"front matter unreadable: {detail}")
@@ -460,6 +469,7 @@ def decide_row(
     aggregators: set[str],
     tracer: UpstreamTracer,
 ) -> CandidateRow:
+    """Combine licence evidence and classification into the candidate verdict."""
     lic_res = resolve_licence(census_row, checkouts, aggregators, tracer)
     if lic_res is None:
         return _escaped_row(census_row, classified_row)

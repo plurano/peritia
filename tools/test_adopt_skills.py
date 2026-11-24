@@ -17,6 +17,7 @@ from unittest.mock import patch
 import adopt_skills as adopt
 import census
 import check_skills
+from licence_text import LICENCE_NOTICES_FILE, MAX_LICENCE_BYTES
 
 REPO = Path(__file__).resolve().parent.parent
 MD = '---\nname: {name}\ndescription: Use when testing adoption.\n---\n\n# Example\n\nCheck the result.\n'
@@ -610,6 +611,84 @@ class AdoptionTests(unittest.TestCase):
             self.invoke()
         self.assertEqual(target.read_text(encoding="utf-8"), "notices: []\n")
 
+    def _register_seed(self, published_size):
+        """Build a register that reaches the given byte size after adoption."""
+        incoming = "Copyright (c) 2025 Owner"
+        notices = [f"Copyright {i:03}" for i in range(500)]
+        original = check_skills.licence_notices_yaml(frozenset([incoming, *notices]))
+        overhead = len(original.encode())
+        width, remainder = divmod(published_size - overhead, len(notices))
+        seeded = set()
+        for index, notice in enumerate(notices):
+            wide, narrow = divmod(width + (index < remainder), len("界".encode()))
+            seeded.add(notice + "界" * wide + "x" * narrow)
+        self.assertLessEqual(
+            max(map(len, seeded)), check_skills.MAX_LICENCE_NOTICE_CHARS,
+        )
+        rendered = check_skills.licence_notices_yaml(frozenset({incoming, *seeded}))
+        self.assertEqual(len(rendered.encode()), published_size)
+        return check_skills.licence_notices_yaml(frozenset(seeded))
+
+    def test_adoption_register_serialized_byte_limit(self):
+        """Refuse cap plus one before writing and publish exactly at the cap."""
+        self.fixture()
+        register = self.root / LICENCE_NOTICES_FILE
+        register.parent.mkdir()
+        report = self.base / 'report.tsv'
+        overflow = MAX_LICENCE_BYTES + 1
+        register.write_text(self._register_seed(overflow), encoding='utf-8')
+        before = snapshot(self.root)
+        detail = (
+            f'{LICENCE_NOTICES_FILE}: serialized size {overflow} bytes '
+            f'exceeds {MAX_LICENCE_BYTES} bytes'
+        )
+        with self.assertRaisesRegex(ValueError, detail):
+            self.invoke(report=report)
+        self.assertEqual(snapshot(self.root), before)
+        self.assertFalse(report.exists())
+
+        register.write_text(self._register_seed(MAX_LICENCE_BYTES), encoding='utf-8')
+        rows, _ = self.invoke(report=report)
+        self.assertEqual(rows[0]['verdict'], 'adopted', rows)
+        self.assertEqual(register.stat().st_size, MAX_LICENCE_BYTES)
+        self.assertIn(
+            'Copyright (c) 2025 Owner', check_skills.read_licence_notices(self.root),
+        )
+        self.assertEqual(report.read_text(encoding='utf-8'), adopt.report_text(rows))
+
+    def test_adoption_refuses_invalid_notice_register(self):
+        """Report bad register types and aliases without changing adoption outputs."""
+        self.fixture()
+        register = self.root / LICENCE_NOTICES_FILE
+        register.parent.mkdir()
+        for body, message in (
+            ('notices: [42]\n', 'notice 1: expected a string'),
+            ('notices: 42\n', 'notices: expected a list'),
+            (
+                'notices: [&owner Copyright Owner, *owner]\n',
+                'invalid YAML: YAML aliases are not allowed',
+            ),
+        ):
+            with self.subTest(message=message):
+                register.write_text(body, encoding='utf-8')
+                before = snapshot(self.root)
+                with self.assertRaisesRegex(
+                    ValueError, f'{LICENCE_NOTICES_FILE}: {message}',
+                ):
+                    self.invoke()
+                self.assertEqual(snapshot(self.root), before)
+
+    def test_adoption_reports_staged_notice_type_error(self):
+        """Convert a staged validation type failure into the candidate refusal."""
+        self.fixture()
+        message = 'notice 1: expected a string'
+        with patch.object(
+            check_skills, 'validate_licence_notices', side_effect=TypeError(message),
+        ):
+            rows, _ = self.invoke(apply=False)
+        self.assertEqual(rows[0]['verdict'], 'refused')
+        self.assertEqual(rows[0]['reason'], f'{LICENCE_NOTICES_FILE}: {message}')
+
     def test_report_output_symlink_refused(self):
         """Keep the target of an explicit report symlink unchanged."""
         self.fixture()
@@ -620,6 +699,30 @@ class AdoptionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "report output symlink refused"):
             self.invoke(report=report)
         self.assertEqual(target.read_text(encoding="utf-8"), "keep me\n")
+
+    def test_report_path_cannot_overlap_publication_outputs(self):
+        """Keep every output intact when a report would land at or under it."""
+        self.fixture()
+        register = self.root / LICENCE_NOTICES_FILE
+        register.parent.mkdir()
+        register.write_text('notices: []\n', encoding='utf-8')
+        before = snapshot(self.root)
+        for output, suffix in (
+            (LICENCE_NOTICES_FILE, ''), ('REUSE.toml', ''), ('CREDITS.md', ''),
+            ('skills/INDEX.tsv', ''), ('LICENSES', '/report.tsv'),
+            ('skills/demo', '/report.tsv'),
+        ):
+            with (
+                self.subTest(output=output, suffix=suffix),
+                tempfile.TemporaryDirectory(dir=self.base) as tmp,
+            ):
+                root = Path(tmp) / 'root'
+                shutil.copytree(self.root, root)
+                with patch.object(self, 'root', root), self.assertRaisesRegex(
+                    ValueError, f'report path overlaps publication output: {output}',
+                ):
+                    self.invoke(report=root / 'LICENSES' / '..' / (output + suffix))
+                self.assertEqual(snapshot(root), before)
 
     def test_report_path_written_and_root_refused(self):
         self.fixture()
