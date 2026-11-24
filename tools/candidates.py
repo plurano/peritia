@@ -21,15 +21,15 @@ from pathlib import Path
 from typing import Any, Iterable
 
 if __package__:
-    from . import licence_policy
+    from . import check_skills, licence_policy
 else:
+    import check_skills
     import licence_policy
 
 _TOOLS_DIR = Path(__file__).resolve().parent
 if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
-from check_skills import front_matter_or_empty  # noqa: E402
 from classify import DOMAINS, FUNCTIONS  # noqa: E402
 
 # Preserve the licence policy names exposed by earlier candidate versions.
@@ -301,12 +301,10 @@ def check_candidate_filter(classified_row: ClassifiedRow, census_row: CensusRow)
 
 def _resolve_aggregator_licence(
     census_row: CensusRow,
-    skill_path: Path,
+    meta: dict[str, str],
     tracer: UpstreamTracer,
 ) -> LicenceResolution:
-    text = skill_path.read_text(encoding="utf-8", errors="replace")
-    meta = front_matter_or_empty(text)
-
+    """Resolve a self-authored or traced aggregator licence."""
     # 3a. source_type self -> census repository licence, evidence repository:self
     if meta.get("source_type", "").strip().lower() == "self":
         lic = census_row.repository_license or "none"
@@ -353,16 +351,15 @@ def _resolve_aggregator_licence(
 
 def _resolve_non_aggregator_licence(
     census_row: CensusRow,
-    skill_path: Path,
+    meta: dict[str, str],
     folder: Path,
 ) -> LicenceResolution:
+    """Resolve evidence from the folder, front matter or repository."""
     folder_lic_file = find_folder_licence_file(folder)
     if folder_lic_file is not None:
         folder_spdx = identify_licence_text(folder_lic_file.read_text(encoding="utf-8", errors="replace"))
         return LicenceResolution(folder_spdx, "folder")
 
-    text = skill_path.read_text(encoding="utf-8", errors="replace")
-    meta = front_matter_or_empty(text)
     fm_raw = meta.get("license") or meta.get("licence")
     if fm_raw is not None and fm_raw.strip() != "":
         fm_lic, _, fm_known = normalise_licence(fm_raw)
@@ -420,9 +417,16 @@ def resolve_licence(
                 reason="census folder_license y but checkout lacks the file",
             )
 
+    try:
+        text = check_skills.read_utf8(skill_path, check_skills.MAX_SKILL_MD_BYTES)
+        meta = check_skills.front_matter(text)
+    except (FileNotFoundError, ValueError) as exc:
+        detail = " ".join(str(exc).split())
+        return LicenceResolution("unreadable", "frontmatter", verdict="refused",
+                                 reason=f"front matter unreadable: {detail}")
     if census_row.source in aggregators:
-        return _resolve_aggregator_licence(census_row, skill_path, tracer)
-    return _resolve_non_aggregator_licence(census_row, skill_path, folder)
+        return _resolve_aggregator_licence(census_row, meta, tracer)
+    return _resolve_non_aggregator_licence(census_row, meta, folder)
 
 
 def _escaped_row(census_row: CensusRow, classified_row: ClassifiedRow) -> CandidateRow:

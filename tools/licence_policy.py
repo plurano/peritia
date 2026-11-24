@@ -18,7 +18,7 @@ SPDX_LOOKUP = {spdx.upper(): spdx for spdx in SPDX_TABLE}
 _GNU_SPDX_VARIANTS = {
     f"{base}-{suffix}".upper(): (f"{base}-{suffix}", base)
     for base in GNU_WEAK_LICENCES | STRONG_LICENCES for suffix in ("only", "or-later")
-}
+} | {base.upper(): (f"{base}-only", base) for base in GNU_WEAK_LICENCES}
 
 LICENSE_FILENAMES = (
     "LICENSE", "LICENCE", "COPYING",

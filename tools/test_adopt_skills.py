@@ -332,17 +332,28 @@ class AdoptionTests(unittest.TestCase):
         self.assertNotIn('code fences without a language marked text', origin)
 
     def test_root_licence_for_repository_and_frontmatter(self):
-        for evidence in ('repository', 'frontmatter', 'repository:self'):
-            with self.subTest(evidence=evidence):
-                if not self.candidates:
-                    pin = self.source({'pack/demo/SKILL.md': MD.format(name='demo'), 'LICENSE.txt': LICENCE})
-                    self.candidate(pin=pin, evidence=evidence)
-                self.candidates[0]['licence_evidence'] = evidence
-                rows, _ = self.invoke(apply=False)
-                self.assertEqual(rows[0]['verdict'], 'adopted', rows)
+        """Publish the selected root filename for every repository-backed evidence type."""
+        kinds = {"repo": "repository", "self": "repository:self", "front": "frontmatter"}
+        files = {f"pack/{name}/SKILL.md": MD.format(name=name) for name in kinds}
+        pin = self.source(files | {"LICENSE.md": LICENCE})
+        for name, evidence in kinds.items():
+            self.candidate(name=name, folder=f"pack/{name}", pin=pin, evidence=evidence)
         rows, _ = self.invoke()
-        self.assertEqual(rows[0]['verdict'], 'adopted', rows)
-        self.assertEqual((self.root / 'skills/demo/LICENSE').read_text(), LICENCE)
+        self.assertEqual([row["verdict"] for row in rows], ["adopted"] * len(kinds), rows)
+        for name in kinds:
+            with self.subTest(name=name):
+                skill = self.root / "skills" / name
+                self.assertTrue((skill / "LICENSE.md").is_file(), "selected licence basename LICENSE.md missing")
+                self.assertEqual((skill / "LICENSE.md").read_text(encoding="utf-8"), LICENCE)
+                self.assertFalse((skill / "LICENSE").exists())
+        self.assertEqual(check_skills.check(self.root), 0)
+
+    def test_repository_licence_shadowed_by_folder_refused(self):
+        """Require the file discovered by the checker to be the selected licence."""
+        self.fixture(extra={"LICENSE.md": LICENCE}, evidence="repository")
+        rows, _ = self.invoke()
+        self.assertEqual(rows[0]["verdict"], "refused")
+        self.assertEqual(rows[0]["reason"], "licence-text-shadowed: LICENSE.md by LICENSE")
 
     def test_upstream_api_is_pinned_and_recorded(self):
         self.fixture(evidence='upstream:upstream/original')
@@ -523,7 +534,7 @@ class AdoptionTests(unittest.TestCase):
         self.assertIn('licence download failed for MIT-0: network error', rows[0]['reason'])
         self.assertIn('licence LGPL-NONSENSE not recognised', rows[1]['reason'])
         self.assertEqual(downloads, ['MIT-0'])
-        self.assertEqual(sorted(path.name for path in (self.root / 'skills').iterdir()), ['INDEX.tsv', 'good'])
+        self.assertEqual(sorted(path.name for path in (self.root / 'skills').iterdir()), ['INDEX.tsv', 'good', 'licence-notices.yaml'])
         self.assertFalse((self.root / 'LICENSES/MIT-0.txt').exists())
 
     def test_staged_licence_requires_exact_reviewed_pin(self):
@@ -559,6 +570,56 @@ class AdoptionTests(unittest.TestCase):
         self.assertEqual(rows[0]['verdict'], 'adopted', rows)
         self.assertEqual((self.root / 'skills/demo/LICENSE.rst').read_text(), LICENCE)
         self.assertEqual(check_skills.check(self.root), 0)
+
+    def test_adoption_registers_new_licence_notices(self):
+        """Publish only adopted notices, once each, and disclose them on the report."""
+        added = "Copyright 2026 New Holder"
+        refused = "Copyright 2026 Refused Holder"
+        pin = self.source({
+            "pack/demo/SKILL.md": MD.format(name="demo"),
+            "pack/demo/LICENSE": f"{added}\n{LICENCE}\n{added}\n",
+            "pack/refused/SKILL.md": MD.format(name="refused"),
+            "pack/refused/LICENSE": f"{refused}\nModified terms.\n",
+        })
+        self.candidate(pin=pin)
+        self.candidate(name="refused", folder="pack/refused", pin=pin)
+        register = self.root / "skills/licence-notices.yaml"
+        register.parent.mkdir()
+        register.write_text("notices:\n- Copyright Z Existing Holder\n", encoding="utf-8")
+        preview, _ = self.invoke(apply=False)
+        self.assertEqual(register.read_text(encoding="utf-8"), "notices:\n- Copyright Z Existing Holder\n")
+        rows, _ = self.invoke()
+        self.assertEqual(rows, preview)
+        self.assertEqual([row["verdict"] for row in rows], ["adopted", "refused"])
+        self.assertEqual(f"licence notices added: Copyright (c) 2025 Owner; {added}", rows[0]["reason"])
+        self.assertIn("LICENSE differs from MIT", rows[1]["reason"])
+        self.assertEqual(register.read_text(encoding="utf-8").splitlines(), [
+            "notices:", "- Copyright (c) 2025 Owner", f"- {added}", "- Copyright Z Existing Holder",
+        ])
+        self.assertEqual(check_skills.check(self.root), 0)
+
+    def test_licence_notice_register_output_symlink_refused(self):
+        """Keep an ordinary file unchanged when the notice register points to it."""
+        self.fixture()
+        target = self.base / "register.yaml"
+        target.write_text("notices: []\n", encoding="utf-8")
+        register = self.root / "skills/licence-notices.yaml"
+        register.parent.mkdir()
+        register.symlink_to(target)
+        with self.assertRaisesRegex(ValueError, "skills/licence-notices.yaml: output symlink refused"):
+            self.invoke()
+        self.assertEqual(target.read_text(encoding="utf-8"), "notices: []\n")
+
+    def test_report_output_symlink_refused(self):
+        """Keep the target of an explicit report symlink unchanged."""
+        self.fixture()
+        target = self.base / "victim.tsv"
+        target.write_text("keep me\n", encoding="utf-8")
+        report = self.base / "report.tsv"
+        report.symlink_to(target)
+        with self.assertRaisesRegex(ValueError, "report output symlink refused"):
+            self.invoke(report=report)
+        self.assertEqual(target.read_text(encoding="utf-8"), "keep me\n")
 
     def test_report_path_written_and_root_refused(self):
         self.fixture()

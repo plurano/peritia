@@ -115,6 +115,39 @@ class CandidatesTests(unittest.TestCase):
             self.assertEqual((row.licence, row.licence_class, row.licence_evidence, row.verdict),
                              ("Apache-2.0", "permissive", "frontmatter", "candidate"))
 
+    def test_licence_front_matter_read_state(self) -> None:
+        """Retain an anchored licence, and refuse unreadable metadata before fallback."""
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            checkouts = folder / "checkouts"
+            source, path = "a/repo", "skills/s2/SKILL.md"
+            census_p = write_census(folder, [{
+                "source": source, "path": path, "skill_name": "s2", "blob_id": "b2", "repository_license": "MIT",
+            }])
+            class_p = write_classified(folder, [{
+                "blob_id": "b2", "source": source, "path": path, "skill_name": "s2", "functions": "coding",
+                "domains": "governance-devtooling", "status": "ok",
+            }])
+            out = folder / "out.tsv"
+            with self.subTest(front="anchor without alias"):
+                write_skill(checkouts, source, path, "---\nname: s2\nlicense: &terms GPL-3.0-only\n---\n")
+                row, = candidates.run(census_p, class_p, checkouts, out, [], FakeGitHubReader())
+                self.assertEqual((row.licence, row.licence_evidence, row.verdict), ("GPL-3.0-only", "frontmatter", "report"))
+                self.assertIn("strong copyleft", row.reason)
+            for front, detail in (
+                ("license: &terms GPL-3.0-only\ncopy: *terms\n---\n", "YAML aliases are not allowed"),
+                ("license: [\n---\n", "while parsing a flow node"),
+                ("license: MIT\n", "missing its closing delimiter"),
+            ):
+                write_skill(checkouts, source, path, f"---\nname: s2\n{front}")
+                for aggregators in ([], [source]):
+                    with self.subTest(front=front, aggregators=aggregators):
+                        row, = candidates.run(census_p, class_p, checkouts, out, aggregators, FakeGitHubReader())
+                        self.assertEqual((row.licence, row.licence_evidence, row.verdict),
+                                         ("unreadable", "frontmatter", "refused"))
+                        self.assertIn("front matter unreadable", row.reason)
+                        self.assertIn(detail, row.reason)
+
     def test_licence_path_upstream_aggregator(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             folder = Path(tmp)
