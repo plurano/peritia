@@ -14,24 +14,41 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import io
 import json
 import math
 import os
 import sys
 import urllib.error
 from collections import defaultdict
+from collections.abc import Callable, Iterator
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, BinaryIO, TextIO
 
 import networkx
 
-_TOOLS_DIR = Path(__file__).resolve().parent
-if str(_TOOLS_DIR) not in sys.path:
-    sys.path.insert(0, str(_TOOLS_DIR))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from check_skills import front_matter_or_empty  # noqa: E402
-from llm_client import LLMClient  # noqa: E402
+from check_skills import front_matter_or_empty
+from git_blob import _hash_git_blob, git_blob_id
+from input_identity import (
+    TSV_DELIMITER,
+    bounded_history,
+    digest_file,
+    file_sha256,
+    fingerprint,
+    open_fingerprinted_tsv,
+    output_lock,
+    provider_id,
+    staged_output,
+    text_sha256,
+    tsv_sha256,
+    validate_base_url,
+    write_tsv,
+)
+from llm_client import LLMClient, structured_request_parameters
 
 MAX_CANDIDATES = 200_000
 MAX_EXISTING_SKILLS = 5_000
@@ -40,14 +57,26 @@ MAX_GROUPS = 100_000
 MAX_BATCH_SIZE = 64
 MAX_DESC_CHARS = 600
 MAX_SKILL_CHARS = 8192
+EMBED_PREPROCESSING = fingerprint("embed-prep", {
+    "text": "skill_name + ': ' + description",
+    "max_desc_chars": MAX_DESC_CHARS,
+    "max_skill_chars": MAX_SKILL_CHARS,
+    "crlf": "lf",
+    "normalise": "l2-at-use",
+})
 ATTEMPTS = 2
+PAIR_SCHEMA_NAME = "skill_overlap"
 DEFAULT_K = 5
 DEFAULT_EMBED_MODEL = os.environ.get("PERITIA_LLM_EMBED_MODEL")
 DEFAULT_JUDGE_MODEL = os.environ.get("PERITIA_LLM_JUDGE_MODEL")
 DEFAULT_BASE_URL = os.environ.get("PERITIA_LLM_BASE_URL")
 
-OVERLAP_FIELDS = ["a", "b", "cosine", "rank", "name_match", "same_use", "reason", "model"]
+OVERLAP_FIELDS = ["a", "b", "cosine", "rank", "name_match", "same_use", "reason", "model",
+                  "blob_a", "blob_b", "judge_fp"]
 GROUPS_FIELDS = ["group_id", "members", "edges", "has_existing"]
+GENERATION_VERSION = 1
+GENERATION_FIELD = "generation_version"
+MAX_MANIFEST_BYTES = 4096
 
 JUDGE_SYSTEM_PROMPT = (
     "You compare two agent skills and decide whether they serve the same use.\n"
@@ -57,11 +86,6 @@ JUDGE_SYSTEM_PROMPT = (
     "Answer in JSON with 'same_use' (boolean: true if they serve the same use, false otherwise) "
     "and 'reason' (brief explanation, at most 200 characters)."
 )
-
-
-def git_blob_id(data: bytes) -> str:
-    """Computes the git blob sha1 of data."""
-    return hashlib.sha1(f"blob {len(data)}\0".encode("utf-8") + data).hexdigest()
 
 
 def normalize_name(name: str) -> str:
@@ -76,6 +100,7 @@ class Item:
     skill_name: str
     description: str
     is_existing: bool = False
+    content_blob_id: str = ""
 
 
 @dataclass
@@ -89,8 +114,28 @@ class CandidatePair:
     item_b: Item
 
 
+def item_from_skill(
+    item_id: str, blob_id: str, fallback_name: str, text: str, is_existing: bool = False,
+    *, content_blob_id: str = "",
+) -> Item:
+    """Extract the same name and description for every embedding cache consumer."""
+    meta = front_matter_or_empty(text.replace("\r\n", "\n").replace("\r", "\n")[:MAX_SKILL_CHARS])
+    return Item(item_id, blob_id, meta.get("name") or fallback_name,
+                meta.get("description", "")[:MAX_DESC_CHARS], is_existing, content_blob_id)
+
+
+def _read_candidate_skill(path: Path) -> tuple[str, str]:
+    """Read the embedding text prefix and hash the on-disk skill as a Git blob."""
+    with path.open("rb") as handle:
+        size = os.fstat(handle.fileno()).st_size
+        blob_id = _hash_git_blob(handle, size)
+        handle.seek(0)
+        with io.TextIOWrapper(handle, encoding="utf-8", errors="replace") as text:
+            return text.read(MAX_SKILL_CHARS), blob_id
+
+
 def load_candidates(candidates_tsv: Path, checkouts: Path) -> list[Item]:
-    """Reads verdict candidate rows from candidates.tsv and their SKILL.md from checkouts."""
+    """Read candidate items and their current skill inputs from confined checkouts."""
     items: list[Item] = []
     if not candidates_tsv.exists():
         return items
@@ -115,21 +160,17 @@ def load_candidates(candidates_tsv: Path, checkouts: Path) -> list[Item]:
                 continue
 
             try:
-                with skill_path.open(encoding="utf-8", errors="replace") as f:
-                    content = f.read(MAX_SKILL_CHARS).replace("\r\n", "\n")
+                text, current_blob = _read_candidate_skill(skill_path)
             except OSError:
                 continue
 
-            meta = front_matter_or_empty(content)
-            name = meta.get("name") or skill_name
-            desc = meta.get("description", "")[:MAX_DESC_CHARS]
-            item_id = f"{source}:{path_str}"
-            items.append(Item(item_id=item_id, blob_id=blob_id, skill_name=name, description=desc, is_existing=False))
+            items.append(item_from_skill(f"{source}:{path_str}", blob_id, skill_name,
+                                         text, content_blob_id=current_blob))
     return items
 
 
 def load_existing_skills(skills_dir: Path) -> list[Item]:
-    """Reads existing skills from the repository's skills/<name>/SKILL.md."""
+    """Read existing skills under the repository's skills directory."""
     items: list[Item] = []
     if not skills_dir.is_dir():
         return items
@@ -143,12 +184,8 @@ def load_existing_skills(skills_dir: Path) -> list[Item]:
         except OSError:
             continue
         blob_id = git_blob_id(raw_bytes)
-        content = raw_bytes.decode("utf-8", errors="replace")[:MAX_SKILL_CHARS].replace("\r\n", "\n")
-        meta = front_matter_or_empty(content)
-        name = meta.get("name") or p.name
-        desc = meta.get("description", "")[:MAX_DESC_CHARS]
-        item_id = f"skills/{p.name}"
-        items.append(Item(item_id=item_id, blob_id=blob_id, skill_name=name, description=desc, is_existing=True))
+        items.append(item_from_skill(f"skills/{p.name}", blob_id, p.name,
+                                     raw_bytes.decode("utf-8", errors="replace"), is_existing=True))
     return items
 
 
@@ -167,7 +204,7 @@ def normalize_vector(vec: list[float]) -> list[float]:
 
 def normalize_embeddings(embeddings: dict[str, list[float]]) -> dict[str, list[float]]:
     """Returns a new mapping with every embedding vector normalised to unit length."""
-    return {blob_id: normalize_vector(vec) for blob_id, vec in embeddings.items()}
+    return {item_id: normalize_vector(vec) for item_id, vec in embeddings.items()}
 
 
 def dot_product(a: list[float], b: list[float]) -> float:
@@ -185,48 +222,292 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
-def load_cache(cache_path: Path | None) -> dict[str, list[float]]:
-    """Loads cached embeddings mapping blob_id -> vector."""
+def _read_embedding_cache(cache_path: Path | None) -> tuple[dict[str, Any], bool]:
+    """Read cache namespaces and quarantine a legacy cache without binding its vectors."""
     if cache_path is None or not cache_path.exists():
-        return {}
-    with cache_path.open(encoding="utf-8") as handle:
-        return json.load(handle)
+        return {"version": 2, "namespaces": {}}, False
+    try:
+        with cache_path.open(encoding="utf-8") as handle:
+            cache = json.load(handle)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"{cache_path}: invalid embedding cache JSON: {error}") from error
+    if isinstance(cache, dict) and cache.get("version") == 2 and isinstance(cache.get("namespaces"), dict):
+        return cache, False
+    if isinstance(cache, dict) and all(isinstance(vector, list) for vector in cache.values()):
+        return {"version": 2, "namespaces": {}, "legacy_unbound": cache}, True
+    raise ValueError(f"{cache_path}: invalid embedding cache format")
 
 
-def save_cache(cache_path: Path, cache: dict[str, list[float]]) -> None:
-    """Atomically saves cached embeddings."""
+def _is_text_key(key: str) -> bool:
+    """Recognize 64-character hexadecimal SHA-256 text keys."""
+    return len(key) == 64 and all(ch in "0123456789abcdefABCDEF" for ch in key)
+
+
+def _entry_text_hash(key: str, entry: dict) -> str | None:
+    """Return the bound text hash, refusing text-keyed entries whose key disagrees."""
+    text_hash = entry.get("text_sha256")
+    if not isinstance(text_hash, str):
+        return None
+    if _is_text_key(key) and key != text_hash:
+        return None
+    return text_hash
+
+
+def _merge_vectors(existing: dict, incoming: dict, namespace: str, *, unbound: bool = False) -> dict:
+    """Retain stored vectors and reject disagreements about an existing input."""
+    valid_existing = {
+        key: value for key, value in existing.items()
+        if unbound or not isinstance(value, dict) or _entry_text_hash(key, value) is not None
+    }
+    for key in valid_existing.keys() & incoming.keys():
+        first, second = valid_existing[key], incoming[key]
+        if not unbound and isinstance(first, dict) and isinstance(second, dict):
+            first, second = first.get("vector"), second.get("vector")
+        if first != second:
+            raise ValueError(f"embedding cache namespace {namespace!r}: conflicting vector for {key!r}")
+    return incoming | valid_existing
+
+
+def _merge_cache(existing: dict, incoming: dict) -> dict:
+    """Merge namespaces while retaining the on-disk metadata for existing entries."""
+    merged = incoming | existing
+    namespaces = existing["namespaces"].copy()
+    for namespace, entry in incoming["namespaces"].items():
+        if namespace not in namespaces:
+            namespaces[namespace] = entry
+        elif _valid_namespace(namespace, entry):
+            previous = namespaces[namespace]
+            if _valid_namespace(namespace, previous):
+                vectors = _merge_vectors(previous["vectors"], entry["vectors"], namespace)
+                entry = previous | {"vectors": vectors}
+            namespaces[namespace] = entry
+    merged["namespaces"] = namespaces
+    old_unbound = existing.get("legacy_unbound")
+    new_unbound = incoming.get("legacy_unbound")
+    if isinstance(old_unbound, dict) and isinstance(new_unbound, dict):
+        merged["legacy_unbound"] = _merge_vectors(old_unbound, new_unbound, "legacy_unbound", unbound=True)
+    return merged
+
+
+def _write_cache(handle: BinaryIO, cache: dict) -> None:
+    """Stream cache JSON to the staging file without duplicating it in memory."""
+    text = io.TextIOWrapper(handle, encoding="utf-8")
+    try:
+        json.dump(cache, text)
+    finally:
+        text.detach()
+
+
+def save_cache(cache_path: Path, cache: dict[str, Any]) -> None:
+    """Merge concurrent additions under the cache's own lock and publish atomically."""
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    temp = cache_path.with_suffix(".tmp")
-    with temp.open("w", encoding="utf-8") as handle:
-        json.dump(cache, handle)
-    temp.replace(cache_path)
+    with output_lock(cache_path):
+        existing, _ = _read_embedding_cache(cache_path)
+        merged = _merge_cache(existing, cache)
+        with staged_output(cache_path, lambda handle: _write_cache(handle, merged)) as temporary:
+            os.replace(temporary, cache_path)
+
+
+@dataclass(frozen=True)
+class EmbeddingSpace:
+    """Identify an embedding model and the text preparation it receives."""
+
+    model: str
+    provider: str
+    preprocessing: str
+
+    def fields(self) -> dict[str, str]:
+        """Return the namespace fields common to all vector dimensions."""
+        return {"model": self.model, "provider": self.provider, "preprocessing": self.preprocessing}
+
+    def key(self, dims: int) -> str:
+        """Fingerprint the space at the given vector dimension."""
+        return fingerprint("embed", {**self.fields(), "dims": dims})
+
+    def resolve(self, namespaces: dict, dims: int | None) -> int | None:
+        """Select explicit dimensions or infer them from a unique matching namespace."""
+        if dims is not None:
+            if not _positive_dims(dims):
+                raise ValueError(f"embedding model {self.model}: --embed-dims must be a positive integer")
+            return dims
+        fields = self.fields()
+        matches = [space["dims"] for space in namespaces.values()
+                   if all(space[key] == value for key, value in fields.items())]
+        if len(matches) > 1:
+            raise ValueError(f"embedding model {self.model}: multiple dimensions in cache, specify --embed-dims")
+        return matches[0] if matches else None
+
+    def vectors(self, namespaces: dict, dims: int | None) -> dict | None:
+        """Return validated entries for the selected namespace if it exists."""
+        if dims is None:
+            return None
+        namespace = namespaces.get(self.key(dims))
+        return namespace["vectors"] if namespace is not None else None
+
+
+def _positive_dims(dims: Any) -> bool:
+    """Recognize positive integer vector lengths, excluding Boolean and float values."""
+    if isinstance(dims, bool) or not isinstance(dims, int):
+        return False
+    return dims > 0
+
+
+def _valid_namespace(key: str, metadata: Any) -> bool:
+    """Check that the stored namespace fields reproduce its key."""
+    if not isinstance(metadata, dict) or not _positive_dims(metadata.get("dims")):
+        return False
+    fields = [metadata.get(name) for name in ("model", "provider", "preprocessing")]
+    if not all(isinstance(value, str) for value in fields) or not isinstance(metadata.get("vectors"), dict):
+        return False
+    return key == EmbeddingSpace(*fields).key(metadata["dims"])
+
+
+def _validated_namespaces(path: Path | None, namespaces: dict) -> dict:
+    """Warn about damaged namespaces and exclude them from dimension inference."""
+    valid = {}
+    for key, metadata in namespaces.items():
+        if _valid_namespace(key, metadata):
+            valid[key] = metadata
+        else:
+            print(f"{path}: ignored invalid embedding namespace {key!r}", file=sys.stderr)
+    return valid
+
+
+class MissingEmbeddingNamespace(ValueError):
+    """Signal that a compatible embedding space needs to be populated."""
+
+
+def _embedding_texts(items: list[Item]) -> tuple[dict[str, str], dict[str, str]]:
+    """Deduplicate exact model inputs and identify the input used by each item."""
+    texts: dict[str, str] = {}
+    item_keys: dict[str, str] = {}
+    for item in items:
+        if not item.blob_id:
+            continue
+        text = make_embed_text(item)
+        key = text_sha256(text)
+        texts[key] = text
+        item_keys[item.item_id] = key
+    return texts, item_keys
+
+
+def _check_vector(model: str, dims: int | None, vector: list[float]) -> int:
+    """Validate a vector and return its dimensions when they were unknown."""
+    if not isinstance(vector, list):
+        raise TypeError(f"embedding model {model}: vector must be an array")
+    expected = len(vector) if dims is None else dims
+    if expected < 1 or len(vector) != expected:
+        raise ValueError(f"embedding model {model}: expected {expected} dimensions, got {len(vector)}")
+    if not all(type(value) in (int, float) and math.isfinite(value) for value in vector):
+        raise ValueError(f"embedding model {model}: vector must contain finite numbers")
+    return expected
+
+
+def _matching_embeddings(
+    texts: dict[str, str], entries: dict, model: str, dims: int | None, path: Path | None,
+) -> dict[str, list[float]]:
+    """Validate bound vectors and keep entries for exact current input texts."""
+    matched = {}
+    for key, entry in entries.items():
+        text_hash = _entry_text_hash(key, entry) if isinstance(entry, dict) else ""
+        if text_hash is None:
+            continue
+        try:
+            vector = entry["vector"]
+            _check_vector(model, dims, vector)
+        except (KeyError, TypeError, ValueError, OverflowError) as error:
+            raise ValueError(f"{path}: invalid embedding vector for input {key}: {error}") from error
+        # Version 2 caches also contain entries keyed by the original blob ID.
+        if text_hash in texts and (key == text_hash or text_hash not in matched):
+            matched[text_hash] = vector
+    return matched
+
+
+def _embed_missing(
+    texts: dict[str, str], missing: list[str], dims: int | None, model: str,
+    embed_fn: Callable[[list[str]], list[list[float]]],
+) -> tuple[int | None, dict[str, list[float]]]:
+    """Embed missing texts in bounded batches and assert a common vector length."""
+    additions = {}
+    for start in range(0, len(missing), MAX_BATCH_SIZE):
+        batch = missing[start : start + MAX_BATCH_SIZE]
+        vectors = embed_fn([texts[key] for key in batch])
+        if len(vectors) != len(batch):
+            raise ValueError(f"embedding model {model}: expected {len(batch)} vectors, got {len(vectors)}")
+        for key, vector in zip(batch, vectors, strict=True):
+            try:
+                dims = _check_vector(model, dims, vector)
+            except (TypeError, ValueError, OverflowError) as error:
+                raise ValueError(f"invalid embedding response for input {key}: {error}") from error
+            additions[key] = vector
+    return dims, additions
+
+
+def _save_embedding_additions(
+    path: Path, cache: dict, migrated: bool, space: EmbeddingSpace, dims: int | None,
+    entries: dict, additions: dict[str, list[float]],
+) -> None:
+    """Save new entries in their namespace and retain any unbound history."""
+    if additions:
+        updated = dict(entries)
+        updated.update({key: {"text_sha256": key, "vector": vector} for key, vector in additions.items()})
+        cache["namespaces"][space.key(dims)] = {**space.fields(), "dims": dims, "vectors": updated}
+    save_cache(path, cache)
+    if migrated:
+        print(f"{path}: moved legacy embedding vectors to legacy_unbound", file=sys.stderr)
+
+
+def _report_missing_namespace(path: Path | None, model: str, migrated: bool, required: bool) -> None:
+    """Tell a cache reader how to distinguish an absent namespace from a partial hit."""
+    legacy_note = " (legacy vectors are unbound)" if migrated else ""
+    message = f"{path}: no matching embedding namespace for model {model}{legacy_note}"
+    if required:
+        raise MissingEmbeddingNamespace(message)
+    print(message, file=sys.stderr)
+
+
+def load_embeddings(
+    cache_path: Path | None, items: list[Item], model: str, provider: str, embed_dims: int | None = None,
+    *,
+    embed_fn: Callable[[list[str]], list[list[float]]] | None = None,
+    require_namespace: bool = False,
+) -> dict[str, list[float]]:
+    """Return vectors by item ID and optionally embed missing exact inputs."""
+    space = EmbeddingSpace(model, provider_id(provider), EMBED_PREPROCESSING)
+    if cache_path is None and embed_fn is None and not require_namespace:
+        return {}
+    if cache_path is not None and not model:
+        raise ValueError("--cache requires --embed-model (or set PERITIA_LLM_EMBED_MODEL)")
+    cache, migrated = _read_embedding_cache(cache_path)
+    namespaces = _validated_namespaces(cache_path, cache["namespaces"])
+    dims = space.resolve(namespaces, embed_dims)
+    entries = space.vectors(namespaces, dims)
+    if entries is None and embed_fn is None:
+        _report_missing_namespace(cache_path, model, migrated, require_namespace)
+        return {}
+
+    texts, item_keys = _embedding_texts(items)
+    result = _matching_embeddings(texts, entries or {}, model, dims, cache_path)
+    if embed_fn is not None:
+        missing = [key for key in texts if key not in result]
+        dims, additions = _embed_missing(texts, missing, dims, model, embed_fn)
+        if cache_path is not None and (additions or migrated):
+            _save_embedding_additions(cache_path, cache, migrated, space, dims, entries or {}, additions)
+        result.update(additions)
+    return {item_id: result[key] for item_id, key in item_keys.items() if key in result}
 
 
 def get_embeddings(
     items: list[Item],
     embed_fn: Callable[[list[str]], list[list[float]]],
-    cache: dict[str, list[float]],
     cache_path: Path | None = None,
+    *,
+    model: str = "",
+    provider: str = "",
+    embed_dims: int | None = None,
 ) -> dict[str, list[float]]:
-    """Retrieves embeddings for items, batching uncached calls up to 64 texts."""
-    uncached: dict[str, str] = {}
-    for item in items:
-        if item.blob_id not in cache and item.blob_id not in uncached:
-            uncached[item.blob_id] = make_embed_text(item)
-
-    if uncached:
-        uncached_blobs = list(uncached.keys())
-        for i in range(0, len(uncached_blobs), MAX_BATCH_SIZE):
-            batch_blobs = uncached_blobs[i : i + MAX_BATCH_SIZE]
-            batch_texts = [uncached[b] for b in batch_blobs]
-            embeddings = embed_fn(batch_texts)
-            for b, emb in zip(batch_blobs, embeddings):
-                cache[b] = emb
-
-        if cache_path is not None:
-            save_cache(cache_path, cache)
-
-    return cache
+    """Read cached embeddings and make requests for any missing inputs."""
+    return load_embeddings(cache_path, items, model, provider, embed_dims, embed_fn=embed_fn)
 
 
 def find_candidate_pairs(
@@ -241,16 +522,18 @@ def find_candidate_pairs(
     pairs_map: dict[tuple[str, str], CandidatePair] = {}
 
     for cand in candidates:
-        cand_emb = norm_embeddings.get(cand.blob_id)
+        cand_emb = norm_embeddings.get(cand.item_id)
         if cand_emb is None:
             continue
 
+        cand_blob = cand.content_blob_id or cand.blob_id
         eligible: list[tuple[float, Item]] = []
         for target in all_items:
-            # Never pair an item with itself or two rows of the same blob
-            if target.item_id == cand.item_id or target.blob_id == cand.blob_id:
+            # Reconsider a census duplicate if the current files have diverged.
+            same_blob = target.blob_id == cand.blob_id and (target.content_blob_id or target.blob_id) == cand_blob
+            if target.item_id == cand.item_id or same_blob:
                 continue
-            target_emb = norm_embeddings.get(target.blob_id)
+            target_emb = norm_embeddings.get(target.item_id)
             if target_emb is None:
                 continue
             cos = min(1.0, max(-1.0, dot_product(cand_emb, target_emb)))
@@ -334,18 +617,23 @@ def judge_one(judge_fn: Callable[[str], Any], prompt: str) -> tuple[bool, str] |
 
 
 def load_done_pairs(overlap_tsv: Path) -> dict[tuple[str, str], dict[str, str]]:
-    """Loads previously judged pairs from overlap.tsv so runs resume."""
+    """Read the latest row per pair, including legacy rows for summary."""
     if not overlap_tsv.exists():
         return {}
-    done: dict[tuple[str, str], dict[str, str]] = {}
     with overlap_tsv.open(newline="", encoding="utf-8") as handle:
-        for i, row in enumerate(csv.DictReader(handle, delimiter="\t")):
-            if i >= MAX_PAIRS:
-                break
-            a, b = row.get("a", ""), row.get("b", "")
-            if a and b:
-                key = (min(a, b), max(a, b))
-                done[key] = row
+        return _read_done_pairs(overlap_tsv, handle)
+
+
+def _read_done_pairs(path: Path, handle: TextIO) -> dict[tuple[str, str], dict[str, str]]:
+    """Index the last valid record for each unordered pair in an open TSV."""
+    done = {}
+    rows = csv.DictReader(handle, delimiter=TSV_DELIMITER)
+    for row in bounded_history(path, rows, MAX_PAIRS):
+        if None in row or None in row.values():
+            continue
+        a, b = row.get("a", ""), row.get("b", "")
+        if a and b:
+            done[min(a, b), max(a, b)] = row
     return done
 
 
@@ -397,16 +685,6 @@ def build_groups(
     return groups
 
 
-def write_groups(groups_tsv: Path, groups: list[dict[str, Any]]) -> None:
-    """Writes groups.tsv."""
-    groups_tsv.parent.mkdir(parents=True, exist_ok=True)
-    with groups_tsv.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=GROUPS_FIELDS, delimiter="\t", lineterminator="\n")
-        writer.writeheader()
-        for g in groups:
-            writer.writerow(g)
-
-
 def _load_summary_candidates(
     candidates_path: Path | None,
     limit: int | None,
@@ -446,7 +724,7 @@ def _build_valid_ids(
 
 
 def _count_groups(
-    groups_path: Path,
+    handle: TextIO | None,
     valid_ids: set[str] | None,
     skills_dir: Path | None,
 ) -> tuple[int, int, set[str]]:
@@ -454,52 +732,46 @@ def _count_groups(
     num_groups = 0
     num_groups_with_existing = 0
     grouped_members: set[str] = set()
-    if not groups_path.exists():
+    if handle is None:
         return num_groups, num_groups_with_existing, grouped_members
 
-    with groups_path.open(newline="", encoding="utf-8") as handle:
-        for i, row in enumerate(csv.DictReader(handle, delimiter="\t")):
-            if i >= MAX_GROUPS:
-                break
-            members = [m.strip() for m in row.get("members", "").split(",") if m.strip()]
-            if valid_ids is not None:
-                members = [
-                    m for m in members
-                    if m in valid_ids or (not (skills_dir and skills_dir.is_dir()) and m.startswith("skills/"))
-                ]
-                if len(members) < 2:
-                    continue
-            num_groups += 1
-            has_existing = any(m.startswith("skills/") for m in members) or (row.get("has_existing") == "true" and valid_ids is None)
-            if has_existing:
-                num_groups_with_existing += 1
-            for m in members:
-                grouped_members.add(m)
+    for i, row in enumerate(csv.DictReader(handle, delimiter="\t")):
+        if i >= MAX_GROUPS:
+            break
+        members = [m.strip() for m in row.get("members", "").split(",") if m.strip()]
+        if valid_ids is not None:
+            members = [
+                m for m in members
+                if m in valid_ids or (not (skills_dir and skills_dir.is_dir()) and m.startswith("skills/"))
+            ]
+            if len(members) < 2:
+                continue
+        num_groups += 1
+        has_existing = any(m.startswith("skills/") for m in members) or (row.get("has_existing") == "true" and valid_ids is None)
+        if has_existing:
+            num_groups_with_existing += 1
+        for m in members:
+            grouped_members.add(m)
     return num_groups, num_groups_with_existing, grouped_members
 
 
 def _count_unjudged(
-    overlap_path: Path,
+    pairs: dict[tuple[str, str], dict[str, str]],
     valid_ids: set[str] | None,
     skills_dir: Path | None,
 ) -> int:
-    """Counts unjudged pairs between valid items."""
+    """Count the last result for each unjudged pair between valid items."""
     num_unjudged = 0
-    if not overlap_path.exists():
-        return 0
-    with overlap_path.open(newline="", encoding="utf-8") as handle:
-        for i, row in enumerate(csv.DictReader(handle, delimiter="\t")):
-            if i >= MAX_PAIRS:
-                break
-            if row.get("same_use") == "unjudged":
-                a = row.get("a", "")
-                b = row.get("b", "")
-                if valid_ids is not None:
-                    a_valid = a in valid_ids or (not (skills_dir and skills_dir.is_dir()) and a.startswith("skills/"))
-                    b_valid = b in valid_ids or (not (skills_dir and skills_dir.is_dir()) and b.startswith("skills/"))
-                    if not (a_valid and b_valid):
-                        continue
-                num_unjudged += 1
+    allow_unknown_existing = not (skills_dir and skills_dir.is_dir())
+    for (a, b), row in pairs.items():
+        if row.get("same_use") != "unjudged":
+            continue
+        if valid_ids is not None and any(
+            item not in valid_ids and not (allow_unknown_existing and item.startswith("skills/"))
+            for item in (a, b)
+        ):
+            continue
+        num_unjudged += 1
     return num_unjudged
 
 
@@ -510,11 +782,15 @@ def summary(
     skills_dir: Path | None = None,
     limit: int | None = None,
 ) -> str:
-    """Returns summary string counting candidates, overlap-free candidates, groups, and unjudged."""
+    """Count candidates, overlap-free candidates, groups and current unjudged pairs."""
+    effective_skills_dir = skills_dir or Path("skills")
     num_candidates, candidate_ids = _load_summary_candidates(candidates_path, limit)
-    valid_ids = _build_valid_ids(candidate_ids, skills_dir)
-    num_groups, num_existing, grouped_members = _count_groups(groups_path, valid_ids, skills_dir)
-    num_unjudged = _count_unjudged(overlap_path, valid_ids, skills_dir)
+    valid_ids = _build_valid_ids(candidate_ids, effective_skills_dir)
+    with open_overlap_generation(groups_path, overlap_path) as (groups, pairs):
+        num_groups, num_existing, grouped_members = _count_groups(groups, valid_ids, effective_skills_dir)
+        pair_path = Path(pairs.name) if pairs is not None else overlap_path
+        judgments = _read_done_pairs(pair_path, pairs) if pairs is not None else {}
+    num_unjudged = _count_unjudged(judgments, valid_ids, effective_skills_dir)
 
     overlap_free = len(candidate_ids - grouped_members) if candidate_ids else 0
     lines = [
@@ -539,57 +815,201 @@ class OverlapJudge:
         return self.client.embed(self.embed_model, texts)
 
     def judge(self, prompt: str) -> Any:
+        """Request a structured same-use judgment for one pair."""
         messages = [
             {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ]
         return self.client.chat_json(
-            self.judge_model, messages, schema=judge_schema(), schema_name="skill_overlap"
+            self.judge_model, messages, schema=judge_schema(), schema_name=PAIR_SCHEMA_NAME
         )
 
 
+@dataclass(frozen=True)
+class PairJudgeIdentity:
+    """Bind a pair judgment to its model, endpoint, prompts and response schema."""
+
+    model: str
+    provider: str
+    system_prompt_sha256: str
+    request: dict[str, Any]
+
+    def key(self, prompt: str) -> str:
+        """Fingerprint the exact judge request for this pair."""
+        return fingerprint("pair-judge", {
+            "judge_model": self.model,
+            "provider": self.provider,
+            "judge_system_prompt_sha256": self.system_prompt_sha256,
+            "judge_prompt_sha256": text_sha256(prompt),
+            "request": self.request,
+        })
+
+
+def _pair_blobs(a: Item, b: Item) -> tuple[str, str]:
+    """Return the blob ids of the two skill files that are currently on disk."""
+    return a.content_blob_id or a.blob_id, b.content_blob_id or b.blob_id
+
+
+def _current_pairs_path(groups_path: Path) -> Path:
+    """Locate the pair snapshot belonging to these groups."""
+    return groups_path.with_name(groups_path.name + ".pairs.tsv")
+
+
+def _generation_path(groups_path: Path) -> Path:
+    """Locate the manifest committed after the two published files."""
+    return groups_path.with_name(groups_path.name + ".generation.json")
+
+
+def _legacy_generation_path(groups_path: Path) -> Path:
+    """Locate the stem-named manifest written by earlier overlap runs."""
+    return groups_path.with_suffix(".generation.json")
+
+
+def _select_manifest(manifest: Path, groups_path: Path) -> Path:
+    """Prefer the full-name manifest and fall back to a stem manifest only when absent."""
+    if manifest.exists():
+        return manifest
+    legacy = _legacy_generation_path(groups_path)
+    return legacy if legacy.exists() else manifest
+
+
+def _generation(groups_sha: str, pairs_sha: str) -> dict:
+    """Bind published groups and pairs to the same versioned manifest."""
+    return {"version": GENERATION_VERSION, "groups_sha256": groups_sha, "pairs_sha256": pairs_sha}
+
+
+def _open_optional(path: Path, stack: ExitStack) -> BinaryIO | None:
+    """Open a snapshot file once so the verified bytes are the bytes parsed."""
+    try:
+        return stack.enter_context(path.open("rb"))
+    except FileNotFoundError:
+        return None
+
+
+def _has_header_field(handle: BinaryIO | None, field: str) -> bool:
+    """Look for a version marker in a TSV header and rewind the open file."""
+    if handle is None:
+        return False
+    header = handle.readline(MAX_MANIFEST_BYTES)
+    handle.seek(0)
+    return field in next(csv.reader([header.decode("utf-8")], delimiter=TSV_DELIMITER), [])
+
+
+def _is_version_int(value: Any) -> bool:
+    """Accept plain integer manifest versions and reject Booleans."""
+    return not isinstance(value, bool) and isinstance(value, int)
+
+
+def _verify_generation(manifest: Path, groups: BinaryIO | None, pairs: BinaryIO | None) -> None:
+    """Require both open file snapshots to match their committed manifest."""
+    message = f"{manifest}: overlap generation missing or mismatched; rerun with python3 tools/overlap.py run ..."
+    if groups is None or pairs is None:
+        raise ValueError(message)
+    try:
+        with manifest.open("rb") as handle:
+            payload = handle.read(MAX_MANIFEST_BYTES + 1)
+        if len(payload) > MAX_MANIFEST_BYTES:
+            raise ValueError("generation manifest exceeds size limit")
+        record = json.loads(payload)
+    except (OSError, ValueError, RecursionError) as error:
+        raise ValueError(message) from error
+    if record != _generation(digest_file(groups), digest_file(pairs)) or not _is_version_int(record["version"]):
+        raise ValueError(message)
+
+
+@contextmanager
+def open_overlap_generation(
+    groups_path: Path, legacy_overlap: Path | None = None,
+) -> Iterator[tuple[TextIO | None, TextIO | None]]:
+    """Open verified groups and current pairs, allowing pre-fingerprint input."""
+    manifest = _generation_path(groups_path)
+    selected = _select_manifest(manifest, groups_path)
+    with ExitStack() as stack:
+        groups = _open_optional(groups_path, stack)
+        pairs = _open_optional(_current_pairs_path(groups_path), stack)
+        if pairs is not None or selected.exists() or _has_header_field(groups, GENERATION_FIELD):
+            _verify_generation(selected, groups, pairs)
+        elif legacy_overlap is not None:
+            pairs = _open_optional(legacy_overlap, stack)
+            if _has_header_field(pairs, "judge_fp"):
+                raise ValueError(f"{legacy_overlap}: current pair snapshot missing; "
+                                 "rerun with python3 tools/overlap.py run ...")
+        yield (
+            stack.enter_context(io.TextIOWrapper(groups, newline="", encoding="utf-8")) if groups else None,
+            stack.enter_context(io.TextIOWrapper(pairs, newline="", encoding="utf-8")) if pairs else None,
+        )
+
+
+def _write_overlap_generation(groups_path: Path, groups: list[dict], pairs: list[dict]) -> None:
+    """Publish both snapshots under a shared lock, committing the manifest last."""
+    groups_path.parent.mkdir(parents=True, exist_ok=True)
+    pairs_path = _current_pairs_path(groups_path)
+    manifest = _generation_path(groups_path)
+    fields = [*GROUPS_FIELDS, GENERATION_FIELD]
+    groups = [row | {GENERATION_FIELD: GENERATION_VERSION} for row in groups]
+    groups_sha = tsv_sha256(fields, groups)
+    pairs_sha = tsv_sha256(OVERLAP_FIELDS, pairs)
+    payload = (json.dumps(_generation(groups_sha, pairs_sha), sort_keys=True) + "\n").encode()
+    with output_lock(manifest), ExitStack() as stack:
+        groups_changed = groups_sha != file_sha256(groups_path)
+        pairs_changed = pairs_sha != file_sha256(pairs_path)
+        if not groups_changed and not pairs_changed and hashlib.sha256(payload).hexdigest() == file_sha256(manifest):
+            return
+        if groups_changed:
+            staged_groups = stack.enter_context(staged_output(
+                groups_path, lambda handle: write_tsv(handle.write, fields, groups),
+            ))
+        if pairs_changed:
+            staged_pairs = stack.enter_context(staged_output(
+                pairs_path, lambda handle: write_tsv(handle.write, OVERLAP_FIELDS, pairs),
+            ))
+        staged_manifest = stack.enter_context(staged_output(manifest, lambda handle: handle.write(payload)))
+        if groups_changed:
+            os.replace(staged_groups, groups_path)
+        if pairs_changed:
+            os.replace(staged_pairs, pairs_path)
+        os.replace(staged_manifest, manifest)
+
+
+def _pair_result(
+    pair: CandidatePair, previous: dict[str, str], judge_fn: Callable[[str], Any], identity: PairJudgeIdentity,
+) -> tuple[dict[str, str], bool]:
+    """Project a compatible judgment onto current geometry or judge the pair anew."""
+    prompt = make_judge_prompt(pair.item_a, pair.item_b)
+    judge_fp = identity.key(prompt)
+    blob_a, blob_b = _pair_blobs(pair.item_a, pair.item_b)
+    same_inputs = (previous.get("blob_a"), previous.get("blob_b"), previous.get("judge_fp")) == (
+        blob_a, blob_b, judge_fp,
+    )
+    row = {
+        "a": pair.a, "b": pair.b, "cosine": f"{pair.cosine:.4f}", "rank": str(pair.rank),
+        "name_match": "true" if pair.name_match else "false",
+        "model": identity.model, "blob_a": blob_a, "blob_b": blob_b, "judge_fp": judge_fp,
+    }
+    if same_inputs:
+        return row | {"same_use": previous["same_use"], "reason": previous["reason"]}, False
+    judgment = judge_one(judge_fn, prompt)
+    if judgment is None:
+        return row | {"same_use": "unjudged", "reason": "unjudged: failed after 2 attempts"}, True
+    same_use = "true" if judgment[0] else "false"
+    return row | {"same_use": same_use, "reason": judgment[1]}, True
+
+
 def _judge_pairs(
-    pairs: list[CandidatePair],
-    done: dict[tuple[str, str], dict[str, str]],
-    overlap_out: Path,
-    judge_fn: Callable[[str], Any],
-    judge_model: str,
-) -> None:
-    """Judges candidate pairs not yet in done, appending each to overlap_out."""
-    fresh = not overlap_out.exists()
-    overlap_out.parent.mkdir(parents=True, exist_ok=True)
-    with overlap_out.open("a", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=OVERLAP_FIELDS, delimiter="\t", lineterminator="\n")
-        if fresh:
-            writer.writeheader()
-
-        for pair in pairs:
-            pair_key = (pair.a, pair.b)
-            if pair_key in done:
-                continue
-
-            prompt = make_judge_prompt(pair.item_a, pair.item_b)
-            judgment = judge_one(judge_fn, prompt)
-            if judgment is not None:
-                same_use = "true" if judgment[0] else "false"
-                reason = judgment[1]
-            else:
-                same_use = "unjudged"
-                reason = "unjudged: failed after 2 attempts"
-
-            row = {
-                "a": pair.a,
-                "b": pair.b,
-                "cosine": f"{pair.cosine:.4f}",
-                "rank": str(pair.rank),
-                "name_match": "true" if pair.name_match else "false",
-                "same_use": same_use,
-                "reason": reason,
-                "model": judge_model,
-            }
-            writer.writerow(row)
-            handle.flush()
-            done[pair_key] = row
+    pairs: list[CandidatePair], overlap_out: Path, judge_fn: Callable[[str], Any], identity: PairJudgeIdentity,
+) -> list[dict[str, str]]:
+    """Resume current candidates and append history only for newly judged pairs."""
+    log = open_fingerprinted_tsv(overlap_out, OVERLAP_FIELDS, "judge_fp", max_rows=MAX_PAIRS)
+    history = load_done_pairs(overlap_out)
+    current = []
+    for pair in pairs:
+        key = pair.a, pair.b
+        row, new_judgment = _pair_result(pair, history.get(key, {}), judge_fn, identity)
+        if new_judgment:
+            log.append(row, key, history)
+            history[key] = row
+        current.append(row)
+    return current
 
 
 def run(
@@ -604,27 +1024,35 @@ def run(
     cache_path: Path | None = None,
     k: int = DEFAULT_K,
     limit: int | None = None,
+    embed_model: str | None = DEFAULT_EMBED_MODEL,
+    provider: str = "",
+    embed_dims: int | None = None,
 ) -> tuple[int, int]:
-    """Runs overlap detection and judging, writing overlap.tsv and groups.tsv."""
-    candidates = load_candidates(candidates_tsv, checkouts)
-    if limit is not None:
-        candidates = candidates[:limit]
-    existing = load_existing_skills(skills_dir)
-    all_items = candidates + existing
+    """Detect overlap and write current pair judgments and groups."""
+    overlap_out.parent.mkdir(parents=True, exist_ok=True)
+    with output_lock(overlap_out):
+        endpoint = provider_id(provider)
+        candidates = load_candidates(candidates_tsv, checkouts)
+        if limit is not None:
+            candidates = candidates[:limit]
+        existing = load_existing_skills(skills_dir)
+        all_items = candidates + existing
 
-    cache = load_cache(cache_path)
-    embeddings = get_embeddings(all_items, embed_fn, cache, cache_path)
-    pairs = find_candidate_pairs(candidates, all_items, embeddings, k=k)
+        embeddings = get_embeddings(all_items, embed_fn, cache_path, model=embed_model or "",
+                                    provider=provider, embed_dims=embed_dims)
+        pairs = find_candidate_pairs(candidates, all_items, embeddings, k=k)
 
-    done = load_done_pairs(overlap_out)
-    _judge_pairs(pairs, done, overlap_out, judge_fn, judge_model)
+        identity = PairJudgeIdentity(judge_model, endpoint, text_sha256(JUDGE_SYSTEM_PROMPT),
+                                     structured_request_parameters(judge_schema(), PAIR_SCHEMA_NAME))
+        current = _judge_pairs(pairs, overlap_out, judge_fn, identity)
 
-    groups = build_groups(list(done.values()), all_items)
-    write_groups(groups_out, groups)
-    return len(done), len(groups)
+        groups = build_groups(current, all_items)
+        _write_overlap_generation(groups_out, groups, current)
+        return len(current), len(groups)
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
+    """Parse overlap commands and require the endpoint and models for a run."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     commands = parser.add_subparsers(dest="command", required=True)
 
@@ -637,6 +1065,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     run_cmd.add_argument("--cache", type=Path, default=None, help="JSON cache file for embeddings")
     run_cmd.add_argument("--embed-model", default=DEFAULT_EMBED_MODEL,
                          help="embedding model name (PERITIA_LLM_EMBED_MODEL)")
+    run_cmd.add_argument("--embed-dims", type=int, help="assert the embedding vector dimensions")
     run_cmd.add_argument("--judge-model", default=DEFAULT_JUDGE_MODEL,
                          help="chat model name for judging (PERITIA_LLM_JUDGE_MODEL)")
     run_cmd.add_argument("--base-url", default=DEFAULT_BASE_URL,
@@ -655,6 +1084,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     if args.command == "run":
         if not args.base_url:
             parser.error("missing --base-url (or set PERITIA_LLM_BASE_URL)")
+        try:
+            validate_base_url(args.base_url)
+        except ValueError as error:
+            parser.error(str(error))
         if not args.embed_model:
             parser.error("missing --embed-model (or set PERITIA_LLM_EMBED_MODEL)")
         if not args.judge_model:
@@ -663,10 +1096,21 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 def main(argv: list[str]) -> int:
+    """Run the selected overlap command."""
     args = parse_args(argv)
-    if args.command == "summary":
-        print(summary(args.overlap, args.groups, args.candidates, skills_dir=args.skills_dir))
-        return 0
+    try:
+        if args.command == "summary":
+            print(summary(args.overlap, args.groups, args.candidates, skills_dir=args.skills_dir))
+        else:
+            _run_cli(args)
+    except (OSError, ValueError) as error:
+        print(f"overlap: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _run_cli(args: argparse.Namespace) -> None:
+    """Run the overlap stage and print the current summary."""
     client = LLMClient(args.base_url, args.timeout, api_key=os.environ.get("PERITIA_LLM_API_KEY"))
     judge = OverlapJudge(client, args.embed_model, args.judge_model)
     run(
@@ -679,11 +1123,13 @@ def main(argv: list[str]) -> int:
         judge_fn=judge.judge,
         judge_model=args.judge_model,
         cache_path=args.cache,
+        embed_model=args.embed_model,
+        provider=args.base_url,
+        embed_dims=args.embed_dims,
         k=args.k,
         limit=args.limit,
     )
     print(summary(args.out, args.groups, args.candidates, skills_dir=args.skills_dir, limit=args.limit))
-    return 0
 
 
 if __name__ == "__main__":
