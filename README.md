@@ -84,11 +84,13 @@ continues after a folder error while time remains and lists each error on
 stderr or in the JSON `errors` list.
 
 `DRIFT_SCAN_SECONDS` sets a 30-second scan budget for the whole drift run,
-including all client folders and synced sets. The deadline is checked between
-filesystem calls, so a single blocking call can overrun it. On expiry, the
-current folder gets an error with the limit and elapsed time. Remaining folders
-get the `not scanned` status in the JSON `folders` list and the same reason in
-`errors`. The exit status is 2 on expiry or any folder error, 1 for drift
+including all client folders and synced sets. The scan checks the deadline
+immediately before every filesystem call. One blocking call can still overrun
+the deadline. Only confirmed directories under the synced root enter the scan
+queue. On expiry, the current folder gets an error with the limit and elapsed
+time. Queued folders get the same reason in `errors`. The JSON `folders` list
+gives each folder's `path` and `status` (`scanned`, `absent`, `error`, or
+`not scanned`). The exit status is 2 on expiry or any folder error, 1 for drift
 without errors, or 0 otherwise.
 
 ## Census
