@@ -152,6 +152,38 @@ class CandidatesTests(unittest.TestCase):
                         self.assertIn("front matter unreadable", row.reason)
                         self.assertIn(detail, row.reason)
 
+    def test_licence_front_matter_line_endings_and_duplicate_keys(self) -> None:
+        """Use strict front matter evidence regardless of line endings."""
+        with tempfile.TemporaryDirectory() as tmp:
+            checkouts = Path(tmp)
+            source, path = "a/repo", "skills/demo/SKILL.md"
+            row = candidates.CensusRow(
+                source=source, path=path, skill_name="demo", blob_id="b1", pin="",
+                folder_license="", repository_license="Apache-2.0", ineligible="",
+                dup_of_blob="", failure_reason="",
+            )
+            tracer = candidates.UpstreamTracer(FakeGitHubReader())
+            skill = write_skill(checkouts, source, path)
+            for ending, licence, detail in (
+                ("\r", "license: [MIT]", "license must be a string"),
+                ("\r", "license: MIT", ""),
+                ("\n", "license: [MIT]\nlicense: MIT", "duplicate key 'license'"),
+                ("\n", "license: MIT\nlicense: MIT", "duplicate key 'license'"),
+                ("\n", "license: MIT", ""),
+                ("\r\n", "license: MIT", ""),
+            ):
+                with self.subTest(ending=ending, licence=licence):
+                    front = f"---\nname: demo\n{licence}\n---\n".replace("\n", ending)
+                    skill.write_bytes(front.encode())
+                    expected = candidates.LicenceResolution("MIT", "frontmatter")
+                    if detail:
+                        expected = candidates.LicenceResolution(
+                            "unreadable", "frontmatter", verdict="refused",
+                            reason=f"front matter unreadable: {detail}",
+                        )
+                    resolved = candidates.resolve_licence(row, checkouts, set(), tracer)
+                    self.assertEqual(resolved, expected)
+
     def test_folder_licence_byte_limit(self) -> None:
         """Read a licence at the byte cap and refuse an oversized file by name."""
         with tempfile.TemporaryDirectory() as tmp:

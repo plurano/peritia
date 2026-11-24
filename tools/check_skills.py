@@ -86,9 +86,14 @@ FETCH = re.compile(r"\b(?:pip install|uv pip install|uvx |npx |npm install|pnpm 
                    r"curl[^\n|]*\|\s*(?:ba)?sh|wget[^\n|]*\|\s*(?:ba)?sh)")
 
 
+def _normalize_line_endings(text: str) -> str:
+    """Translate CRLF and lone CR line endings to LF."""
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
 def fields(text):
     """Read the scalar provenance fields in ORIGIN.md."""
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = _normalize_line_endings(text)
     values = {}
     for match in islice(FIELD.finditer(text), MAX_ORIGIN_BYTES):
         key = match["key"]
@@ -377,7 +382,7 @@ def read_licence_scan(root: Path, *, today: date | None = None) -> LicenceScan:
 
 def _load_front_matter(text: str, loader: type[yaml.SafeLoader]) -> dict:
     """Parse the YAML mapping without converting value types."""
-    text = text.replace("\r\n", "\n")
+    text = _normalize_line_endings(text)
     match = FRONT.match(text)
     if not match:
         if text.startswith("---\n"):
@@ -393,12 +398,13 @@ def front_matter(
     text: str, *, exact_license: bool = False, require_string_licence: bool = False,
 ) -> dict[str, str]:
     """Project up to 100 YAML fields, optionally requiring string licence values."""
-    loader = _UniqueKeyLoader if exact_license else yaml.SafeLoader
+    strict = exact_license or require_string_licence
+    loader = _UniqueKeyLoader if strict else yaml.SafeLoader
     data = _load_front_matter(text, loader)
     if require_string_licence:
-        for field in ("license", "licence"):
-            if field in data and not isinstance(data[field], str):
-                raise TypeError(f"{field} must be a string")
+        for key in ("license", "licence"):
+            if key in data and not isinstance(data[key], str):
+                raise TypeError(f"{key} must be a string")
     meta: dict[str, str] = {}
     for i, (k, v) in enumerate(data.items()):
         if i >= 100:

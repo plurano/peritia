@@ -22,12 +22,10 @@ import tempfile
 import tomllib
 import urllib.parse
 from collections import Counter
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from dataclasses import dataclass
-from itertools import islice
 from pathlib import Path, PurePosixPath
 
-import census
 import check_skills
 import judge_groups
 from candidates import (
@@ -62,9 +60,14 @@ TIMEOUT = 60
 REPORT_FIELDS = ['candidate', 'verdict', 'directory', 'reason']
 INDEX_FIELDS = ['skill', 'source', 'functions', 'domains', 'overlap_group']
 INDEX_HEADER = '\t'.join(INDEX_FIELDS)
-PUBLICATION_OUTPUTS = (
-    'LICENSES', 'REUSE.toml', 'CREDITS.md', 'skills/INDEX.tsv', LICENCE_NOTICES_FILE,
-)
+SKILLS_DIR = 'skills'
+LICENCES_DIR = 'LICENSES'
+REUSE_FILE = 'REUSE.toml'
+CREDITS_FILE = 'CREDITS.md'
+INDEX_FILE = f'{SKILLS_DIR}/INDEX.tsv'
+DEFAULT_REPORT_FILE = 'adopt-report.tsv'
+PUBLICATION_FILES = (REUSE_FILE, CREDITS_FILE, INDEX_FILE, LICENCE_NOTICES_FILE)
+PUBLICATION_TREES = (SKILLS_DIR, LICENCES_DIR)
 REPOSITORY = re.compile(r'[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9][A-Za-z0-9._-]*\Z')
 NAME = re.compile(r'[a-z0-9][a-z0-9-]*\Z')
 MARKDOWN_EXTENSIONS = ('.md', '.markdown', '.mdx')
@@ -752,9 +755,9 @@ def stage_one(row, pin, staging, inputs: StageInputs, spdx: str):
 
 def initial_metadata(root):
     """Read the REUSE and credits files and validate the REUSE TOML."""
-    reuse = (root / 'REUSE.toml').read_text(encoding='utf-8')
+    reuse = (root / REUSE_FILE).read_text(encoding='utf-8')
     tomllib.loads(reuse)
-    credits_text = (root / 'CREDITS.md').read_text(encoding='utf-8')
+    credits_text = (root / CREDITS_FILE).read_text(encoding='utf-8')
     return reuse, credits_text
 
 
@@ -868,10 +871,11 @@ def candidate_folder(row: dict) -> str | None:
 
 def rebuild_index(root: Path, adopted_map: dict[str, dict] | None = None,
                   group_map: dict[str, str] | None = None) -> list[dict[str, str]]:
-    skills_dir = root / 'skills'
+    """Build index rows for the installed skills and retain existing metadata."""
+    skills_dir = root / SKILLS_DIR
     if not skills_dir.is_dir():
         return []
-    index_file = skills_dir / 'INDEX.tsv'
+    index_file = root / INDEX_FILE
     existing = {}
     if index_file.is_file():
         try:
@@ -920,11 +924,12 @@ def rebuild_index(root: Path, adopted_map: dict[str, dict] | None = None,
 
 def write_index(root: Path, adopted_map: dict[str, dict] | None = None,
                 group_map: dict[str, str] | None = None) -> None:
-    skills_dir = root / 'skills'
+    """Write the installed skill index when the skills directory exists."""
+    skills_dir = root / SKILLS_DIR
     if not skills_dir.is_dir():
         return
     rows = rebuild_index(root, adopted_map, group_map)
-    index_file = skills_dir / 'INDEX.tsv'
+    index_file = root / INDEX_FILE
     with index_file.open('w', encoding='utf-8', newline='') as handle:
         writer = csv.DictWriter(handle, fieldnames=INDEX_FIELDS, delimiter='\t', lineterminator='\n')
         writer.writeheader()
@@ -1082,7 +1087,7 @@ def evaluate(row, staging, stage: StageInputs, inputs: EvaluationInputs):
         run_gates(stage.root, staging, skill, row, folder, pin, state, inputs.gates)
         # A future gate fixer must preserve the checker contract too.
         _check_staged_skill(skill, template_dir, staged_scan)
-        result.update(verdict='adopted', directory=f'skills/{skill.name}')
+        result.update(verdict='adopted', directory=f'{SKILLS_DIR}/{skill.name}')
         if notices:
             result['reason'] = 'licence notices added: ' + '; '.join(sorted(notices))
             stage.licence_scan.notices = staged_scan.notices
@@ -1110,22 +1115,22 @@ def default_download_runner(args, *, cwd=None):
 
 def _download_licence(root: Path, spdx: str, runner) -> None:
     """Download a single SPDX template and require the promised output file."""
-    (root / 'LICENSES').mkdir(parents=True, exist_ok=True)
+    (root / LICENCES_DIR).mkdir(parents=True, exist_ok=True)
     try:
         runner(['reuse', 'download', spdx], cwd=root)
     except Exception as error:
         raise _LicenceDownloadError(f'licence download failed for {spdx}: {error}') from error
-    if not (root / 'LICENSES' / f'{spdx}.txt').is_file():
+    if not (root / LICENCES_DIR / f'{spdx}.txt').is_file():
         raise _LicenceDownloadError(f'licence download failed for {spdx}: template missing')
 
 
 def _stage_licence_template(root: Path, cache: Path, spdx: str, runner) -> Path:
     """Use a local SPDX template or download it once into the adoption staging cache."""
-    local = root / 'LICENSES'
+    local = root / LICENCES_DIR
     local_entry = local / f'{spdx}.txt'
     if local_entry.is_symlink() or local_entry.exists():
         return local
-    staged = cache / 'LICENSES'
+    staged = cache / LICENCES_DIR
     if not (staged / f'{spdx}.txt').is_file():
         _download_licence(cache, spdx, runner)
     return staged
@@ -1133,7 +1138,7 @@ def _stage_licence_template(root: Path, cache: Path, spdx: str, runner) -> Path:
 
 def sync_licences(root: Path, reuse_text: str, runner=default_download_runner, *, template_cache=None):
     """Install the staged SPDX texts and fetch any other missing REUSE texts."""
-    licenses_dir = root / 'LICENSES'
+    licenses_dir = root / LICENCES_DIR
     licenses_dir.mkdir(parents=True, exist_ok=True)
     data = tomllib.loads(reuse_text)
     spdx_ids = set()
@@ -1147,7 +1152,9 @@ def sync_licences(root: Path, reuse_text: str, runner=default_download_runner, *
         lic_file = licenses_dir / f'{spdx_id}.txt'
         if lic_file.is_file():
             continue
-        cached = template_cache / 'LICENSES' / lic_file.name if template_cache else None
+        cached = (
+            template_cache / LICENCES_DIR / lic_file.name if template_cache else None
+        )
         if cached is not None and cached.is_file():
             shutil.copyfile(cached, lic_file)
         else:
@@ -1190,46 +1197,39 @@ def publish(root, rows, publication: Publication):
     for row in rows[:MAX_ROWS]:
         if row['verdict'] == 'adopted':
             shutil.copytree(publication.saved / Path(row['directory']).name, root / row['directory'])
-    for name, text in [('REUSE.toml', publication.reuse), ('CREDITS.md', publication.credits_text)]:
+    for name, text in (
+        (REUSE_FILE, publication.reuse), (CREDITS_FILE, publication.credits_text),
+    ):
         (root / name).write_text(text, encoding='utf-8')
     write_index(root, adopted_map=publication.adopted_map, group_map=publication.group_map)
 
 
-def resolve_report_path(report: Path | None, root: Path) -> Path | None:
-    """Validate the requested report path and resolve its destination."""
+def resolve_report_path(report: Path | str | None, root: Path) -> Path | None:
+    """Derive the final report file and refuse conflicts with publication."""
     if report is None:
         return None
-    if report.is_symlink():
+    dest = Path(report)
+    if not dest.is_symlink():
+        dest = dest.resolve()
+        if dest.is_dir() or os.fspath(report).endswith(('/', '\\')):
+            dest /= DEFAULT_REPORT_FILE
+    if dest.is_symlink():
         raise ValueError('report output symlink refused')
-    dest = report.resolve()
-    if dest.is_dir() or str(report).endswith(('/', '\\')):
-        dest = dest / 'adopt-report.tsv'
-    root_resolved = root.resolve()
-    if dest == root_resolved or dest == (root_resolved / 'adopt-report.tsv'):
+    dest, root = dest.resolve(), root.resolve()
+    if dest in {root, root / DEFAULT_REPORT_FILE}:
         raise ValueError('repository root refused as report location')
+    for name in (*PUBLICATION_FILES, *PUBLICATION_TREES):
+        output = (root / name).resolve()
+        if dest.is_relative_to(output) or output.is_relative_to(dest):
+            raise ValueError(f'report path overlaps publication output: {name}')
     return dest
 
 
-def _validate_outputs(root: Path, report_file: Path | None) -> None:
-    """Refuse output symlinks and fixed report collisions before staging."""
-    for name in ('skills', 'REUSE.toml', 'CREDITS.md', LICENCE_NOTICES_FILE):
+def _validate_outputs(root: Path) -> None:
+    """Refuse publication output symlinks before staging."""
+    for name in (SKILLS_DIR, REUSE_FILE, CREDITS_FILE, LICENCE_NOTICES_FILE):
         if (root / name).is_symlink():
             raise ValueError(f'{name}: output symlink refused')
-    if report_file is not None and report_file.is_symlink():
-        raise ValueError('report output symlink refused')
-    _validate_report_overlap(root, report_file, PUBLICATION_OUTPUTS)
-
-
-def _validate_report_overlap(
-    root: Path, report_file: Path | None, outputs: Iterable[str],
-) -> None:
-    """Reject report files that would occupy or obstruct publication paths."""
-    if report_file is None:
-        return
-    for name in islice(outputs, check_skills.MAX_SKILLS):
-        output = (root / name).resolve()
-        if report_file.is_relative_to(output) or output.is_relative_to(report_file):
-            raise ValueError(f'report path overlaps publication output: {name}')
 
 
 def _evaluate_candidates(selected, stage: StageInputs, evaluation: EvaluationInputs, saved, metadata):
@@ -1261,9 +1261,9 @@ def run(candidates, groups, census, checkouts, root=Path('.'), *, apply=False,
     if runner is None:
         runner = default_download_runner
     root, checkouts = root.resolve(), checkouts.resolve()
+    _validate_outputs(root)
     report_file = resolve_report_path(report, root)
     selected, grouped, order, pins, group_rows, group_map, all_candidates = inputs(candidates, groups, census)
-    _validate_outputs(root, report_file)
 
     copies_map = {}
     if include_grouped:
@@ -1281,8 +1281,6 @@ def run(candidates, groups, census, checkouts, root=Path('.'), *, apply=False,
         template_cache = Path(tmp) / 'templates'
         stage = StageInputs(checkouts, root, occupied, apply, reader, template_cache, runner, licence_scan)
         rows, adopted_map, reuse, credits_text = _evaluate_candidates(selected, stage, evaluation, saved, metadata)
-        skill_outputs = (f'skills/{name}' for name in adopted_map)
-        _validate_report_overlap(root, report_file, skill_outputs)
         updated = licence_scan.notices
         register = (
             _render_notice_register(updated) if updated != existing_notices else None
@@ -1300,12 +1298,13 @@ def run(candidates, groups, census, checkouts, root=Path('.'), *, apply=False,
 
 
 def main(argv=None):
+    """Run the adoption CLI and print the report and summary."""
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('candidates', 'groups', 'census', 'checkouts'):
         parser.add_argument('--' + name, required=True, type=Path)
     parser.add_argument('--root', type=Path, default=Path('.'))
     parser.add_argument('--apply', action='store_true', help='write accepted skills and attribution')
-    parser.add_argument('--report', type=Path, default=None, help='write adopt-report.tsv to this path')
+    parser.add_argument('--report', help=f'write {DEFAULT_REPORT_FILE} to this path')
     parser.add_argument('--include-grouped', action='store_true', help='adopt overlap-group members except collapsed copies')
     parser.add_argument('--cache', type=Path, default=None, help='embedding cache JSON path (required by --include-grouped)')
     args = parser.parse_args(argv)

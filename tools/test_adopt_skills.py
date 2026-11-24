@@ -11,13 +11,21 @@ import shutil
 import tempfile
 import tomllib
 import unittest
+from contextlib import (
+    redirect_stderr,
+    redirect_stdout,
+)
+from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
 import adopt_skills as adopt
 import census
 import check_skills
-from licence_text import LICENCE_NOTICES_FILE, MAX_LICENCE_BYTES
+from licence_text import (
+    LICENCE_NOTICES_FILE,
+    MAX_LICENCE_BYTES,
+)
 
 REPO = Path(__file__).resolve().parent.parent
 MD = '---\nname: {name}\ndescription: Use when testing adoption.\n---\n\n# Example\n\nCheck the result.\n'
@@ -634,7 +642,6 @@ class AdoptionTests(unittest.TestCase):
         self.fixture()
         register = self.root / LICENCE_NOTICES_FILE
         register.parent.mkdir()
-        report = self.base / 'report.tsv'
         overflow = MAX_LICENCE_BYTES + 1
         register.write_text(self._register_seed(overflow), encoding='utf-8')
         before = snapshot(self.root)
@@ -642,11 +649,15 @@ class AdoptionTests(unittest.TestCase):
             f'{LICENCE_NOTICES_FILE}: serialized size {overflow} bytes '
             f'exceeds {MAX_LICENCE_BYTES} bytes'
         )
-        with self.assertRaisesRegex(ValueError, detail):
-            self.invoke(report=report)
-        self.assertEqual(snapshot(self.root), before)
-        self.assertFalse(report.exists())
+        for apply in (False, True):
+            with self.subTest(apply=apply):
+                report = self.base / f'overflow-{apply}.tsv'
+                with self.assertRaisesRegex(ValueError, detail):
+                    self.invoke(apply=apply, report=report)
+                self.assertEqual(snapshot(self.root), before)
+                self.assertFalse(report.exists())
 
+        report = self.base / 'report.tsv'
         register.write_text(self._register_seed(MAX_LICENCE_BYTES), encoding='utf-8')
         rows, _ = self.invoke(report=report)
         self.assertEqual(rows[0]['verdict'], 'adopted', rows)
@@ -700,6 +711,16 @@ class AdoptionTests(unittest.TestCase):
             self.invoke(report=report)
         self.assertEqual(target.read_text(encoding="utf-8"), "keep me\n")
 
+    def test_derived_report_output_symlink_refused(self):
+        """Refuse a symlink at the default destination within a report directory."""
+        directory = self.base / 'reports'
+        directory.mkdir()
+        target = directory / 'missing.tsv'
+        (directory / 'adopt-report.tsv').symlink_to(target)
+        with self.assertRaisesRegex(ValueError, 'report output symlink refused'):
+            self.invoke(apply=False, report=directory)
+        self.assertFalse(target.exists())
+
     def test_report_path_cannot_overlap_publication_outputs(self):
         """Keep every output intact when a report would land at or under it."""
         self.fixture()
@@ -718,11 +739,81 @@ class AdoptionTests(unittest.TestCase):
             ):
                 root = Path(tmp) / 'root'
                 shutil.copytree(self.root, root)
+                expected = 'skills' if output == 'skills/demo' else output
                 with patch.object(self, 'root', root), self.assertRaisesRegex(
-                    ValueError, f'report path overlaps publication output: {output}',
+                    ValueError, f'report path overlaps publication output: {expected}$',
                 ):
                     self.invoke(report=root / 'LICENSES' / '..' / (output + suffix))
                 self.assertEqual(snapshot(root), before)
+
+    def test_report_path_cannot_land_in_publication_trees(self):
+        """Refuse derived and explicit destinations before dry-run or apply writes."""
+        self.fixture()
+        (self.root / 'skills').mkdir()
+        before = snapshot(self.root)
+        for apply in (False, True):
+            for output in ('skills', 'LICENSES'):
+                for filename in ('', 'new-report.tsv'):
+                    with (
+                        self.subTest(apply=apply, output=output, filename=filename),
+                        tempfile.TemporaryDirectory(dir=self.base) as tmp,
+                    ):
+                        root = Path(tmp) / 'root'
+                        shutil.copytree(self.root, root)
+                        directory = root / output
+                        message = f'report path overlaps publication output: {output}$'
+                        with patch.object(self, 'root', root), self.assertRaisesRegex(
+                            ValueError, message,
+                        ):
+                            self.invoke(apply=apply, report=directory / filename)
+                        self.assertEqual(snapshot(root), before)
+                        self.assertFalse((directory / 'adopt-report.tsv').exists())
+                        self.assertFalse((directory / 'new-report.tsv').exists())
+
+    def test_cli_report_directory_with_trailing_slash_refused(self):
+        """Refuse a directory argument with a trailing slash in both CLI modes."""
+        self.invoke(apply=False)
+        directory = self.root / 'skills'
+        directory.mkdir()
+        before = snapshot(self.root)
+        argv = [
+            '--candidates', str(self.base / 'candidates.tsv'),
+            '--groups', str(self.base / 'groups.tsv'),
+            '--census', str(self.base / 'census.tsv'),
+            '--checkouts', str(self.checkouts), '--root', str(self.root),
+            '--report', f'{directory}/',
+        ]
+        for flags in ([], ['--apply']):
+            with (
+                self.subTest(flags=flags),
+                redirect_stderr(StringIO()) as errors,
+                redirect_stdout(StringIO()),
+            ):
+                self.assertEqual(adopt.main([*argv, *flags]), 1)
+                self.assertEqual(
+                    errors.getvalue(),
+                    'adopt-skills: report path overlaps publication output: skills\n',
+                )
+                self.assertEqual(snapshot(self.root), before)
+                self.assertFalse((directory / 'adopt-report.tsv').exists())
+
+    def test_report_path_allows_unrelated_directory_and_skills_prefix(self):
+        """Accept safe destinations derived from directories or a sibling file."""
+        self.fixture()
+        directory = self.base / 'reports'
+        directory.mkdir()
+        sibling = self.root / 'skills-report.tsv'
+        for report, destination in (
+            (directory, directory / 'adopt-report.tsv'),
+            (self.base, self.base / 'adopt-report.tsv'),
+            (sibling, sibling),
+        ):
+            with self.subTest(report=report):
+                rows, _ = self.invoke(apply=False, report=report)
+                self.assertEqual(rows[0]['verdict'], 'adopted', rows)
+                self.assertEqual(
+                    destination.read_text(encoding='utf-8'), adopt.report_text(rows),
+                )
 
     def test_report_path_written_and_root_refused(self):
         self.fixture()

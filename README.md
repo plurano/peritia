@@ -33,12 +33,15 @@ canonical SPDX text in `LICENSES/` for the ID declared in `ORIGIN.md`.
 A front matter `license` declaration must identify the same licence or point
 to the licence file.
 
-Keep vendored licence files unchanged. The checker accepts exact copyright
-notice lines from the selected SPDX template or the reviewed
-[`skills/licence-notices.yaml`](skills/licence-notices.yaml) register. It collapses
-whitespace before matching the line, preserving case and punctuation. Adoption
-lists each proposed addition in its report and writes a sorted, deduplicated
-register with the adopted skills. Review each new line in the diff.
+Keep vendored licence files unchanged. Copyright notice lines start with
+`Copyright ` (with a trailing space) or `©`, including `©2026` without a space.
+Lettered clause lines such as `(c)` stay in the licence body comparison. The
+checker accepts exact notices from the selected SPDX template or the
+reviewed [`skills/licence-notices.yaml`](skills/licence-notices.yaml) register.
+It collapses whitespace before matching the line, preserving case and
+punctuation. Adoption lists each proposed addition in its report and writes a
+sorted, deduplicated register with the adopted skills. Review each new line in
+the diff.
 
 For a reviewed licence body variant at exactly `skills/<name>/LICENSE`, record
 the path, SPDX ID, SHA-256 hash of the original bytes, and reason in
