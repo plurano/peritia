@@ -203,6 +203,20 @@ class AdoptionTests(unittest.TestCase):
         self.assertIn('name changed from demo to demo-owner', (skill / 'ORIGIN.md').read_text())
         self.assertEqual(check_skills.skill_problems(skill), [])
 
+    def test_adoption_inputs_require_matching_overlap_generation(self):
+        """Consume verified group rows and refuse adoption after either file changes."""
+        candidates = self.base / 'candidates.tsv'
+        census_path = self.base / 'census.tsv'
+        groups = self.base / 'groups.tsv'
+        tsv(candidates, CANDIDATE_FIELDS, [])
+        tsv(census_path, ['source', 'path', 'pin'], [])
+        overlap._write_overlap_generation(groups, [], [])
+        self.assertEqual(adopt.inputs(candidates, groups, census_path)[4], [])
+        pairs = overlap._current_pairs_path(groups)
+        pairs.write_bytes(pairs.read_bytes() + b'\n')
+        with self.assertRaisesRegex(ValueError, r'python3 tools/overlap\.py run'):
+            adopt.inputs(candidates, groups, census_path)
+
     def test_grouped_candidate_is_skipped(self):
         row = self.fixture()
         self.groups = [{'members': f'skills/existing,{adopt.candidate_id(row)}'}]

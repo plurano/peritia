@@ -32,6 +32,7 @@ from input_identity import (
     bounded_history,
     fingerprint,
     open_fingerprinted_tsv,
+    output_lock,
     provider_id,
     text_sha256,
     validate_base_url,
@@ -215,9 +216,9 @@ def run(items: list[Item], checkouts: Path, output: Path, ask: Callable[[str], A
         "request": structured_request_parameters(label_schema(), LABEL_SCHEMA_NAME),
     }
     counts: Counter = Counter()
-    handle, writer = open_fingerprinted_tsv(output, OUTPUT_FIELDS, "input_fp", max_rows=MAX_ROWS)
-    with handle:
-        done = {blob: row.get("input_fp") for blob, row in latest_classifications(output).items()}
+    with output_lock(output):
+        log = open_fingerprinted_tsv(output, OUTPUT_FIELDS, "input_fp", max_rows=MAX_ROWS)
+        done = latest_classifications(output)
         for item in items:
             if limit is not None and counts.total() >= limit:
                 break
@@ -227,16 +228,16 @@ def run(items: list[Item], checkouts: Path, output: Path, ask: Callable[[str], A
                 input_fp = fingerprint("classify", {
                     **context, "blob_id": item.blob_id, "skill_text_sha256": text_sha256(skill_prompt(text)),
                 })
-                if done.get(item.blob_id) == input_fp:
+                if done.get(item.blob_id, {}).get("input_fp") == input_fp:
                     continue
             labels = classify_one(ask, text) if text is not None else None
             status = "ok" if labels else "error"
             functions, domains = labels or ([], [])
-            writer.writerow({"blob_id": item.blob_id, "source": item.source, "path": item.path,
-                             "skill_name": item.skill_name, "functions": ";".join(functions),
-                             "domains": ";".join(domains), "model": model, "status": status, "input_fp": input_fp})
-            handle.flush()
-            done[item.blob_id] = input_fp
+            row = {"blob_id": item.blob_id, "source": item.source, "path": item.path,
+                   "skill_name": item.skill_name, "functions": ";".join(functions),
+                   "domains": ";".join(domains), "model": model, "status": status, "input_fp": input_fp}
+            log.append(row, item.blob_id, done)
+            done[item.blob_id] = row
             counts[status] += 1
     return counts
 

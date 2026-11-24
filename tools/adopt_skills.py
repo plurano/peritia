@@ -87,19 +87,33 @@ def git(checkout, *args, data=None, allow_fetch=False):
     return command(['git', '-C', str(checkout), *args], data=data, allow_fetch=allow_fetch)
 
 
-def read_rows(path, required):
-    with path.open(encoding='utf-8', newline='') as handle:
-        reader = csv.DictReader(handle, delimiter='\t')
-        if not required.issubset(reader.fieldnames or []):
-            raise ValueError(f'{path}: missing columns {sorted(required)}')
-        rows = []
-        for index, row in enumerate(reader):
-            if index >= MAX_ROWS:
-                raise ValueError(f'{path}: more than {MAX_ROWS} rows')
-            if None in row or any(value is None for value in row.values()):
-                raise ValueError(f'{path}: malformed row {index + 2}')
-            rows.append(row)
+def _read_rows(path, handle, required):
+    """Read a bounded TSV from the supplied snapshot and validate its columns."""
+    reader = csv.DictReader(handle, delimiter='\t')
+    if not required.issubset(reader.fieldnames or []):
+        raise ValueError(f'{path}: missing columns {sorted(required)}')
+    rows = []
+    for index, row in enumerate(reader):
+        if index >= MAX_ROWS:
+            raise ValueError(f'{path}: more than {MAX_ROWS} rows')
+        if None in row or any(value is None for value in row.values()):
+            raise ValueError(f'{path}: malformed row {index + 2}')
+        rows.append(row)
     return rows
+
+
+def read_rows(path, required):
+    """Read a bounded input TSV with the required columns."""
+    with path.open(encoding='utf-8', newline='') as handle:
+        return _read_rows(path, handle, required)
+
+
+def _read_group_rows(path):
+    """Use the verified groups snapshot for adoption."""
+    with overlap.open_overlap_generation(path) as (handle, _):
+        if handle is None:
+            raise FileNotFoundError(path)
+        return _read_rows(path, handle, {'members'})
 
 
 def candidate_id(row):
@@ -110,7 +124,7 @@ def inputs(candidates, groups, census):
     candidate_rows = read_rows(candidates, {'source', 'path', 'skill_name', 'verdict',
                                             'licence', 'licence_evidence', 'functions'})
     census = read_rows(census, {'source', 'path', 'pin'})
-    groups = read_rows(groups, {'members'})
+    groups = _read_group_rows(groups)
     order, pins = {}, {}
     for index, row in enumerate(census):
         source, pin = row['source'], row['pin']

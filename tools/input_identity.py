@@ -4,20 +4,31 @@
 from __future__ import annotations
 
 import csv
+import errno
 import hashlib
 import io
 import json
 import os
 import sys
-from collections.abc import Iterable, Iterator
+import tempfile
+import time
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass
+from functools import partial
 from itertools import islice
 from pathlib import Path
 from typing import Any, BinaryIO, TextIO, TypeVar
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 FINGERPRINT_VERSION = 1
-MAX_LEGACY_TSV_ROWS = 500_000
+LOCK_WAIT_SECONDS = 30.0
+LOCK_POLL_SECONDS = 0.05
+MAX_RECORD_BYTES = 16 * 1024 * 1024
+COPY_BLOCK_BYTES = 64 * 1024
+TSV_DELIMITER = "\t"
 Row = TypeVar("Row")
+Key = TypeVar("Key")
 
 
 def canonical_json(value: Any) -> str:
@@ -89,102 +100,320 @@ def bounded_history(path: Path, rows: Iterable[Row], cap: int) -> Iterator[Row]:
         raise ValueError(f"{path}: history exceeds cap of {cap} rows")
 
 
-def append_separator(handle: BinaryIO) -> bytes:
-    """Return the separator needed to preserve an unterminated append-log tail."""
-    if handle.seek(0, os.SEEK_END):
-        handle.seek(-1, os.SEEK_END)
-        if handle.read(1) != b"\n":
-            return b"\n"
-    return b""
+def _lock_operation(handle: BinaryIO, *, acquire: bool) -> None:
+    """Try or release the exclusive lock using the host's file-locking API."""
+    if os.name == "nt":
+        import msvcrt
+
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK if acquire else msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB if acquire else fcntl.LOCK_UN)
 
 
-def _read_tsv_header(path: Path) -> list[str]:
-    """Read the first TSV record from a migration source or archive."""
-    with path.open(newline="", encoding="utf-8") as handle:
-        return next(csv.reader(handle, delimiter="\t"), [])
+@contextmanager
+def output_lock(path: Path) -> Iterator[None]:
+    """Lock the output's stable sibling for a bounded wait. Linux tests do not exercise Windows locking."""
+    lock_path = path.with_name(path.name + ".lock")
+    deadline = time.monotonic() + LOCK_WAIT_SECONDS
+    attempts = 1 + int(LOCK_WAIT_SECONDS / LOCK_POLL_SECONDS)
+    with lock_path.open("a+b") as handle:
+        for _ in range(attempts):
+            try:
+                _lock_operation(handle, acquire=True)
+            except OSError as error:
+                if error.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(LOCK_POLL_SECONDS, remaining))
+            else:
+                try:
+                    yield
+                finally:
+                    _lock_operation(handle, acquire=False)
+                return
+    raise TimeoutError(f"{lock_path}: timed out waiting for output lock after {LOCK_WAIT_SECONDS:g}s")
 
 
-def _reserve_archive(path: Path) -> Path:
-    """Reserve an unused sibling archive name without clobbering another writer."""
+def _reserve_archive(path: Path, kind: str) -> Path:
+    """Reserve an unused sibling archive name exclusively."""
     for n in range(1, 100):
-        archive = path.with_name(f"{path.stem}.legacy-{n}{path.suffix}")
+        archive = path.with_name(f"{path.stem}.{kind}-{n}{path.suffix}")
         try:
-            fd = os.open(archive, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with archive.open("xb"):
+                return archive
         except FileExistsError:
             continue
-        os.close(fd)
-        return archive
-    raise ValueError(f"{path}: all 99 legacy archive names are taken")
+    raise ValueError(f"{path}: all 99 {kind} archive names are taken")
 
 
-def _archive_legacy_tsv(path: Path, count: int, legacy_header: list[str]) -> None:
-    """Atomically archive legacy bytes on the same filesystem and check for races."""
-    archive = _reserve_archive(path)
-    try:
-        found_header = _read_tsv_header(path)
-    except OSError as error:
-        archive.unlink(missing_ok=True)
-        raise OSError(f"{path}: could not migrate TSV to {archive}: {error}") from error
-    if found_header != legacy_header:
-        archive.unlink(missing_ok=True)
-        raise ValueError(f"{path}: TSV changed before migration to {archive}")
+def _archive_output(path: Path, kind: str) -> Path:
+    """Move an output to an archive, preserving it even after an ambiguous rename."""
+    archive = _reserve_archive(path, kind)
     try:
         os.replace(path, archive)
     except OSError as error:
-        # A failed acknowledgement can leave the source bytes in the archive.
-        raise OSError(f"{path}: could not migrate TSV to {archive}: {error}") from error
-    if _read_tsv_header(archive) != legacy_header:
-        raise ValueError(f"{path}: concurrent migration moved current data to {archive}")
+        if path.exists():
+            archive.unlink(missing_ok=True)
+        raise OSError(f"{path}: could not archive output to {archive}: {error}") from error
+    return archive
+
+
+@contextmanager
+def staged_output(path: Path, write: Callable[[BinaryIO], None]) -> Iterator[Path]:
+    """Stage a complete file beside its destination, ready for atomic replacement."""
+    with tempfile.NamedTemporaryFile(prefix=f".{path.name}.", suffix=".tmp",
+                                     dir=path.parent, delete=False) as handle:
+        temporary = Path(handle.name)
+        try:
+            write(handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+            handle.close()
+            yield temporary
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def digest_file(handle: BinaryIO) -> str:
+    """Hash an open file and rewind it for a subsequent read."""
+    handle.seek(0)
+    digest = hashlib.file_digest(handle, "sha256").hexdigest()
+    handle.seek(0)
+    return digest
+
+
+def file_sha256(path: Path) -> str | None:
+    """Return the current file's digest, or None when publication has yet to create it."""
+    try:
+        with path.open("rb") as handle:
+            return digest_file(handle)
+    except FileNotFoundError:
+        return None
+
+
+def _quarantine_tail(path: Path, boundary: int) -> None:
+    """Persist the exact torn suffix before truncating the active output."""
+    with path.open("r+b") as handle:
+        length = handle.seek(0, os.SEEK_END) - boundary
+        if not length:
+            return
+        handle.seek(boundary)
+        archive = _reserve_archive(path, "torn")
+        with archive.open("wb") as copy:
+            for offset in range(0, length, COPY_BLOCK_BYTES):
+                block = min(COPY_BLOCK_BYTES, length - offset)
+                data = handle.read(block)
+                if len(data) != block:
+                    raise OSError(f"{path}: short read while quarantining {archive}")
+                copy.write(data)
+            copy.flush()
+            os.fsync(copy.fileno())
+        handle.truncate(boundary)
+    print(f"{path}: quarantined {length} bytes to {archive}", file=sys.stderr)
+
+
+@dataclass
+class _TsvLines:
+    """Track byte offsets while reading CSV's universal, untranslated physical lines."""
+
+    handle: TextIO
+    path: Path
+    size: int
+    position: int = 0
+    boundary: int = 0
+
+    def read(self) -> Iterator[str]:
+        """Feed complete UTF-8 physical lines within a per-record byte cap."""
+        for _ in range(self.size):
+            remaining = MAX_RECORD_BYTES - (self.position - self.boundary)
+            line = self.handle.readline(remaining + 1)
+            length = len(line.encode("utf-8"))
+            if length > remaining:
+                raise ValueError(f"{self.path}: TSV record exceeds cap of {MAX_RECORD_BYTES} bytes")
+            if not line.endswith(("\n", "\r")):
+                return
+            self.position += length
+            yield line
+
+
+def _tsv_prefix(path: Path, cap: int) -> tuple[list[str] | None, int, int]:
+    """Return header, row count and end offset of the complete TSV prefix."""
+    count = 0
+    header = None
+    with path.open(newline="", encoding="utf-8", errors="surrogateescape") as handle:
+        source = _TsvLines(handle, path, os.fstat(handle.fileno()).st_size)
+        rows = csv.reader(source.read(), delimiter=TSV_DELIMITER, strict=True)
+        try:
+            header = next(rows, None)
+            source.boundary = source.position
+            for row in rows:
+                source.boundary = source.position
+                count += bool(row)
+                if count > cap:
+                    raise ValueError(f"{path}: history exceeds cap of {cap} rows")
+        except (UnicodeEncodeError, csv.Error):
+            pass
+    return header, count, source.boundary
+
+
+def _jsonl_prefix(path: Path, cap: int) -> tuple[int, int]:
+    """Return the line count and offset through the last newline-terminated JSON value."""
+    count = boundary = 0
+    with path.open("rb") as handle:
+        lines = iter(partial(handle.readline, MAX_RECORD_BYTES + 1), b"")
+        for index, line in enumerate(bounded_history(path, lines, cap), 1):
+            if len(line) > MAX_RECORD_BYTES:
+                raise ValueError(f"{path}: JSONL record exceeds cap of {MAX_RECORD_BYTES} bytes")
+            if not line.endswith(b"\n"):
+                break
+            try:
+                json.loads(line.decode("utf-8"))
+            except (ValueError, RecursionError):
+                continue
+            count, boundary = index, handle.tell()
+    return count, boundary
+
+
+def _pending_compaction(path: Path) -> Path:
+    """Locate the staged active history used to recover an interrupted compaction."""
+    return path.with_name(f".{path.name}.compacting")
+
+
+def _finish_compaction(path: Path) -> None:
+    """Complete a compaction interrupted after archiving the old active file."""
+    pending = _pending_compaction(path)
+    if pending.is_file():
+        if path.exists():
+            pending.unlink()
+        else:
+            os.replace(pending, path)
+
+
+@dataclass
+class AppendLog:
+    """Track the active record count and enforce its cap under the caller's lock."""
+
+    path: Path
+    cap: int
+    count: int
+    encode: Callable[[dict], bytes]
+    header: bytes = b""
+
+    def _compact(self, payload: bytes, key: Key, latest: Mapping[Key, dict]) -> None:
+        """Archive the active log and publish the staged latest records."""
+        if len(latest) >= self.cap:
+            raise ValueError(f"{self.path}: latest history reaches cap of {self.cap} rows")
+
+        def write(handle: BinaryIO) -> None:
+            """Write the header and all retained records to the staged log."""
+            handle.write(self.header)
+            for previous_key, row in latest.items():
+                if previous_key != key:
+                    handle.write(self.encode(row))
+            handle.write(payload)
+
+        pending = _pending_compaction(self.path)
+        with staged_output(self.path, write) as temporary:
+            os.replace(temporary, pending)
+            _archive_output(self.path, "history")
+            os.replace(pending, self.path)
+        self.count = len(latest) + (key not in latest)
+
+    def append(self, row: dict, key: Key, latest: Mapping[Key, dict]) -> None:
+        """Append one complete record, compacting active history when required."""
+        payload = self.encode(row)
+        if len(payload) > MAX_RECORD_BYTES:
+            raise ValueError(f"{self.path}: record exceeds cap of {MAX_RECORD_BYTES} bytes")
+        if self.count >= self.cap:
+            self._compact(payload, key, latest)
+            return
+        with self.path.open("ab") as handle:
+            handle.write(payload)
+        self.count += 1
+
+
+@dataclass
+class _TsvSink:
+    """Accept whole records from csv.writer and emit UTF-8 bytes with LF separators."""
+
+    emit: Callable[[bytes], object]
+
+    def write(self, record: str) -> None:
+        """Use LF as the record terminator while keeping CR quoted inside fields."""
+        self.emit((record[:-2] + "\n").encode())
+
+
+def write_tsv(
+    emit: Callable[[bytes], object], fields: Sequence[str], rows: Iterable[dict], *, header: bool = True,
+) -> None:
+    """Serialize TSV with common quoting and byte encoding for logs and snapshots."""
+    writer = csv.DictWriter(_TsvSink(emit), fieldnames=fields, delimiter=TSV_DELIMITER, lineterminator="\r\n")
+    if header:
+        writer.writeheader()
+    writer.writerows(rows)
+
+
+def tsv_sha256(fields: Sequence[str], rows: Iterable[dict]) -> str:
+    """Hash the published encoding without materializing or staging the TSV."""
+    digest = hashlib.sha256()
+    write_tsv(digest.update, fields, rows)
+    return digest.hexdigest()
+
+
+def _tsv_record(fields: Sequence[str], row: dict | None = None) -> bytes:
+    """Encode a header or one TSV record within the reader's CSV field limit."""
+    out = io.BytesIO()
+    if row is None:
+        write_tsv(out.write, fields, ())
+    else:
+        if any(len(str(value)) > csv.field_size_limit() for value in row.values()):
+            raise ValueError(f"TSV field exceeds cap of {csv.field_size_limit()} characters")
+        write_tsv(out.write, fields, (row,), header=False)
+    return out.getvalue()
+
+
+def _prepare_tsv_history(path: Path, fields: list[str], fp_field: str, cap: int) -> int:
+    """Archive legacy data or repair the current TSV and count its complete rows."""
+    if not path.exists():
+        return 0
+    found, count, boundary = _tsv_prefix(path, cap)
+    if found is None or found == fields:
+        _quarantine_tail(path, boundary)
+        return count
+    if fp_field in found:
+        raise ValueError(f"{path}: TSV header {found!r} differs from expected {fields!r}")
+    archive = _archive_output(path, "legacy")
     label = "row" if count == 1 else "rows"
     print(f"{path}: moved {count} {label} to {archive} (legacy TSV)", file=sys.stderr)
+    return 0
 
 
-def _tsv_append_mode(path: Path, fields: list[str], fp_field: str, max_rows: int) -> str:
-    """Select append or create mode after checking and migrating the header."""
-    try:
-        handle = path.open(newline="", encoding="utf-8")
-    except FileNotFoundError:
-        return "x"
-    with handle:
-        rows = csv.reader(handle, delimiter="\t")
-        header = next(rows, [])
-        if header == fields:
-            return "a"
-        if fp_field in header:
-            raise ValueError(f"{path}: TSV header {header!r} differs from expected {fields!r}")
-        count = sum(bool(row) for row in bounded_history(path, rows, max_rows))
-    _archive_legacy_tsv(path, count, header)
-    return "x"
+def open_fingerprinted_tsv(path: Path, fields: list[str], fp_field: str, *, max_rows: int) -> AppendLog:
+    """Prepare a fingerprinted TSV under its output lock and return its append log."""
+    _finish_compaction(path)
+    count = _prepare_tsv_history(path, fields, fp_field, max_rows)
+    header = _tsv_record(fields)
+    if not path.exists() or not path.stat().st_size:
+        with staged_output(path, lambda handle: handle.write(header)) as temporary:
+            os.replace(temporary, path)
+    return AppendLog(path, max_rows, count, partial(_tsv_record, fields), header)
 
 
-def _open_tsv_output(path: Path, mode: str) -> TextIO:
-    """Open a new TSV or put a line boundary before the next append."""
-    if mode == "x":
-        return path.open("x", newline="", encoding="utf-8")
-    binary = path.open("a+b")
-    try:
-        separator = append_separator(binary)
-        if separator:
-            binary.write(separator)
-            binary.flush()
-        return io.TextIOWrapper(binary, newline="", encoding="utf-8")
-    except OSError:
-        binary.close()
-        raise
+def _jsonl_record(record: dict) -> bytes:
+    """Encode one trial as a newline-terminated JSON record."""
+    return (json.dumps(record) + "\n").encode()
 
 
-def open_fingerprinted_tsv(
-    path: Path, fields: list[str], fp_field: str, *, max_rows: int = MAX_LEGACY_TSV_ROWS,
-) -> tuple[TextIO, csv.DictWriter]:
-    """Return an open TSV handle and writer after validating or creating the schema."""
-    mode = _tsv_append_mode(path, fields, fp_field, max_rows)
-    handle = _open_tsv_output(path, mode)
-    writer = csv.DictWriter(handle, fieldnames=fields, delimiter="\t", lineterminator="\n")
-    if mode == "x":
-        try:
-            writer.writeheader()
-            handle.flush()
-        except OSError:
-            handle.close()
-            raise
-    return handle, writer
+def open_jsonl_history(path: Path, cap: int) -> AppendLog:
+    """Repair the JSONL tail under its output lock and return its append log."""
+    _finish_compaction(path)
+    count = 0
+    if path.exists():
+        count, boundary = _jsonl_prefix(path, cap)
+        _quarantine_tail(path, boundary)
+    return AppendLog(path, cap, count, _jsonl_record)

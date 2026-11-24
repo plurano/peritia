@@ -16,6 +16,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import adopt_skills
+import input_identity
 import judge_groups
 import llm_client
 import overlap
@@ -477,6 +478,90 @@ class OverlapResumeTests(unittest.TestCase):
               self.assertRaisesRegex(ValueError, r"overlap\.tsv.*cap.*2")):
             overlap.load_done_pairs(self.out)
 
+    def test_overlap_output_lock_blocks_inference_and_publication(self):
+        """Hold the history lock for the whole overlap run."""
+        with (patch.object(input_identity, "LOCK_WAIT_SECONDS", 0.001),
+              input_identity.output_lock(self.out),
+              self.assertRaisesRegex(TimeoutError, r"overlap\.tsv\.lock")):
+            self.run_overlap()
+        self.assertEqual(self.judge_calls, [])
+        self.assertFalse(self.groups.exists())
+
+    def test_pair_history_compacts_at_cap(self):
+        """Retain all archived rows and resume the compacted pair judgments."""
+        with patch.object(overlap, "MAX_PAIRS", 5):
+            self.run_overlap()
+            self.run_overlap(model="second", k=1)
+            original = self.out.read_bytes()
+            write_skill_file(self.checkouts, "s/c3/SKILL.md", "---\nname: c3\ndescription: Edited\n---\n")
+            self.run_overlap(model="second", k=1)
+            self.assertEqual(len(self.judge_calls), 1)
+            self.assertEqual(self.out.with_name("overlap.history-1.tsv").read_bytes(), original)
+            self.assertEqual(len(self.out.read_bytes().splitlines()), 4)
+            paths = (self.out, self.groups, overlap._current_pairs_path(self.groups), overlap._generation_path(self.groups))
+            before = [(path.read_bytes(), path.stat().st_mtime_ns) for path in paths]
+            self.run_overlap(model="second", k=1)
+            self.assertEqual(self.judge_calls, [])
+            self.assertEqual([(path.read_bytes(), path.stat().st_mtime_ns) for path in paths], before)
+
+    def test_distinct_pair_history_at_cap_refuses_append(self):
+        """Keep an exactly full pair history intact when each row is required."""
+        with patch.object(overlap, "MAX_PAIRS", 3):
+            self.run_overlap()
+            before = self.out.read_bytes(), self.out.stat().st_mtime_ns
+            with self.assertRaisesRegex(ValueError, r"overlap\.tsv.*cap of 3 rows"):
+                self.run_overlap(model="second")
+            self.assertEqual((self.out.read_bytes(), self.out.stat().st_mtime_ns), before)
+            self.assertFalse(self.out.with_name("overlap.history-1.tsv").exists())
+
+    def test_publication_interruptions_leave_no_readable_mixed_generation(self):
+        """Refuse both an incomplete first generation and a stale manifest on update."""
+        rerun = r"python3 tools/overlap\.py run"
+        replace_file = os.replace
+        for failure_point in ("pairs", "manifest"):
+            with self.subTest(failure_point=failure_point):
+                pairs = overlap._current_pairs_path(self.groups)
+                manifest = overlap._generation_path(self.groups)
+                target = pairs if failure_point == "pairs" else manifest
+                same_use = failure_point == "manifest"
+
+                def interrupt(source, destination, target=target):
+                    """Fail before replacing the selected component."""
+                    if destination == target:
+                        raise OSError("interrupted publication")
+                    replace_file(source, destination)
+
+                with (patch.object(overlap.os, "replace", side_effect=interrupt),
+                      self.assertRaisesRegex(OSError, "interrupted publication")):
+                    self.run_overlap(model=failure_point, same_use=same_use)
+                for read in (lambda: overlap.summary(self.out, self.groups),
+                             lambda: judge_groups.load_groups(self.groups),
+                             lambda: adopt_skills._read_group_rows(self.groups)):
+                    with self.assertRaisesRegex(ValueError, rerun):
+                        read()
+                self.run_overlap(model=failure_point, same_use=same_use)
+                self.assertEqual(self.judge_calls, [])
+                self.assertIn(f"groups: {int(same_use)}", overlap.summary(self.out, self.groups))
+
+    def test_summary_refuses_hash_mismatch_in_either_published_file(self):
+        """Verify both published byte streams even when they remain valid TSV."""
+        self.run_overlap()
+        for path in (self.groups, overlap._current_pairs_path(self.groups)):
+            with self.subTest(path=path):
+                before = path.read_bytes()
+                path.write_bytes(before + b"\n")
+                with self.assertRaisesRegex(ValueError, r"python3 tools/overlap\.py run"):
+                    overlap.summary(self.out, self.groups)
+                path.write_bytes(before)
+        self.assertIn("groups: 1", overlap.summary(self.out, self.groups))
+
+    def test_groups_and_pair_snapshot_require_manifest(self):
+        """Reject an otherwise complete generation after the manifest is lost."""
+        self.run_overlap()
+        overlap._generation_path(self.groups).unlink()
+        with self.assertRaisesRegex(ValueError, r"python3 tools/overlap\.py run"):
+            overlap.summary(self.out, self.groups)
+
     def test_resume_skips_judged_pairs(self):
         """Reuse all three judgments when inputs match and preserve the TSV bytes."""
         self.assertEqual(self.run_overlap(), (3, 1))
@@ -601,6 +686,45 @@ class OverlapEmbeddingIdentityTests(unittest.TestCase):
     def load_cache_json(self):
         """Read the stored cache document for structural assertions."""
         return json.loads(self.cache.read_text(encoding="utf-8"))
+
+    def test_interleaved_cache_writers_keep_both_vectors_and_namespaces(self):
+        """Persist another run's additions made after this run reads the cache."""
+        second = replace(self.item, item_id="second", description="second description")
+
+        def interleave(texts):
+            """Save two new vectors to disk before the outer writer can save."""
+            overlap.get_embeddings([second], lambda _: [[1.0, 0.0, 0.0]], self.cache, model="embed")
+            overlap.get_embeddings([second], lambda _: [[0.0, 1.0, 0.0]], self.cache, model="other")
+            return self.embed(texts)
+
+        overlap.get_embeddings([self.item], interleave, self.cache, model="embed")
+        with patch.object(overlap, "save_cache", wraps=overlap.save_cache) as save:
+            result = overlap.get_embeddings([self.item, second], self.embed, self.cache, model="embed")
+            save.assert_not_called()
+        self.assertEqual(result, {"item1": [0.1, 0.2, 0.3], "second": [1.0, 0.0, 0.0]})
+        self.assertEqual(len(self.load_cache_json()["namespaces"]), 2)
+
+    def test_cache_lock_blocks_independent_writer(self):
+        """Prevent a writer from publishing while an independent holder locks the cache."""
+        with (patch.object(input_identity, "LOCK_WAIT_SECONDS", 0.001),
+              input_identity.output_lock(self.cache),
+              self.assertRaisesRegex(TimeoutError, r"embeddings\.json\.lock")):
+            overlap.get_embeddings([self.item], self.embed, self.cache, model="embed")
+        self.assertFalse(self.cache.exists())
+
+    def test_conflicting_cache_writers_keep_the_published_vector(self):
+        """Reject a different vector for the same namespace and input hash."""
+        namespace = overlap.EmbeddingSpace("embed", "", overlap.EMBED_PREPROCESSING).key(3)
+
+        def interleave(texts):
+            """Publish another vector for the same input before the outer save."""
+            overlap.get_embeddings([self.item], lambda _: [[1.0, 0.0, 0.0]], self.cache, model="embed")
+            return self.embed(texts)
+
+        with self.assertRaisesRegex(ValueError, rf"{namespace}.*conflicting vector"):
+            overlap.get_embeddings([self.item], interleave, self.cache, model="embed")
+        result = overlap.load_embeddings(self.cache, [self.item], "embed", "")
+        self.assertEqual(result, {"item1": [1.0, 0.0, 0.0]})
 
     def test_embeddings_cache_hit_makes_no_call(self):
         """Reuse a matching vector without contacting the embedding model."""

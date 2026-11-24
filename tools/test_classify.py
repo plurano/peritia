@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import classify
+import input_identity
 
 CENSUS_FIELDS = ["source", "pin", "path", "skill_name", "blob_id", "dup_of_blob", "failure_reason"]
 
@@ -236,6 +237,80 @@ class RunTests(unittest.TestCase):
         self.assertEqual(self.classify(), ["x", "y"])
         self.assertEqual(self.out.with_name("resume.legacy-1.tsv").read_bytes(), original)
         self.assertIn("rows=2 ok=2 error=0 models=model-a", classify.summary(self.out))
+
+    def test_migration_holds_output_lock_until_new_rows_are_written(self):
+        """Block a competing run inside migration and preserve both generations."""
+        original = b"blob_id\tmodel\n1\told-a\n2\told-b\n"
+        self.out.write_bytes(original)
+        archive = input_identity._archive_output
+
+        def migrate(path, kind):
+            """Try to acquire the same output lock before renaming the legacy TSV."""
+            with self.assertRaisesRegex(TimeoutError, r"resume\.tsv\.lock"):
+                with input_identity.output_lock(path):
+                    self.fail("migration did not hold the output lock")
+            return archive(path, kind)
+
+        def ask(text):
+            """Verify that inference still runs inside the same lock."""
+            with self.assertRaisesRegex(TimeoutError, r"resume\.tsv\.lock"):
+                with input_identity.output_lock(self.out):
+                    self.fail("inference did not hold the output lock")
+            return self.ask(text)
+
+        with (patch.object(input_identity, "LOCK_WAIT_SECONDS", 0.001),
+              patch.object(input_identity, "_archive_output", side_effect=migrate)):
+            classify.run(self.items, self.folder, self.out, ask, "model-a")
+        self.assertEqual(self.out.with_name("resume.legacy-1.tsv").read_bytes(), original)
+        self.assertEqual(self.asked, ["x", "y"])
+        self.assertEqual(set(classify.latest_classifications(self.out)), {"1", "2"})
+
+    def test_compacts_full_history_and_resumes_latest_rows(self):
+        """Archive all prior rows and keep one active classification per blob."""
+        with patch.object(classify, "MAX_ROWS", 3):
+            self.classify()
+            self.classify("model-b", limit=1)
+            original = self.out.read_bytes()
+            self.assertEqual(self.classify("model-b"), ["y"])
+            self.assertEqual(self.out.with_name("resume.history-1.tsv").read_bytes(), original)
+            active = self.out.read_bytes()
+            mtime = self.out.stat().st_mtime_ns
+            self.assertEqual(len(active.splitlines()), 3)
+            self.assertEqual(self.classify("model-b"), [])
+            self.assertEqual((self.out.read_bytes(), self.out.stat().st_mtime_ns), (active, mtime))
+
+    def test_full_distinct_history_refuses_append_without_writing(self):
+        """Refuse compaction when all slots are already needed for the latest rows."""
+        with patch.object(classify, "MAX_ROWS", 2):
+            self.classify()
+            original = self.out.read_bytes(), self.out.stat().st_mtime_ns
+            with self.assertRaisesRegex(ValueError, r"resume\.tsv.*cap of 2 rows"):
+                self.classify("model-b")
+            self.assertEqual((self.out.read_bytes(), self.out.stat().st_mtime_ns), original)
+            self.assertFalse(self.out.with_name("resume.history-1.tsv").exists())
+
+    def test_compaction_resumes_after_archive_before_active_publish(self):
+        """Recover the staged latest rows if publication fails after the archive rename."""
+        replace = input_identity.os.replace
+
+        def interrupt(source, target):
+            """Fail only when installing the already staged compacted output."""
+            if Path(source).name.endswith(".compacting"):
+                raise OSError("interrupted compaction")
+            replace(source, target)
+
+        with patch.object(classify, "MAX_ROWS", 3):
+            self.classify()
+            self.classify("model-b", limit=1)
+            original = self.out.read_bytes()
+            with (patch.object(input_identity.os, "replace", side_effect=interrupt),
+                  self.assertRaisesRegex(OSError, "interrupted compaction")):
+                self.classify("model-b")
+            self.assertFalse(self.out.exists())
+            self.assertEqual(self.out.with_name("resume.history-1.tsv").read_bytes(), original)
+            self.assertEqual(self.classify("model-b"), [])
+            self.assertFalse(self.out.with_name(".resume.tsv.compacting").exists())
+            self.assertIn("rows=2 ok=2 error=0 models=model-b", classify.summary(self.out))
 
     def test_unreadable_skill_can_resume_after_the_file_returns(self):
         """Retry a read failure because no skill text went to the model."""

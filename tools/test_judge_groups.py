@@ -526,6 +526,59 @@ class TrialIdentityTests(unittest.TestCase):
             judge_groups.run(**self.options)
         self.assert_calls(0, 0)
 
+    def test_trials_lock_blocks_a_second_run_before_model_calls(self):
+        """Hold the trials file lock across the run's read and write operations."""
+        with (patch.object(input_identity, "LOCK_WAIT_SECONDS", 0.001),
+              input_identity.output_lock(self.trials),
+              self.assertRaisesRegex(TimeoutError, r"trials\.jsonl\.lock")):
+            judge_groups.run(**self.options)
+        self.assert_calls(0, 0)
+        self.assertFalse(self.verdicts.exists())
+
+    def test_torn_jsonl_is_quarantined_before_resuming_and_appending(self):
+        """Preserve complete trials and move an incomplete JSONL record byte for byte."""
+        before = self.first_run()
+        tail = b'{"answer":"partial\xc3'
+        self.trials.write_bytes(before + tail)
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            judge_groups.run(**(self.options | {"judge_model": "second"}))
+        archive = self.trials.with_name("trials.torn-1.jsonl")
+        self.assertEqual(archive.read_bytes(), tail)
+        self.assertIn(f"{len(tail)} bytes to {archive}", stderr.getvalue())
+        self.assertEqual(len(self.new_rows(before)), 12)
+        self.assert_calls(0, 12)
+        self.judge.reset_mock()
+        judge_groups.run(**(self.options | {"judge_model": "second"}))
+        self.assert_calls(0, 0)
+
+    def test_trial_history_compacts_at_cap_and_remains_resumable(self):
+        """Compact duplicate slot history while retaining existing answers and grades."""
+        before = self.first_run()
+        before += before.splitlines(keepends=True)[0]
+        self.trials.write_bytes(before)
+        with patch.object(judge_groups, "MAX_TRIAL_ROWS", 13):
+            self.set_task_field("must_match", ["new grading rule"])
+            judge_groups.run(**self.options)
+            self.assertEqual(self.trials.with_name("trials.history-1.jsonl").read_bytes(), before)
+            self.assertLessEqual(len(self.new_rows()), 13)
+            self.assert_calls(0, 0)
+            paths = self.trials, self.verdicts
+            active = [(path.read_bytes(), path.stat().st_mtime_ns) for path in paths]
+            judge_groups.run(**self.options)
+            self.assert_calls(0, 0)
+            self.assertEqual([(path.read_bytes(), path.stat().st_mtime_ns) for path in paths], active)
+
+    def test_distinct_trial_history_at_cap_refuses_append(self):
+        """Refuse to discard a distinct active trial slot to make room."""
+        before = self.first_run()
+        self.set_task_field("must_match", ["new grading rule"])
+        with (patch.object(judge_groups, "MAX_TRIAL_ROWS", 12),
+              self.assertRaisesRegex(ValueError, r"trials\.jsonl.*cap of 12 rows")):
+            judge_groups.run(**self.options)
+        self.assertEqual(self.trials.read_bytes(), before)
+        self.assertFalse(self.trials.with_name("trials.history-1.jsonl").exists())
+
     def test_answer_layout_preserves_existing_identity(self):
         """Keep the answer identity when the actual baseline message layout is unchanged."""
         expected = input_identity.fingerprint("answer", {
@@ -690,12 +743,13 @@ class TrialIdentityTests(unittest.TestCase):
         self.assertNotIn("old-model", self.verdicts.read_text())
 
     def test_legacy_trial_without_final_newline_keeps_its_bytes(self):
-        """Separate consecutive JSON records without overwriting the legacy tail."""
+        """Preserve an unterminated legacy record in the quarantine archive."""
         legacy = b'{"member":"cand-1","task_id":"code-0","trial":1,"model":"old-model"}'
         self.trials.write_bytes(legacy)
         with redirect_stderr(io.StringIO()):
             judge_groups.run(**self.options)
-        self.assertEqual(len(self.new_rows(legacy + b"\n")), 12)
+        self.assertEqual(self.trials.with_name("trials.torn-1.jsonl").read_bytes(), legacy)
+        self.assertEqual(len(self.new_rows()), 12)
         self.chat.reset_mock()
         self.judge.reset_mock()
         with redirect_stderr(io.StringIO()):

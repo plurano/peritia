@@ -33,12 +33,18 @@ from census import load_sources
 from check_skills import front_matter_or_empty
 from classify import FUNCTIONS, latest_classifications
 from input_identity import (
-    append_separator,
+    AppendLog,
     bounded_history,
+    file_sha256,
     fingerprint,
+    open_jsonl_history,
+    output_lock,
     provider_id,
     resolve_base_urls,
+    staged_output,
     text_sha256,
+    tsv_sha256,
+    write_tsv,
 )
 from llm_client import LLMClient, structured_request_parameters
 from overlap import (
@@ -48,6 +54,7 @@ from overlap import (
     load_embeddings,
     load_existing_skills,
     normalize_name,
+    open_overlap_generation,
 )
 
 DEFAULT_MODEL = os.environ.get("PERITIA_LLM_MODEL")
@@ -299,9 +306,9 @@ def load_groups(groups_tsv: Path) -> list[dict[str, Any]]:
     """Load groups and reject duplicate group/member trial input IDs."""
     groups: list[dict[str, Any]] = []
     seen_members: set[tuple[str, str]] = set()
-    if not groups_tsv.exists():
-        return groups
-    with groups_tsv.open(newline="", encoding="utf-8") as handle:
+    with open_overlap_generation(groups_tsv) as (handle, _):
+        if handle is None:
+            return groups
         for row in csv.DictReader(handle, delimiter="\t"):
             group_id = row.get("group_id", "")
             members = [m.strip() for m in row.get("members", "").split(",") if m.strip()]
@@ -352,11 +359,11 @@ def load_done_trials(trials_path: Path) -> TrialHistory:
     if not trials_path.exists():
         return history
     legacy = 0
-    with trials_path.open(encoding="utf-8") as handle:
+    with trials_path.open("rb") as handle:
         for line in bounded_history(trials_path, handle, MAX_TRIAL_ROWS):
             try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
+                record = json.loads(line.decode("utf-8"))
+            except (ValueError, RecursionError):
                 continue
             if not isinstance(record, dict):
                 continue
@@ -387,12 +394,10 @@ def _supported_trial(record: dict[str, Any]) -> bool:
     )
 
 
-def append_trial(trials_path: Path, record: dict[str, Any]) -> None:
-    """Append one trial without overwriting a partial or unterminated previous line."""
-    trials_path.parent.mkdir(parents=True, exist_ok=True)
-    payload = (json.dumps(record) + "\n").encode()
-    with trials_path.open("a+b") as handle:
-        handle.write(append_separator(handle) + payload)
+def append_trial(log: AppendLog, history: TrialHistory, record: dict[str, Any]) -> None:
+    """Append one trial under the run's output lock and index it for reuse."""
+    log.append(record, _slot(record), history.slots)
+    history.remember(record)
 
 
 def answer_messages(skill_text: str, task_prompt: str) -> list[dict[str, str]]:
@@ -549,7 +554,7 @@ def _grade_fingerprint(task: Task) -> str:
 class TrialRunner:
     """Resume or evaluate trials against the inputs for this run."""
 
-    path: Path
+    log: AppendLog
     history: TrialHistory
     chat: Callable[[str, str, float, int], str]
     judge: Callable[[str], float]
@@ -604,8 +609,7 @@ class TrialRunner:
             "answer_sha256": answer_hash, "answer_fp": answer_fp, "grade_fp": grade_fp,
             "judge_fp": judge_fp, "provider": self.provider, "temperature": self.temperature,
         }
-        append_trial(self.path, record)
-        self.history.remember(record)
+        append_trial(self.log, self.history, record)
         return record
 
 
@@ -671,13 +675,13 @@ def _init_callables(
 
 
 def _write_verdicts(verdicts_out: Path, verdicts_rows: list[dict[str, Any]]) -> None:
-    """Writes verdict rows to the verdicts TSV file."""
+    """Publish verdicts atomically when their serialized contents change."""
     verdicts_out.parent.mkdir(parents=True, exist_ok=True)
-    with verdicts_out.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=VERDICTS_FIELDS, delimiter="\t", lineterminator="\n")
-        writer.writeheader()
-        for r in verdicts_rows:
-            writer.writerow(r)
+    digest = tsv_sha256(VERDICTS_FIELDS, verdicts_rows)
+    if file_sha256(verdicts_out) == digest:
+        return
+    with staged_output(verdicts_out, lambda handle: write_tsv(handle.write, VERDICTS_FIELDS, verdicts_rows)) as temporary:
+        os.replace(temporary, verdicts_out)
 
 
 def run(
@@ -705,37 +709,40 @@ def run(
     embed_base_url: str | None = None,
 ) -> list[dict[str, Any]]:
     """Evaluate groups and write their verdicts and newly computed trials."""
-    if k < 1:
-        raise ValueError("k must be positive")
-    base_url, embed_base_url = resolve_base_urls(base_url, embed_base_url)
-    groups = load_groups(groups_tsv)
-    if limit is not None:
-        groups = groups[:limit]
+    trials_out.parent.mkdir(parents=True, exist_ok=True)
+    with output_lock(trials_out):
+        if k < 1:
+            raise ValueError("k must be positive")
+        base_url, embed_base_url = resolve_base_urls(base_url, embed_base_url)
+        groups = load_groups(groups_tsv)
+        if limit is not None:
+            groups = groups[:limit]
 
-    eval_tasks = load_eval_tasks(eval_tasks_json)
-    member_funcs = load_member_functions(candidates_tsv, classified_tsv)
-    done_trials = load_done_trials(trials_out)
-    ranks = {s.repository: s.rank for s in load_sources(sources_path)}
-    if cache_path is not None and not cache_path.is_file():
-        raise ValueError(f"embedding cache not found: {cache_path}")
-    candidates = load_candidates(candidates_tsv, checkouts) if candidates_tsv is not None else []
-    items = {item.item_id: item for item in candidates + load_existing_skills(skills_dir)}
+        eval_tasks = load_eval_tasks(eval_tasks_json)
+        member_funcs = load_member_functions(candidates_tsv, classified_tsv)
+        log = open_jsonl_history(trials_out, MAX_TRIAL_ROWS)
+        done_trials = load_done_trials(trials_out)
+        ranks = {s.repository: s.rank for s in load_sources(sources_path)}
+        if cache_path is not None and not cache_path.is_file():
+            raise ValueError(f"embedding cache not found: {cache_path}")
+        candidates = load_candidates(candidates_tsv, checkouts) if candidates_tsv is not None else []
+        items = {item.item_id: item for item in candidates + load_existing_skills(skills_dir)}
 
-    provider = provider_id(base_url)
-    embeddings = load_embeddings(cache_path, list(items.values()),
-                                 embed_model or os.environ.get("PERITIA_LLM_EMBED_MODEL", ""),
-                                 embed_base_url, embed_dims)
-    model_str = model or os.environ.get("PERITIA_LLM_MODEL") or ""
-    judge_model_str = judge_model or os.environ.get("PERITIA_LLM_JUDGE_MODEL") or ""
-    chat_fn, judge_fn = _init_callables(base_url, model_str, judge_model_str, timeout, chat_fn, judge_fn)
-    trials = TrialRunner(trials_out, done_trials, chat_fn, judge_fn, model_str, judge_model_str, provider, temperature)
-    verdicts_rows = [
-        _run_single_group(g, eval_tasks, member_funcs, checkouts, skills_dir, trials, k, items, embeddings, ranks)
-        for g in groups
-    ]
+        provider = provider_id(base_url)
+        embeddings = load_embeddings(cache_path, list(items.values()),
+                                     embed_model or os.environ.get("PERITIA_LLM_EMBED_MODEL", ""),
+                                     embed_base_url, embed_dims)
+        model_str = model or os.environ.get("PERITIA_LLM_MODEL") or ""
+        judge_model_str = judge_model or os.environ.get("PERITIA_LLM_JUDGE_MODEL") or ""
+        chat_fn, judge_fn = _init_callables(base_url, model_str, judge_model_str, timeout, chat_fn, judge_fn)
+        trials = TrialRunner(log, done_trials, chat_fn, judge_fn, model_str, judge_model_str, provider, temperature)
+        verdicts_rows = [
+            _run_single_group(g, eval_tasks, member_funcs, checkouts, skills_dir, trials, k, items, embeddings, ranks)
+            for g in groups
+        ]
 
-    _write_verdicts(verdicts_out, verdicts_rows)
-    return verdicts_rows
+        _write_verdicts(verdicts_out, verdicts_rows)
+        return verdicts_rows
 
 
 def summary(verdicts_path: Path) -> str:
