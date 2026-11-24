@@ -75,8 +75,14 @@ remain (zero).
 installed client folders without changing any files. Each drifting name lists
 its locations and short SHA-256 digests, followed by the first path that differs
 between the two most common contents. The summary counts drifting names out of
-all shared names. Add `--json` for structured output. The exit status is 0 for
-agreement, 1 for drift, or 2 for a scan error.
+all shared names in completed folders. Dangling links and links that leave a
+skill's root are excluded from its digest. The text report gives the count and
+first skipped path for each affected copy, even when there is no drift.
+With `--json`, every reported copy includes a sorted `skipped_links` list, and
+the `skipped` list shows affected copies for names without drift. The scan
+continues after a folder error and lists each error on stderr or in the JSON
+`errors` list. The exit status is 2 if any folder fails, 1 if there is drift
+without errors, or 0 otherwise.
 
 ## Census
 

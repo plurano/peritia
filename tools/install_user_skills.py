@@ -18,14 +18,17 @@ Usage:
   install_user_skills.py selftest
 Without --apply, install and uninstall only print what they would do.
 
-Drift exits 0 for agreement, 1 for differences, and 2 for a scan error.
+Drift exits 2 if any folder fails, otherwise 1 for differences or 0 for agreement.
 With --json it prints one object with:
   folders: objects with path and status (scanned, absent, or error)
   summary: counts named drifting, shared, and folders (scanned folders)
   drift: objects with name, first_difference (relative path), and copies
-         (each has a full SHA-256 digest and a list of installed locations)
-  error: a diagnostic string for the first scan error, otherwise null
-Only completed folders contribute to the counts and differences on a scan error.
+  skipped: objects with name and affected copies for names without drift
+  errors: list of "<folder>: <detail>" diagnostics, empty when all scans succeed
+Each copy has a full SHA-256 digest, installed locations, and skipped_links
+(sorted relative paths of dangling and out-of-tree links excluded from the digest).
+Only completed folders contribute to the counts and differences. The text view
+prints skipped link counts with the first path, and prints each error to stderr.
 """
 import hashlib
 import json
@@ -40,6 +43,7 @@ from contextlib import redirect_stdout
 from io import StringIO
 from itertools import islice
 from pathlib import Path
+from unittest.mock import patch
 
 REPO = "https://github.com/plurano/peritia"
 TAG = "v0.1.0"
@@ -71,7 +75,6 @@ DRIFT_EXTRA_FOLDERS = (
     (".copilot/skills", False),
     (".pi/agent/skills", False),
     (".claude/skills/synced", True),
-    (".codex/skills/.system", False),
 )
 
 
@@ -148,10 +151,11 @@ def drift_add_file(files, root, relative, target):
 
 
 def drift_tree_digest(root):
-    """Return a digest of sorted relative paths and their file digests, plus that inventory."""
+    """Return the tree digest, file inventory, and sorted skipped link paths."""
     pending = [(root, Path(), (root,))]
     remaining = MAX_DRIFT_ENTRIES
     files = {}
+    skipped_links = []
     for _ in range(MAX_DRIFT_ENTRIES + 1):
         if not pending:
             break
@@ -159,10 +163,11 @@ def drift_tree_digest(root):
         entries = drift_entries(folder, remaining)
         remaining -= len(entries)
         for entry in entries:
+            relative = prefix / entry.name
             target = drift_tree_path(root, entry)
             if target is None:
+                skipped_links.append(relative.as_posix())
                 continue
-            relative = prefix / entry.name
             mode = target.stat().st_mode
             if stat.S_ISREG(mode):
                 drift_add_file(files, root, relative, target)
@@ -173,7 +178,7 @@ def drift_tree_digest(root):
     tree = hashlib.sha256()
     for relative, file_digest in sorted(files.items()):
         tree.update(os.fsencode(relative) + b"\0" + bytes.fromhex(file_digest))
-    return tree.hexdigest(), files
+    return tree.hexdigest(), files, sorted(skipped_links)
 
 
 def drift_scan_folder(folder, locations, trees):
@@ -191,43 +196,49 @@ def drift_scan_folder(folder, locations, trees):
 
 
 def drift_scan(home):
-    """Scan configured roots and per-set folders, returning the first scan error if any."""
+    """Scan configured roots and per-set folders, collecting every folder error."""
     clients, _ = client_dirs(home, everyone=True)
     roots = dict.fromkeys(clients.values(), False)
     roots.update((home / relative, expand) for relative, expand in DRIFT_EXTRA_FOLDERS)
+    roots[clients["codex"] / ".system"] = False
     folders, locations, trees = {}, {}, {}
-    pending = list(reversed(roots.items()))
+    errors = []
+    pending = list(reversed(roots))
     for _ in range(len(roots) + MAX_DRIFT_ENTRIES):
         if not pending:
             break
-        folder, expand = pending.pop()
+        folder = pending.pop()
         if folder in folders:
             continue
         try:
             try:
                 mode = folder.stat().st_mode
             except FileNotFoundError:
-                folders[folder] = "absent"
+                if folder in roots:
+                    folders[folder] = "absent"
                 continue
             if not stat.S_ISDIR(mode):
-                raise NotADirectoryError("expected a skill directory")
-            if expand:
-                sets = drift_entries(folder, MAX_DRIFT_ENTRIES)
-                pending.extend((path, False) for path in reversed(sets) if drift_is_dir(path))
+                if folder in roots:
+                    raise NotADirectoryError("expected a skill directory")
+                continue
+            if roots.get(folder):
+                pending.extend(reversed(drift_entries(folder, MAX_DRIFT_ENTRIES)))
             else:
                 drift_scan_folder(folder, locations, trees)
                 folders[folder] = "scanned"
-        except (OSError, ValueError) as exc:
+        except (OSError, RuntimeError, ValueError) as exc:
+            # Path.resolve raises RuntimeError for symlink loops on Python 3.11.
             folders[folder] = "error"
-            return folders, locations, trees, f"{folder}: {exc}"
-    return folders, locations, trees, None
+            errors.append(f"{folder}: {exc}")
+    return folders, locations, trees, errors
 
 
 def drift_copies(locations, trees):
-    """Group installed locations by resolved folder while retaining every alias."""
+    """Group installed locations by resolved folder and retain every alias."""
     copies = {}
     for location, root in sorted(locations):
-        copy = copies.setdefault(root, {"digest": trees[root][0], "locations": []})
+        fingerprint, _, skipped_links = trees[root]
+        copy = copies.setdefault(root, {"digest": fingerprint, "locations": [], "skipped_links": skipped_links})
         copy["locations"].append(str(location))
     return list(copies.values())
 
@@ -244,22 +255,40 @@ def drift_difference(copies, inventories):
 
 def drift_report(home):
     """Build the report shared by the text and JSON views."""
-    folders, locations, trees, error = drift_scan(home)
-    inventories = dict(trees.values())
+    folders, locations, trees, errors = drift_scan(home)
+    inventories = {fingerprint: files for fingerprint, files, _ in trees.values()}
     shared = 0
     differences = []
+    skipped = []
     for name, paths in sorted(locations.items()):
         copies = drift_copies(paths, trees)
-        if len(copies) < 2:
-            continue
-        shared += 1
-        difference = drift_difference(copies, inventories)
+        difference = None
+        if len(copies) >= 2:
+            shared += 1
+            difference = drift_difference(copies, inventories)
         if difference is not None:
             differences.append({"name": name, "copies": copies, "first_difference": difference})
+            continue
+        affected = [copy for copy in copies if copy["skipped_links"]]
+        if affected:
+            skipped.append({"name": name, "copies": affected})
     return {"folders": [{"path": str(path), "status": status} for path, status in folders.items()],
             "summary": {"drifting": len(differences), "shared": shared,
                         "folders": sum(status == "scanned" for status in folders.values())},
-            "drift": differences, "error": error}
+            "drift": differences, "skipped": skipped, "errors": errors}
+
+
+def drift_print_copies(row):
+    """Print locations, skipped link details, and any first difference for one name."""
+    print(f"{row['name']}:")
+    for copy in row["copies"]:
+        for location in copy["locations"]:
+            print(f"  {copy['digest'][:12]}  {location}")
+        skipped_links = copy["skipped_links"]
+        if skipped_links:
+            print(f"  skipped links: {len(skipped_links)} ({skipped_links[0]})")
+    if "first_difference" in row:
+        print(f"  first difference: {row['first_difference']}")
 
 
 def drift(home, as_json):
@@ -272,17 +301,15 @@ def drift(home, as_json):
             if folder["status"] != "error":
                 print(f"{folder['status']}: {folder['path']}")
         for difference in report["drift"]:
-            print(f"{difference['name']}:")
-            for copy in difference["copies"]:
-                for location in copy["locations"]:
-                    print(f"  {copy['digest'][:12]}  {location}")
-            print(f"  first difference: {difference['first_difference']}")
+            drift_print_copies(difference)
+        for skipped in report["skipped"]:
+            drift_print_copies(skipped)
         summary = report["summary"]
         print(f"drift: {summary['drifting']} of {summary['shared']} shared skill names differ across "
               f"{summary['folders']} folders")
-        if report["error"] is not None:
-            print(f"drift error: {report['error']}", file=sys.stderr)
-    if report["error"] is not None:
+        for error in report["errors"]:
+            print(f"drift error: {error}", file=sys.stderr)
+    if report["errors"]:
         return 2
     return int(bool(report["drift"]))
 
@@ -673,9 +700,9 @@ def fixture_skill(home, relative, content):
     return skill
 
 
-def fixture_drift(home):
+def fixture_drift(home, codex_home=None):
     """Run the drift command against a fixture home and capture its JSON."""
-    os.environ["CODEX_HOME"] = str(home / ".codex")
+    os.environ["CODEX_HOME"] = str(codex_home or home / ".codex")
     output = StringIO()
     with redirect_stdout(output):
         status = drift(home, as_json=True)
@@ -689,7 +716,7 @@ def fixture_first_difference(report):
 
 
 def selftest_drift_content(root):
-    """Check identical trees, changed bytes, and an extra relative path."""
+    """Check identical trees, changed bytes, and added or renamed paths."""
     home = root / "content"
     left = fixture_skill(home, ".claude/skills/example", "left\n")
     right = fixture_skill(home, ".agents/skills/example", "right\n")
@@ -710,6 +737,12 @@ def selftest_drift_content(root):
     status, report = fixture_drift(home)
     cases.append(("drift: extra file exits 1 and names path",
                   status == 1 and fixture_first_difference(report) == "extra.md"))
+    (right / "extra.md").unlink()
+    (right / "docs").mkdir()
+    (right / "notes.md").rename(right / "docs/notes.md")
+    status, report = fixture_drift(home)
+    cases.append(("drift: path-only rename exits 1 and names a changed path",
+                  status == 1 and fixture_first_difference(report) in {"notes.md", "docs/notes.md"}))
     return cases
 
 
@@ -736,11 +769,23 @@ def selftest_drift_locations(root):
                   and any(row["name"] == "example" for row in report.get("drift", []))))
     cases.append(("drift: Copilot and Codex system folders scanned",
                   status == 1 and any(row["name"] == "other" for row in report.get("drift", []))))
+
+    home = root / "custom-codex"
+    system = fixture_skill(home, "custom-codex/skills/.system/other", "custom\n")
+    copilot = fixture_skill(home, ".copilot/skills/other", "copilot\n")
+    decoy = fixture_skill(home, ".codex/skills/.system/other", "decoy\n")
+    status, report = fixture_drift(home, codex_home=home / "custom-codex")
+    folders = {row["path"]: row["status"] for row in report.get("folders", [])}
+    locations = {location for row in report.get("drift", []) for copy in row["copies"]
+                 for location in copy["locations"]}
+    cases.append(("drift: custom Codex system catalog used instead of default",
+                  status == 1 and folders.get(str(system.parent)) == "scanned"
+                  and str(decoy.parent) not in folders and locations == {str(system), str(copilot)}))
     return cases
 
 
 def selftest_drift_comparison(root):
-    """Check copy frequency, alias locations, and out-of-tree link handling."""
+    """Check copy frequency and alias locations."""
     home = root / "comparison"
     for folder, variant in ((".claude/skills", "one"), (".agents/skills", "one"),
                             (".gemini/skills", "two"), (".copilot/skills", "two")):
@@ -759,27 +804,44 @@ def selftest_drift_comparison(root):
     alias_locations = {str(path) for path in (rare, *aliases)}
     cases.append(("drift: grouped copy retains all installed aliases",
                   any(set(copy["locations"]) == alias_locations for copy in copies)))
+    return cases
 
+
+def selftest_drift_links(root):
+    """Check that skipped links are reported without changing comparison results."""
     home = root / "outside-link"
     skill = fixture_skill(home, ".claude/skills/example", "same\n")
-    fixture_skill(home, ".agents/skills/example", "same\n")
+    peer = fixture_skill(home, ".agents/skills/example", "same\n")
     outside = fixture_skill(home, "external", "outside\n")
     make_link(skill / "outside", outside)
+    target = skill / "target"
+    target.mkdir()
+    make_link(skill / "dangling", target)
+    target.rmdir()
     status, report = fixture_drift(home)
-    cases.append(("drift: links outside skill root excluded from hash",
-                  status == 0 and report.get("summary") == {"drifting": 0, "shared": 1, "folders": 2}))
+    cases = [("drift: outside and dangling links excluded from hash",
+              status == 0 and report.get("summary") == {"drifting": 0, "shared": 1, "folders": 2})]
+    skipped = [copy for row in report.get("skipped", []) for copy in row["copies"]]
+    cases.append(("drift: skipped paths reported even when copies agree",
+                  len(skipped) == 1 and skipped[0].get("locations") == [str(skill)]
+                  and skipped[0].get("skipped_links") == ["dangling", "outside"]))
+    (peer / "SKILL.md").write_text("different\n", encoding="utf-8")
+    status, report = fixture_drift(home)
+    skipped_by_location = {location: copy.get("skipped_links") for row in report.get("drift", [])
+                           for copy in row["copies"] for location in copy["locations"]}
+    cases.append(("drift: every drifting copy lists its skipped paths",
+                  status == 1 and report.get("skipped") == []
+                  and skipped_by_location == {str(skill): ["dangling", "outside"], str(peer): []}))
     return cases
 
 
 def selftest_drift_errors(root):
     """Check absent folders, scan caps, and a file read failure."""
-    from unittest.mock import patch
-
     home = root / "empty"
     status, report = fixture_drift(home)
     folders = report.get("folders", [])
     cases = [("drift: absent folders listed and exit 0", status == 0 and len(folders) == 9
-              and all(row["status"] == "absent" for row in folders))]
+              and all(row["status"] == "absent" for row in folders) and report.get("errors") == [])]
 
     home = root / "errors"
     skill = fixture_skill(home, ".claude/skills/example", "example\n")
@@ -791,9 +853,10 @@ def selftest_drift_errors(root):
     for cap, limit in (("MAX_DRIFT_ENTRIES", 2), ("MAX_DRIFT_DEPTH", 0), ("MAX_FILES", 1)):
         with patch.object(module, cap, limit, create=True):
             status, report = fixture_drift(home)
-        error = report.get("error") or ""
+        errors = report.get("errors", [])
         cases.append((f"drift: {cap} exceeded exits 2 and names folder and cap",
-                      status == 2 and str(skill.resolve()) in error and f"{cap}={limit}" in error))
+                      status == 2 and len(errors) == 1 and errors[0].startswith(f"{skill.parent}: ")
+                      and str(skill.resolve()) in errors[0] and f"{cap}={limit}" in errors[0]))
 
     read_bytes = Path.read_bytes
 
@@ -805,10 +868,38 @@ def selftest_drift_errors(root):
 
     with patch.object(Path, "read_bytes", reject_file):
         status, report = fixture_drift(home)
-    error = report.get("error") or ""
+    errors = report.get("errors", [])
     cases.append(("drift: unreadable file exits 2 and names path",
-                  status == 2 and str(unreadable) in error and "permission denied" in error))
+                  status == 2 and len(errors) == 1 and str(unreadable) in errors[0]
+                  and "permission denied" in errors[0]))
     return cases
+
+
+def selftest_drift_partial_scan(root):
+    """Check that failed folders contribute errors and completed folders contribute drift."""
+    home = root / "partial-scan"
+    fixture_skill(home, ".claude/skills/example", "would leak\n")
+    failed = [fixture_skill(home, f"{folder}/z-bad", "cap\n")
+              for folder in (".claude/skills", ".gemini/config/skills")]
+    for skill in failed:
+        (skill / "extra.md").write_text("over the cap\n", encoding="utf-8")
+    completed = [fixture_skill(home, f"{folder}/example", folder)
+                 for folder in (".agents/skills", ".copilot/skills")]
+    with patch.object(sys.modules[__name__], "MAX_FILES", 1):
+        status, report = fixture_drift(home)
+    folders = {row["path"]: row["status"] for row in report.get("folders", [])}
+    errors = report.get("errors", [])
+    locations = {location for row in report.get("drift", []) for copy in row["copies"]
+                 for location in copy["locations"]}
+    return [("drift: all folder errors reported and exit 2 takes precedence",
+             status == 2 and len(errors) == len(failed)
+             and all(folders.get(str(skill.parent)) == "error" for skill in failed)
+             and all(error.startswith(f"{skill.parent}: ") and "MAX_FILES=1" in error
+                     for skill, error in zip(failed, errors, strict=True))),
+            ("drift: only completed folders contribute to drift after errors",
+             fixture_first_difference(report) == "SKILL.md"
+             and report.get("summary") == {"drifting": 1, "shared": 1, "folders": 2}
+             and locations == {str(skill) for skill in completed})]
 
 
 def refused(call):
@@ -831,7 +922,8 @@ def selftest():
                 root = Path(tmp)
                 checked = (selftest_cases(root) + selftest_drift_content(root)
                            + selftest_drift_locations(root) + selftest_drift_comparison(root)
-                           + selftest_drift_errors(root))
+                           + selftest_drift_links(root) + selftest_drift_errors(root)
+                           + selftest_drift_partial_scan(root))
                 cases += [(f"{mode}: {name}", ok) for name, ok in checked]
         if os.name != "nt":
             os.environ[LINK_MODE_ENV] = "junction"
