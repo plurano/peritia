@@ -6,28 +6,150 @@ from __future__ import annotations
 
 import json
 import os
-import urllib.request
-from typing import Any
+from collections.abc import Callable, Mapping
+from typing import Any, cast
+
+import httpx2
+
+# Codacy's Guardrails rule is a false positive here: this module checks every reply
+# itself and raises ValueError, and callers validate the parsed JSON.
+import openai  # nosemgrep: codacy.python.openai.import-without-guardrails
+from input_identity import provider_id, validate_base_url
+
+DEFAULT_CHAT_TEMPERATURE = 0.0
+DEFAULT_CHAT_SEED = 1
+_PLACEHOLDER_API_KEY = "peritia-keyless-placeholder"
+_JSON_MEDIA_TYPE = "application/json"
+_MAX_CUSTOM_HEADER_LINES = 1024
+_ALLOWED_HEADERS = frozenset({
+    "accept",
+    "accept-encoding",
+    "connection",
+    "content-length",
+    "content-type",
+    "host",
+    "user-agent",
+})
+
+
+def _is_allowed_header(name: str) -> bool:
+    """Allow only transport framing and SDK telemetry headers."""
+    lower = name.lower()
+    return lower in _ALLOWED_HEADERS or lower.startswith("x-stainless-")
+
+
+def _neutralized_custom_headers(effective_api_key: str) -> dict[str, str | openai.Omit]:
+    """Neutralize ambient OPENAI_CUSTOM_HEADERS names parsed in openai/lib/_client_auth.py:236-252."""
+    raw = os.environ.get("OPENAI_CUSTOM_HEADERS")
+    if not raw:
+        return {}
+    lines = raw.split("\n")
+    if len(lines) > _MAX_CUSTOM_HEADER_LINES:
+        raise ValueError(f"OPENAI_CUSTOM_HEADERS exceeds {_MAX_CUSTOM_HEADER_LINES} lines")
+    headers: dict[str, str | openai.Omit] = {}
+    for line in lines[:_MAX_CUSTOM_HEADER_LINES]:
+        colon = line.find(":")
+        if colon < 0:
+            continue
+        name = line[:colon].strip()
+        lower = name.lower()
+        if lower in ("accept", "content-type"):
+            headers[name] = _JSON_MEDIA_TYPE
+        elif lower == "authorization":
+            headers[name] = f"Bearer {effective_api_key}"
+        else:
+            headers[name] = openai.omit
+    return headers
+
+
+def _generation_parameters(temperature: float | None, seed: int | None) -> dict[str, Any]:
+    """Resolve the same generation defaults for structured and plain chat."""
+    return {
+        "temperature": DEFAULT_CHAT_TEMPERATURE if temperature is None else temperature,
+        "seed": DEFAULT_CHAT_SEED if seed is None else seed,
+        "stream": False,
+    }
+
+
+def structured_request_parameters(
+    schema: dict[str, Any], schema_name: str, *, temperature: float | None = None, seed: int | None = None,
+) -> dict[str, Any]:
+    """Return the effective structured generation settings used by transport and resume keys."""
+    return {
+        **_generation_parameters(temperature, seed),
+        "response_format": {
+            "type": "json_schema",
+            # The server guides output; callers check the returned structure.
+            "json_schema": {"name": schema_name, "strict": False, "schema": schema},
+        },
+    }
+
+
+def _embedding_index(item: Any) -> int:
+    """Extract an integer embedding index, rejecting Booleans and non-objects."""
+    if not isinstance(item, dict):
+        raise TypeError("item is not an object")
+    index = item["index"]
+    if isinstance(index, bool) or not isinstance(index, int):
+        raise TypeError("index is not an integer")
+    return index
 
 
 class LLMClient:
     """OpenAI-compatible HTTP API client for chat completions and embeddings."""
 
-    def __init__(self, base_url: str, timeout: float = 300.0, api_key: str | None = None) -> None:
-        self.base_url = base_url.rstrip("/")
+    def __init__(
+        self,
+        base_url: str,
+        timeout: float = 300.0,
+        api_key: str | None = None,
+        *,
+        transport: httpx2.BaseTransport | None = None,
+    ) -> None:
+        """Store a validated endpoint and configure an isolated OpenAI SDK client."""
+        self.base_url = validate_base_url(base_url).rstrip("/")
         self.timeout = timeout
         self.api_key = api_key
+        self._http_client = httpx2.Client(
+            event_hooks={"request": [self._sanitize_request]},
+            timeout=timeout,
+            transport=transport,
+        )
+        effective_api_key = api_key or _PLACEHOLDER_API_KEY
+        # Override ambient OPENAI_CUSTOM_HEADERS parsed in openai/lib/_client_auth.py:236-252.
+        default_headers = _neutralized_custom_headers(effective_api_key)
+        self._client = openai.OpenAI(
+            base_url=self.base_url,
+            api_key=effective_api_key,
+            max_retries=0,
+            timeout=timeout,
+            default_headers=cast(Mapping[str, str], default_headers) if default_headers else None,
+            http_client=self._http_client,
+        )
 
-    def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
-        """Performs a POST request with JSON payload to {base_url}{path}."""
-        url = f"{self.base_url}{path}"
-        data = json.dumps(payload).encode("utf-8")
-        headers = {"Content-Type": "application/json"}
+    def close(self) -> None:
+        """Close the underlying HTTP transport client."""
+        self._http_client.close()
+
+    def _sanitize_request(self, request: httpx2.Request) -> None:
+        """Strip ambient environment headers and set explicit bearer auth when configured."""
+        for name in list(request.headers.keys()):
+            if not _is_allowed_header(name):
+                del request.headers[name]
         if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-        req = urllib.request.Request(url, data=data, headers=headers)
-        with urllib.request.urlopen(req, timeout=self.timeout) as resp:  # noqa: S310
-            raw = resp.read().decode("utf-8")
+            request.headers["Authorization"] = f"Bearer {self.api_key}"
+
+    def _request_json(self, path: str, send: Callable[[], Any]) -> Any:
+        """Decode a POST reply and keep transport diagnostics free of userinfo and secrets."""
+        try:
+            response = send()
+            raw = response.http_response.read().decode("utf-8")
+        except openai.APIStatusError as err:
+            code = err.status_code
+            status = f" (HTTP {code})" if isinstance(code, int) and not isinstance(code, bool) else ""
+            raise OSError(f"LLM request failed{status} for {provider_id(self.base_url)}{path}") from None
+        except (openai.OpenAIError, httpx2.HTTPError, OSError, UnicodeDecodeError):
+            raise OSError(f"LLM request failed for {provider_id(self.base_url)}{path}") from None
         return json.loads(raw)
 
     def chat(
@@ -36,31 +158,23 @@ class LLMClient:
         messages: list[dict[str, Any]],
         schema: dict[str, Any] | None = None,
         schema_name: str = "answer",
-        temperature: float = 0.0,
-        seed: int = 1,
+        temperature: float | None = None,
+        seed: int | None = None,
     ) -> str:
-        """Calls /chat/completions and returns the choices[0].message.content string."""
-        body: dict[str, Any] = {
-            "model": model,
-            "messages": messages,
-            "temperature": temperature,
-            "seed": seed,
-            "stream": False,
-        }
-        if schema is not None:
-            body["response_format"] = {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": schema_name,
-                    # strict mode on OpenAI demands additionalProperties
-                    # false and every property required; the label and
-                    # judge schemas carry neither, so the server guides
-                    # the answer and the callers refuse a malformed one.
-                    "strict": False,
-                    "schema": schema,
-                },
-            }
-        reply = self._post("/chat/completions", body)
+        """Call /chat/completions and return the first choice's message content."""
+        if schema is None:
+            settings = _generation_parameters(temperature, seed)
+        else:
+            settings = structured_request_parameters(schema, schema_name, temperature=temperature, seed=seed)
+        reply = self._request_json(
+            "/chat/completions",
+            lambda: self._client.chat.completions.with_raw_response.create(
+                model=model,
+                messages=cast(Any, messages),
+                timeout=self.timeout,
+                **settings,
+            ),
+        )
         if not isinstance(reply, dict):
             raise ValueError(f"expected JSON object reply, got {type(reply).__name__}")
         choices = reply.get("choices")
@@ -83,10 +197,10 @@ class LLMClient:
         messages: list[dict[str, Any]],
         schema: dict[str, Any],
         schema_name: str = "answer",
-        temperature: float = 0.0,
-        seed: int = 1,
+        temperature: float | None = None,
+        seed: int | None = None,
     ) -> Any:
-        """Calls /chat/completions with schema and returns parsed JSON content."""
+        """Call /chat/completions with a schema and return parsed JSON content."""
         content = self.chat(
             model=model,
             messages=messages,
@@ -99,8 +213,15 @@ class LLMClient:
 
     def embed(self, model: str, texts: list[str]) -> list[list[float]]:
         """Calls /embeddings and returns embeddings ordered by index."""
-        body = {"model": model, "input": texts}
-        reply = self._post("/embeddings", body)
+        reply = self._request_json(
+            "/embeddings",
+            lambda: self._client.embeddings.with_raw_response.create(
+                model=model,
+                input=texts,
+                extra_body={"encoding_format": openai.omit},
+                timeout=self.timeout,
+            ),
+        )
         if not isinstance(reply, dict):
             raise ValueError(f"expected JSON object reply, got {type(reply).__name__}")
         data = reply.get("data")
@@ -109,10 +230,14 @@ class LLMClient:
         if len(data) != len(texts):
             raise ValueError(f"expected {len(texts)} embeddings, got {len(data)}")
         try:
-            sorted_data = sorted(data, key=lambda d: d["index"])
-            return [d["embedding"] for d in sorted_data]
+            sorted_data = sorted(data, key=_embedding_index)
+            indices = [d["index"] for d in sorted_data]
+            vectors = [d["embedding"] for d in sorted_data]
         except (KeyError, TypeError) as err:
             raise ValueError(f"malformed embedding item in reply: {err}") from err
+        if indices != list(range(len(texts))):
+            raise ValueError(f"expected embedding indices 0..{len(texts) - 1}, got {indices}")
+        return vectors
 
 
 def from_env(timeout: float = 300.0) -> LLMClient:

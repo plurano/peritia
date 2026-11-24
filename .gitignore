@@ -3,6 +3,9 @@ bin/
 *.out
 .DS_Store
 .venv/
+__pycache__/
+*.py[cod]
+/.adopt-skills.lock
 
 # BEGIN praetor private artifacts (praetorctl adopt)
 .workingdir/

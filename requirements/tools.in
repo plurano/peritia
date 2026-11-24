@@ -4,3 +4,5 @@ pyyaml
 markdown-it-py
 jsonschema
 regress
+networkx
+openai
