@@ -33,17 +33,14 @@ tools:
 
 # The library's own checks: every skill directory is complete (tools/check_skills.py) and every file
 # carries a licence (REUSE). The selftest plants one defect per rule and must see each refused.
+# Every tools/test_*.py runs, sorted, one process each; a new test file needs no Makefile edit.
 test: tools build
 	@$(BIN)/python -B tools/check_skills.py selftest
 	@node --test tools/markdownlint/test_normalize.mjs
 	@python3 -B tools/install_user_skills.py selftest
-	@$(BIN)/python -B tools/test_census.py
-	@$(BIN)/python -B tools/test_classify.py
-	@$(BIN)/python -B tools/test_candidates.py
-	@$(BIN)/python -B tools/test_overlap.py
-	@$(BIN)/python -B tools/test_judge_groups.py
-	@$(BIN)/python -B tools/test_adopt_skills.py
-	@$(BIN)/python -B tools/test_llm_client.py
+	@for file in $(sort $(wildcard tools/test_*.py)); do \
+		$(BIN)/python -B "$$file" || { printf 'test failed: %s\n' "$$file" >&2; exit 1; }; \
+	done
 	@reuse lint
 
 build: tools
