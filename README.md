@@ -87,17 +87,16 @@ listed entry path before resolution or the canonical path inside a resolved
 skill tree.
 
 `DRIFT_SCAN_SECONDS` sets a 30-second scan budget for the whole drift run,
-including all client folders and synced sets. The scan checks the deadline
-through `drift_fs` before `os.scandir`, `next` on its iterator, `DirEntry.is_dir`,
-`Path.stat`, `os.path.realpath`, `Path.open`, and file `read`. Scandir and file
-context exits and the resolver's internal calls are unchecked. One blocking
-call can still overrun the deadline.
+including all client folders and synced sets. One blocking call can still
+overrun the deadline. The `drift_scan` docstring lists the deadline checks
+in [`tools/install_user_skills.py`](tools/install_user_skills.py).
 
 A failed synced-entry type query gets its own folder error. Discovery continues
 with its siblings while time remains. On expiry, the current folder gets an
 error with the limit and elapsed time. If expiry stops synced-set discovery,
-the synced root reports that discovery stopped. Already queued children each
-get one `not scanned` row and one error. Unlisted entries are unknown. The JSON
+the synced root reports that discovery stopped. Confirmed children each get one
+`not scanned` row and one error. Recorded type-query failures keep their own
+error even when discovery stops. Unlisted entries are unknown. The JSON
 `folders` list gives each folder's `path` and `status` (`scanned`, `absent`,
 `error`, or `not scanned`). The exit status is 2 on expiry or any folder error,
 1 for drift without errors, or 0 otherwise.
