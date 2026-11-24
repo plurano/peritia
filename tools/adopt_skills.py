@@ -1004,13 +1004,14 @@ def evaluate(row, grouped, order, pins, checkouts, root, staging, occupied, appl
 
 def default_download_runner(args, *, cwd=None):
     """Run the REUSE downloader with a deadline and include failures in diagnostics."""
-    proc = subprocess.run(args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=TIMEOUT)
-    if proc.returncode != 0:
-        detail = proc.stderr.decode('utf-8', errors='replace').strip()[:500]
-        spdx_id = args[-1] if args else 'unknown'
-        msg = f'licence download failed for {spdx_id}: {detail}' if detail else f'licence download failed for {spdx_id}'
-        raise ValueError(msg)
-    return proc.stdout
+    if not args:
+        raise ValueError('licence download failed for unknown')
+    try:
+        return command(args, cwd=cwd, timeout=TIMEOUT)
+    except Refused as error:
+        detail = str(error).removeprefix(f'command: {args[0]}: ')
+        message = f'licence download failed for {args[-1]}'
+        raise ValueError(f'{message}: {detail}' if detail else message) from error
 
 
 def _download_licence(root: Path, spdx: str, runner) -> None:

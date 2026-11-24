@@ -91,9 +91,13 @@ class _UniqueKeyLoader(yaml.SafeLoader):
 
 
 def _load_yaml(text: str, loader: type[yaml.SafeLoader], *, error_prefix: str = "") -> object:
-    """Parse with a safe loader and produce a single-line error when prefixed."""
+    """Construct the typed SafeLoader subclass directly to expose the safe call to scanners."""
     try:
-        return yaml.load(text, Loader=loader)
+        parser = loader(text)
+        try:
+            return parser.get_single_data()
+        finally:
+            parser.dispose()
     except (yaml.YAMLError, RecursionError) as exc:
         message = str(exc)
         if error_prefix:
@@ -797,6 +801,26 @@ class _LicenceRegressionTests(unittest.TestCase):
         ):
             with self.subTest(key=key):
                 self._refused(self._plant(self.mit, front=front), f"duplicate key {key!r}")
+
+    def test_discovery_yaml(self):
+        """Preserve discovery's duplicate-key behavior and reject malformed YAML."""
+        self.assertEqual(front_matter("---\nname: first\nname: last\n---\n"), {"name": "last"})
+        with self.assertRaisesRegex(ValueError, "while parsing a flow node"):
+            front_matter("---\nname: [\n---\n")
+
+    def test_unsafe_yaml_tags(self):
+        """Refuse Python-specific YAML tags in discovery and validation."""
+        document = "---\nname: fixture\nmetadata: !!python/object:types.SimpleNamespace {}\n---\n"
+        for exact_license in (False, True):
+            with self.subTest(exact_license=exact_license):
+                with self.assertRaisesRegex(ValueError, "could not determine a constructor"):
+                    front_matter(document, exact_license=exact_license)
+
+        register = self.root / LICENCE_EXCEPTIONS_FILE
+        register.parent.mkdir()
+        register.write_text("!!python/dict {exceptions: []}\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "^invalid YAML: could not determine a constructor"):
+            _read_licence_exceptions(self.root)
 
     def test_file_failures(self):
         """Report missing, directory, symlink and unreadable licence files."""

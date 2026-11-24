@@ -8,7 +8,6 @@ import hashlib
 import json
 import math
 import shutil
-import subprocess
 import tempfile
 import tomllib
 import unittest
@@ -43,6 +42,27 @@ def snapshot(root):
 
 def passing_gate(root, staging, skill):
     return None
+
+
+class DefaultDownloadRunnerTests(unittest.TestCase):
+    def test_returns_stdout_bytes(self):
+        args = ['reuse', 'download', 'MIT-0']
+        cwd = Path('fixture')
+        with patch.object(adopt, 'command', return_value=b'Downloaded') as command:
+            self.assertEqual(adopt.default_download_runner(args, cwd=cwd), b'Downloaded')
+        command.assert_called_once_with(args, cwd=cwd, timeout=adopt.TIMEOUT)
+
+    def test_failure_names_licence_and_includes_stderr(self):
+        error = adopt.Refused('command: reuse: network error')
+        with patch.object(adopt, 'command', side_effect=error):
+            with self.assertRaisesRegex(ValueError, '^licence download failed for MIT-0: network error$'):
+                adopt.default_download_runner(['reuse', 'download', 'MIT-0'])
+
+    def test_empty_args_name_unknown_licence(self):
+        with patch.object(adopt, 'command') as command:
+            with self.assertRaisesRegex(ValueError, '^licence download failed for unknown$'):
+                adopt.default_download_runner([])
+        command.assert_not_called()
 
 
 class AdoptionTests(unittest.TestCase):
@@ -489,7 +509,7 @@ class AdoptionTests(unittest.TestCase):
         self.census.append({'source': 'owner/repo', 'path': 'pack/demo/SKILL.md', 'pin': pin})
 
         def failing_runner(cmd, *, cwd=None):
-            raise subprocess.CalledProcessError(1, cmd, stderr=b'network error')
+            raise OSError('network error')
 
         with self.assertRaises(ValueError) as ctx:
             self.invoke(apply=True, runner=failing_runner)
@@ -743,10 +763,9 @@ class AdoptionTests(unittest.TestCase):
         if not node_bin:
             self.fail('node executable not found on PATH')
         for bad in (str(outside), '../outside.md', 'link.md'):
-            proc = subprocess.run([node_bin, str(script), bad], cwd=folder, capture_output=True,
-                                  check=False, timeout=60)
-            self.assertNotEqual(proc.returncode, 0, bad)
-            self.assertIn(b'refusing Markdown input', proc.stderr, (bad, proc.stderr[:300]))
+            with self.subTest(input=bad):
+                with self.assertRaisesRegex(adopt.Refused, 'refusing Markdown input'):
+                    adopt.command([node_bin, str(script), bad], cwd=folder)
         self.assertEqual(outside.read_text(encoding='utf-8'), '# Outside\n')
 
     def test_whitespace_arbiter_omits_a_file_the_normalizer_changes_beyond_whitespace(self):
@@ -816,13 +835,11 @@ class AdoptionTests(unittest.TestCase):
         git_bin = shutil.which('git')
         if not git_bin:
             self.fail('git executable not found on PATH')
-        diff_proc = subprocess.run(
+        diff_output = adopt.command(
             [git_bin, 'diff', '--no-index', '-w', '--ignore-blank-lines',
              str(fenced_upstream), str(skill / 'reference/guide.md')],
-            capture_output=True, check=False, timeout=60,
         )
-        self.assertEqual(diff_proc.returncode, 0, diff_proc.stdout.decode('utf-8', errors='replace'))
-        self.assertEqual(diff_proc.stdout, b'')
+        self.assertEqual(diff_output, b'')
         # Fail-closed when normalizer script is broken or absent
         shutil.rmtree(skill)
         (self.root / 'tools/markdownlint/normalize.mjs').unlink()
