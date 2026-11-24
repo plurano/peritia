@@ -4,17 +4,62 @@
 """OpenAI-compatible HTTP API client for chat completions and embeddings."""
 from __future__ import annotations
 
-import http.client
 import json
 import os
-import urllib.error
-import urllib.request
-from typing import Any
+from collections.abc import Callable, Mapping
+from typing import Any, cast
 
+import httpx2
+
+# Codacy's Guardrails rule is a false positive here: this module checks every reply
+# itself and raises ValueError, and callers validate the parsed JSON.
+import openai  # nosemgrep: codacy.python.openai.import-without-guardrails
 from input_identity import provider_id, validate_base_url
 
 DEFAULT_CHAT_TEMPERATURE = 0.0
 DEFAULT_CHAT_SEED = 1
+_PLACEHOLDER_API_KEY = "peritia-keyless-placeholder"
+_JSON_MEDIA_TYPE = "application/json"
+_MAX_CUSTOM_HEADER_LINES = 1024
+_ALLOWED_HEADERS = frozenset({
+    "accept",
+    "accept-encoding",
+    "connection",
+    "content-length",
+    "content-type",
+    "host",
+    "user-agent",
+})
+
+
+def _is_allowed_header(name: str) -> bool:
+    """Allow only transport framing and SDK telemetry headers."""
+    lower = name.lower()
+    return lower in _ALLOWED_HEADERS or lower.startswith("x-stainless-")
+
+
+def _neutralized_custom_headers(effective_api_key: str) -> dict[str, str | openai.Omit]:
+    """Neutralize ambient OPENAI_CUSTOM_HEADERS names parsed in openai/lib/_client_auth.py:236-252."""
+    raw = os.environ.get("OPENAI_CUSTOM_HEADERS")
+    if not raw:
+        return {}
+    lines = raw.split("\n")
+    if len(lines) > _MAX_CUSTOM_HEADER_LINES:
+        raise ValueError(f"OPENAI_CUSTOM_HEADERS exceeds {_MAX_CUSTOM_HEADER_LINES} lines")
+    headers: dict[str, str | openai.Omit] = {}
+    for line in lines[:_MAX_CUSTOM_HEADER_LINES]:
+        colon = line.find(":")
+        if colon < 0:
+            continue
+        name = line[:colon].strip()
+        lower = name.lower()
+        if lower in ("accept", "content-type"):
+            headers[name] = _JSON_MEDIA_TYPE
+        elif lower == "authorization":
+            headers[name] = f"Bearer {effective_api_key}"
+        else:
+            headers[name] = openai.omit
+    return headers
 
 
 def _generation_parameters(temperature: float | None, seed: int | None) -> dict[str, Any]:
@@ -53,36 +98,59 @@ def _embedding_index(item: Any) -> int:
 class LLMClient:
     """OpenAI-compatible HTTP API client for chat completions and embeddings."""
 
-    def __init__(self, base_url: str, timeout: float = 300.0, api_key: str | None = None) -> None:
-        """Store a validated endpoint and request settings."""
+    def __init__(
+        self,
+        base_url: str,
+        timeout: float = 300.0,
+        api_key: str | None = None,
+        *,
+        transport: httpx2.BaseTransport | None = None,
+    ) -> None:
+        """Store a validated endpoint and configure an isolated OpenAI SDK client."""
         self.base_url = validate_base_url(base_url).rstrip("/")
         self.timeout = timeout
         self.api_key = api_key
+        self._http_client = httpx2.Client(
+            event_hooks={"request": [self._sanitize_request]},
+            timeout=timeout,
+            transport=transport,
+        )
+        effective_api_key = api_key or _PLACEHOLDER_API_KEY
+        # Override ambient OPENAI_CUSTOM_HEADERS parsed in openai/lib/_client_auth.py:236-252.
+        default_headers = _neutralized_custom_headers(effective_api_key)
+        self._client = openai.OpenAI(
+            base_url=self.base_url,
+            api_key=effective_api_key,
+            max_retries=0,
+            timeout=timeout,
+            default_headers=cast(Mapping[str, str], default_headers) if default_headers else None,
+            http_client=self._http_client,
+        )
 
-    def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
-        """Decode a POST reply and keep transport diagnostics free of userinfo."""
-        data = json.dumps(payload).encode("utf-8")
+    def close(self) -> None:
+        """Close the underlying HTTP transport client."""
+        self._http_client.close()
+
+    def _sanitize_request(self, request: httpx2.Request) -> None:
+        """Strip ambient environment headers and set explicit bearer auth when configured."""
+        for name in list(request.headers.keys()):
+            if not _is_allowed_header(name):
+                del request.headers[name]
+        if self.api_key:
+            request.headers["Authorization"] = f"Bearer {self.api_key}"
+
+    def _request_json(self, path: str, send: Callable[[], Any]) -> Any:
+        """Decode a POST reply and keep transport diagnostics free of userinfo and secrets."""
         try:
-            raw = self._post_text(path, data)
-        except urllib.error.HTTPError as err:
-            code = err.code
-            err.close()
+            response = send()
+            raw = response.http_response.read().decode("utf-8")
+        except openai.APIStatusError as err:
+            code = err.status_code
             status = f" (HTTP {code})" if isinstance(code, int) and not isinstance(code, bool) else ""
             raise OSError(f"LLM request failed{status} for {provider_id(self.base_url)}{path}") from None
-        except (OSError, ValueError, http.client.HTTPException):
+        except (openai.OpenAIError, httpx2.HTTPError, OSError, UnicodeDecodeError):
             raise OSError(f"LLM request failed for {provider_id(self.base_url)}{path}") from None
         return json.loads(raw)
-
-    def _post_text(self, path: str, data: bytes) -> str:
-        """Send the JSON request and read the transport response."""
-        url = f"{self.base_url}{path}"
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-        req = urllib.request.Request(url, data=data, headers=headers)
-        with urllib.request.urlopen(req, timeout=self.timeout) as resp:  # noqa: S310
-            raw = resp.read().decode("utf-8")
-        return raw
 
     def chat(
         self,
@@ -98,8 +166,15 @@ class LLMClient:
             settings = _generation_parameters(temperature, seed)
         else:
             settings = structured_request_parameters(schema, schema_name, temperature=temperature, seed=seed)
-        body = {"model": model, "messages": messages, **settings}
-        reply = self._post("/chat/completions", body)
+        reply = self._request_json(
+            "/chat/completions",
+            lambda: self._client.chat.completions.with_raw_response.create(
+                model=model,
+                messages=cast(Any, messages),
+                timeout=self.timeout,
+                **settings,
+            ),
+        )
         if not isinstance(reply, dict):
             raise ValueError(f"expected JSON object reply, got {type(reply).__name__}")
         choices = reply.get("choices")
@@ -138,8 +213,15 @@ class LLMClient:
 
     def embed(self, model: str, texts: list[str]) -> list[list[float]]:
         """Calls /embeddings and returns embeddings ordered by index."""
-        body = {"model": model, "input": texts}
-        reply = self._post("/embeddings", body)
+        reply = self._request_json(
+            "/embeddings",
+            lambda: self._client.embeddings.with_raw_response.create(
+                model=model,
+                input=texts,
+                extra_body={"encoding_format": openai.omit},
+                timeout=self.timeout,
+            ),
+        )
         if not isinstance(reply, dict):
             raise ValueError(f"expected JSON object reply, got {type(reply).__name__}")
         data = reply.get("data")

@@ -5,6 +5,7 @@ import csv
 import errno
 import hashlib
 import io
+import json
 import os
 import tempfile
 import traceback
@@ -12,6 +13,8 @@ import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
 from unittest.mock import patch
+
+import httpx2
 
 import classify
 import input_identity
@@ -40,19 +43,24 @@ class InputIdentityTests(unittest.TestCase):
 
     def test_structured_client_sends_effective_generation_defaults(self):
         """Check the structured request settings at the transport boundary."""
-        client = LLMClient("https://example.test/v1")
+        seen: list[tuple[str, dict]] = []
+        reply = {"choices": [{"message": {"content": "{}"}}]}
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            seen.append((request.url.path, json.loads(request.content)))
+            return httpx2.Response(200, json=reply)
+
+        client = LLMClient("https://example.test/v1", transport=httpx2.MockTransport(handler))
         schema = {"type": "object"}
         messages = [{"role": "user", "content": "request"}]
-        reply = {"choices": [{"message": {"content": "{}"}}]}
         with (patch("llm_client.DEFAULT_CHAT_TEMPERATURE", 0.25, create=True),
-              patch("llm_client.DEFAULT_CHAT_SEED", 42, create=True),
-              patch.object(client, "_post", return_value=reply) as post):
+              patch("llm_client.DEFAULT_CHAT_SEED", 42, create=True)):
             self.assertEqual(client.chat_json("model", messages, schema, "test_schema"), {})
-        post.assert_called_once_with("/chat/completions", {
+        self.assertEqual(seen, [("/v1/chat/completions", {
             "model": "model", "messages": messages, "temperature": 0.25, "seed": 42, "stream": False,
             "response_format": {"type": "json_schema",
                                 "json_schema": {"name": "test_schema", "strict": False, "schema": schema}},
-        })
+        })])
 
     def test_provider_strips_userinfo(self):
         """Keep the endpoint identity while stripping userinfo."""

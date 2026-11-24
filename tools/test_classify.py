@@ -14,6 +14,8 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
+import httpx2
+
 import classify
 import input_identity
 from llm_client import LLMClient
@@ -363,9 +365,10 @@ class RunTests(unittest.TestCase):
             {"source": "a/b", "path": "x/SKILL.md", "skill_name": "x", "blob_id": "1"},
         ])
         fake_reply = {"choices": [{"message": {"content": '{"functions":["coding"],"domains":["other"]}'}}]}
+        transport = httpx2.MockTransport(lambda _request: httpx2.Response(200, json=fake_reply))
         stdout = io.StringIO()
         with (patch.dict(os.environ, {"PERITIA_LLM_BASE_URL": "https://env.invalid/v1/"}, clear=True),
-              patch.object(LLMClient, "_post", return_value=fake_reply),
+              patch("classify.LLMClient", side_effect=lambda *a, **kw: LLMClient(*a, **kw, transport=transport)),
               redirect_stdout(stdout)):
             rc = classify.main(["run", "--census", str(census), "--checkouts", str(self.folder),
                                 "--out", str(self.out), "--model", "model-a"])
@@ -377,9 +380,8 @@ class RunTests(unittest.TestCase):
             census=census, checkouts=self.folder, out=self.out, model="model-a",
             base_url="https://stale-arg.invalid/v1", timeout=5.0, limit=None,
         )
-        effective_client = LLMClient("https://effective.invalid/v1")
+        effective_client = LLMClient("https://effective.invalid/v1", transport=transport)
         with (patch("classify.LLMClient", return_value=effective_client),
-              patch.object(effective_client, "_post", return_value=fake_reply),
               redirect_stdout(io.StringIO())):
             self.assertEqual(classify._run_cli(args), 0)
         self.asked.clear()
@@ -426,8 +428,10 @@ class RunTests(unittest.TestCase):
         ])
         (self.folder / "a__b" / "x/SKILL.md").unlink()
         fake_reply = {"choices": [{"message": {"content": '{"functions":["coding"],"domains":["other"]}'}}]}
+        transport = httpx2.MockTransport(lambda _request: httpx2.Response(200, json=fake_reply))
         stdout = io.StringIO()
-        with patch.object(LLMClient, "_post", return_value=fake_reply), redirect_stdout(stdout):
+        with (patch("classify.LLMClient", side_effect=lambda *a, **kw: LLMClient(*a, **kw, transport=transport)),
+              redirect_stdout(stdout)):
             rc = classify.main(["run", "--census", str(census), "--checkouts", str(self.folder),
                                 "--out", str(self.out), "--model", "model-a", "--base-url", DEFAULT_PROVIDER])
         self.assertEqual(rc, 1)

@@ -10,11 +10,12 @@ import os
 import shutil
 import tempfile
 import unittest
-import urllib.error
 from contextlib import chdir, redirect_stderr
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
+
+import httpx2
 
 import adopt_skills
 import input_identity
@@ -1095,13 +1096,18 @@ class OverlapEmbeddingIdentityTests(unittest.TestCase):
             {"source": "owner/repo", "path": "SKILL.md", "blob_id": "dummy", "verdict": "candidate"},
         ])
         base = "https://fixture-user:fixture-pass@example.test:8443/v1"
-        failure = urllib.error.URLError(f"{base}?fixture-query#fixture-fragment")
+        failure = httpx2.ConnectError(f"{base}?fixture-query#fixture-fragment")
+
+        def fail_request(_request: httpx2.Request) -> httpx2.Response:
+            raise failure
+
+        transport = httpx2.MockTransport(fail_request)
         args = ["run", "--candidates", str(candidates), "--checkouts", str(root),
                 "--skills-dir", str(root / "skills"), "--out", str(root / "out.tsv"),
                 "--groups", str(root / "groups.tsv"), "--base-url", base, "--embed-model", "embed",
                 "--judge-model", "judge"]
         stderr = io.StringIO()
-        with (patch.object(llm_client.urllib.request, "urlopen", side_effect=failure),
+        with (patch("overlap.LLMClient", side_effect=lambda *a, **kw: llm_client.LLMClient(*a, **kw, transport=transport)),
               redirect_stderr(stderr)):
             self.assertEqual(overlap.main(args), 1)
         self.assertIn("https://example.test:8443/v1/embeddings", stderr.getvalue())
