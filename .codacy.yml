@@ -42,6 +42,21 @@ engines:
       # argument list, by full path from shutil.which, on test input (2 findings).
       # Verdict: FACT peritia-decided-codacy-trial-verdict-27-test-subprocess.
       - "tools/test_adopt_skills.py"
+      # python dangerous subprocess use (audit and tainted-env-args): the patch integrity
+      # test runs git apply --reverse --check with a fixed argument list, by full path from
+      # shutil.which, on committed patches, with a 30 s deadline (1 finding on pull request 62).
+      # Exception category D (120 days, expires 2027-03-24).
+      # Verdict: FACT peritia-decided-codacy-verdict-62-test-subprocess.
+      - "tools/test_skill_patches.py"
+      # python dangerous subprocess use (audit and tainted-env-args): the adopted CellProfiler
+      # and MAGeCK skill scripts exist to run the program the operator names on their own
+      # command line. Each call passes a list argument vector without a shell and a deadline,
+      # so no input crosses a privilege boundary; tools/test_skill_deadlines.py covers the
+      # deadlines (6 findings on pull request 62). Ruff and praetorctl audit still check both
+      # files. Exception category D (120 days, expires 2027-03-24).
+      # Verdict: FACT peritia-decided-codacy-verdict-62-skill-subprocess.
+      - "skills/cellprofiler/scripts/nuclei_assay.py"
+      - "skills/mageck/scripts/screen_analysis.py"
       # Semgrep_python_crypto_rule-hash-sha1 and insecure-hash-algorithm-sha1: SHA-1 is
       # the object ID format in SHA-1 Git repositories. This compatibility checksum uses
       # usedforsecurity=False. test_git_blob_id_matches_git_at_chunk_boundaries in
@@ -53,8 +68,25 @@ engines:
       # B603 subprocess without shell: same calls as the opengrep entry above (2 findings).
       # Verdict: FACT peritia-decided-codacy-trial-verdict-27-test-subprocess.
       - "tools/test_adopt_skills.py"
+      # B404 subprocess import and B603 subprocess without shell: same calls as the opengrep
+      # entries above; the deadline tests import subprocess only for TimeoutExpired
+      # (6 findings on pull request 62). Exception category D (120 days, expires 2027-03-24).
+      # Verdict: FACT peritia-decided-codacy-verdict-62-test-subprocess and
+      # FACT peritia-decided-codacy-verdict-62-skill-subprocess.
+      - "tools/test_skill_patches.py"
+      - "tools/test_skill_deadlines.py"
+      - "skills/cellprofiler/scripts/nuclei_assay.py"
+      - "skills/mageck/scripts/screen_analysis.py"
   prospector:
     exclude_paths:
       # Prospector's bandit plugin repeats the B603 finding above (2 findings); Ruff still lints
       # this file. Verdict: FACT peritia-decided-codacy-trial-verdict-27-test-subprocess.
       - "tools/test_adopt_skills.py"
+      # Prospector's bandit plugin repeats the B404 and B603 findings above (6 findings on
+      # pull request 62); Ruff still lints these files. Exception category D (120 days,
+      # expires 2027-03-24). Verdict: FACT peritia-decided-codacy-verdict-62-test-subprocess
+      # and FACT peritia-decided-codacy-verdict-62-skill-subprocess.
+      - "tools/test_skill_patches.py"
+      - "tools/test_skill_deadlines.py"
+      - "skills/cellprofiler/scripts/nuclei_assay.py"
+      - "skills/mageck/scripts/screen_analysis.py"
