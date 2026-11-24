@@ -406,17 +406,19 @@ def _check_vector(model: str, dims: int | None, vector: list[float]) -> int:
 def _matching_embeddings(
     texts: dict[str, str], entries: dict, model: str, dims: int | None, path: Path | None,
 ) -> dict[str, list[float]]:
-    """Validate selected vectors and keep entries for exact current input texts."""
+    """Validate bound vectors and keep entries for exact current input texts."""
     matched = {}
     for key, entry in entries.items():
+        text_hash = _entry_text_hash(key, entry) if isinstance(entry, dict) else ""
+        if text_hash is None:
+            continue
         try:
             vector = entry["vector"]
             _check_vector(model, dims, vector)
         except (KeyError, TypeError, ValueError, OverflowError) as error:
             raise ValueError(f"{path}: invalid embedding vector for input {key}: {error}") from error
-        text_hash = _entry_text_hash(key, entry)
         # Version 2 caches also contain entries keyed by the original blob ID.
-        if text_hash is not None and text_hash in texts and (key == text_hash or text_hash not in matched):
+        if text_hash in texts and (key == text_hash or text_hash not in matched):
             matched[text_hash] = vector
     return matched
 
@@ -925,7 +927,7 @@ def open_overlap_generation(
     with ExitStack() as stack:
         groups = _open_optional(groups_path, stack)
         pairs = _open_optional(_current_pairs_path(groups_path), stack)
-        if pairs is not None or manifest.exists() or _has_header_field(groups, GENERATION_FIELD):
+        if pairs is not None or selected.exists() or _has_header_field(groups, GENERATION_FIELD):
             _verify_generation(selected, groups, pairs)
         elif legacy_overlap is not None:
             pairs = _open_optional(legacy_overlap, stack)

@@ -1570,10 +1570,14 @@ class AdoptionTests(unittest.TestCase):
         self.assertIn('`second`', (root_withdrawn / 'CREDITS.md').read_text(encoding='utf-8'))
 
     def test_missing_vectors_stderr_mentions_working_tree_restore_hint(self):
-        """Print the working-tree checkout hint while preserving the refill command text."""
+        """Print the working-tree checkout hint and verify it restores only the named sparse path."""
+        pins = {}
         for name, source in (('alpha', 'anthropics/skills'), ('beta', 'obra/superpowers')):
-            pin = self.source({'SKILL.md': MD.format(name=name), 'LICENSE': LICENCE}, source=source)
-            self.candidate(name=name, folder='', source=source, pin=pin, blob_id=name)
+            pins[source] = self.source(
+                {'SKILL.md': MD.format(name=name), 'LICENSE': LICENCE, 'OTHER.md': 'excluded\n'},
+                source=source,
+            )
+            self.candidate(name=name, folder='', source=source, pin=pins[source], blob_id=name)
         members = [adopt.candidate_id(row) for row in self.candidates]
         self.groups = [{'group_id': '77', 'members': ','.join(members)}]
         cache_file = self.embedding_cache({'alpha': [1.0, 0.0]})
@@ -1581,21 +1585,37 @@ class AdoptionTests(unittest.TestCase):
             cache_file, EMBED_MODEL, EMBED_PROVIDER, None, None, True,
             refill_paths=(self.base / 'candidates.tsv', self.checkouts, self.root / 'skills'),
         ).refill_command()
+        hint_cmd = 'git -C <checkout> checkout --ignore-skip-worktree-bits <pin> -- <path>'
 
         stderr_present = io.StringIO()
         with redirect_stderr(stderr_present):
             self.invoke(apply=False, include_grouped=True, cache=cache_file)
         self.assertIn(f'run {expected_cmd}', stderr_present.getvalue())
-        self.assertIn('git -C <checkout> checkout <pin> -- <path>', stderr_present.getvalue())
+        self.assertIn(hint_cmd, stderr_present.getvalue())
+        self.assertIn('only the listed member path at the census pin', stderr_present.getvalue())
 
         beta_checkout = self.checkouts / 'obra__superpowers'
+        beta_pin = pins['obra/superpowers']
         adopt.git(beta_checkout, 'sparse-checkout', 'set', '--no-cone', '--stdin', data=b'**/LICENSE\n')
         self.assertFalse((beta_checkout / 'SKILL.md').exists())
+        self.assertFalse((beta_checkout / 'OTHER.md').exists())
         stderr_absent = io.StringIO()
         with redirect_stderr(stderr_absent):
             self.invoke(apply=False, include_grouped=True, cache=cache_file)
-        self.assertIn(f'run {expected_cmd}', stderr_absent.getvalue())
-        self.assertIn('git -C <checkout> checkout <pin> -- <path>', stderr_absent.getvalue())
+        printed = stderr_absent.getvalue()
+        self.assertIn(f'run {expected_cmd}', printed)
+        self.assertIn(hint_cmd, printed)
+
+        with self.assertRaises(adopt.Refused):
+            adopt.git(beta_checkout, 'checkout', beta_pin, '--', 'SKILL.md')
+        self.assertFalse((beta_checkout / 'SKILL.md').exists())
+
+        _, _, after_prefix = printed.partition('e.g. git -C <checkout> ')
+        raw_args, _, _ = after_prefix.partition(', before rerunning')
+        substitutions = {'<pin>': beta_pin, '<path>': 'SKILL.md'}
+        adopt.git(beta_checkout, *(substitutions.get(tok, tok) for tok in raw_args.split()))
+        self.assertTrue((beta_checkout / 'SKILL.md').is_file())
+        self.assertFalse((beta_checkout / 'OTHER.md').exists())
 
     def test_origin_empty_path_not_present_while_dot_and_skill_md_are_present(self):
         """Ignore existing ORIGIN.md entries lacking a path while honoring explicit . and SKILL.md paths."""

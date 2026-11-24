@@ -1052,9 +1052,9 @@ def _group_copy_decisions(group, items, metadata, embeddings, ranks, embedding: 
     print(
         f"group {group_id}: missing embedding vectors for {', '.join(missing)}; "
         f"run {embedding.refill_command()} "
-        "(files absent from the working tree are skipped by overlap; restore them at the intended pin, "
-        "e.g. git -C <checkout> checkout <pin> -- <path>, before rerunning; checkouts that contain the "
-        "files can run the printed command unchanged)",
+        "(files absent from the working tree are skipped by overlap; restore only the listed member path at the "
+        "census pin, e.g. git -C <checkout> checkout --ignore-skip-worktree-bits <pin> -- <path>, before "
+        "rerunning; checkouts that contain the files can run the printed command unchanged)",
         file=sys.stderr,
     )
     _, copies = collapse_copies(members, items, metadata, {}, ranks)

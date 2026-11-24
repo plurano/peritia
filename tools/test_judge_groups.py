@@ -572,14 +572,32 @@ class TrialIdentityTests(unittest.TestCase):
     def test_regrade_at_cap_compacts_existing_trial_slots(self):
         """Compact at the cap when a regrade only updates slots the active history already holds."""
         before = self.first_run()
+        with self.verdicts.open(newline="", encoding="utf-8") as handle:
+            initial_scores = json.loads(next(csv.DictReader(handle, delimiter="\t"))["scores"])
         self.set_task_field("must_match", ["new grading rule"])
         with patch.object(judge_groups, "MAX_TRIAL_ROWS", 12):
             judge_groups.run(**self.options)
             self.assertEqual(self.trials.with_name("trials.history-1.jsonl").read_bytes(), before)
-            self.assertLessEqual(len(self.new_rows()), 12)
+            active = self.new_rows()
+            self.assertLessEqual(len(active), 12)
             self.assert_calls(0, 0)
+            regraded = [rec for rec in active if rec["task_id"] == "code-0"]
+            untouched = [rec for rec in active if rec["task_id"] != "code-0"]
+            self.assertEqual(
+                {(rec["member"], rec["task_id"], rec["trial"]) for rec in regraded},
+                {(f"cand-{m}", "code-0", t) for m in (1, 2) for t in (1, 2)},
+            )
+            self.assertTrue(all(rec["pass"] is False for rec in regraded))
+            self.assertTrue(all(rec["pass"] is True for rec in untouched))
             judge_groups.run(**self.options)
             self.assert_calls(0, 0)
+            with self.verdicts.open(newline="", encoding="utf-8") as handle:
+                updated_scores = json.loads(next(csv.DictReader(handle, delimiter="\t"))["scores"])
+            for member in ("cand-1", "cand-2"):
+                self.assertAlmostEqual(updated_scores[member]["rule_score"], 2 / 3, places=4)
+                self.assertAlmostEqual(updated_scores[member]["pass_at_k"], 2 / 3, places=4)
+                self.assertAlmostEqual(updated_scores[member]["pass_pow_k"], 2 / 3, places=4)
+                self.assertLess(updated_scores[member]["rule_score"], initial_scores[member]["rule_score"])
 
     def test_distinct_trial_slot_at_cap_refuses_append(self):
         """Refuse to discard a distinct active trial slot to make room for a new one."""
@@ -689,17 +707,70 @@ class TrialIdentityTests(unittest.TestCase):
         """Change the skill text while retaining the member id."""
         before = self.first_run()
         (self.checkouts / "cand-1").write_text("edited skill", encoding="utf-8")
+        expected_prompts = {f"write a greeting module in python, variant {i}" for i in range(3)}
+
+        def check_chat(skill_text: str, task_prompt: str, temperature: float, seed: int) -> str:
+            """Require the edited skill text and current task prompts."""
+            if (skill_text != "edited skill" or task_prompt not in expected_prompts
+                    or temperature != 0.7 or seed not in {1, 2}):
+                self.fail(f"stale chat inputs: {(skill_text, task_prompt, temperature, seed)!r}")
+            return f"hello from {skill_text} ({seed})"
+
+        def check_judge(prompt: str) -> float:
+            """Require the regenerated answer from the edited skill."""
+            if "hello from edited skill" not in prompt:
+                self.fail(f"stale judge prompt: {prompt!r}")
+            return 9.0
+
+        self.chat.side_effect = check_chat
+        self.judge.side_effect = check_judge
         judge_groups.run(**self.options)
         self.assert_calls(6, 6)
-        self.assertEqual({rec["member"] for rec in self.new_rows(before)}, {"cand-1"})
+        self.assertEqual(
+            {(call.args[0], call.args[1], call.args[2], call.args[3]) for call in self.chat.call_args_list},
+            {("edited skill", prompt, 0.7, seed) for prompt in expected_prompts for seed in (1, 2)},
+        )
+        added = self.new_rows(before)
+        self.assertEqual({rec["member"] for rec in added}, {"cand-1"})
+        self.assertEqual({rec["rubric_score"] for rec in added}, {9.0})
+        self.chat.reset_mock()
+        self.judge.reset_mock()
+        judge_groups.run(**self.options)
+        self.assert_calls(0, 0)
 
     def test_changed_task_prompt_runs_only_its_trials(self):
         """Regenerate and judge the changed prompt for both members."""
         before = self.first_run()
         self.set_task_field("prompt", "different task prompt")
+
+        def check_chat(skill_text: str, task_prompt: str, temperature: float, seed: int) -> str:
+            """Require the updated task prompt for each member."""
+            if (skill_text not in {"cand-1", "cand-2"} or task_prompt != "different task prompt"
+                    or temperature != 0.7 or seed not in {1, 2}):
+                self.fail(f"stale chat inputs: {(skill_text, task_prompt, temperature, seed)!r}")
+            return f"hello for {task_prompt} ({skill_text}, {seed})"
+
+        def check_judge(prompt: str) -> float:
+            """Require the updated task prompt in the judge prompt."""
+            if "<task_prompt>\ndifferent task prompt\n</task_prompt>" not in prompt:
+                self.fail(f"stale judge prompt: {prompt!r}")
+            return 7.5
+
+        self.chat.side_effect = check_chat
+        self.judge.side_effect = check_judge
         judge_groups.run(**self.options)
         self.assert_calls(4, 4)
-        self.assertEqual({rec["task_id"] for rec in self.new_rows(before)}, {"code-0"})
+        self.assertEqual(
+            {(call.args[0], call.args[1], call.args[2], call.args[3]) for call in self.chat.call_args_list},
+            {(member, "different task prompt", 0.7, seed) for member in ("cand-1", "cand-2") for seed in (1, 2)},
+        )
+        added = self.new_rows(before)
+        self.assertEqual({rec["task_id"] for rec in added}, {"code-0"})
+        self.assertEqual({rec["rubric_score"] for rec in added}, {7.5})
+        self.chat.reset_mock()
+        self.judge.reset_mock()
+        judge_groups.run(**self.options)
+        self.assert_calls(0, 0)
 
     def test_changed_must_match_regrades_without_model_calls(self):
         """Regrade the affected task using stored answers on an assertion change."""
@@ -727,9 +798,25 @@ class TrialIdentityTests(unittest.TestCase):
         """Rescore one task's answers when its rubric changes."""
         before = self.first_run()
         self.set_task_field("rubric", "must test the greeting")
+
+        def check_judge(prompt: str) -> float:
+            """Require the updated rubric on the rejudged task."""
+            if "<rubric>\nmust test the greeting\n</rubric>" not in prompt or "variant 0" not in prompt:
+                self.fail(f"stale judge prompt: {prompt!r}")
+            return 6.5
+
+        self.judge.side_effect = check_judge
         judge_groups.run(**self.options)
         self.assert_calls(0, 4)
-        self.assertEqual({rec["task_id"] for rec in self.new_rows(before)}, {"code-0"})
+        self.assertTrue(
+            all("<rubric>\nmust test the greeting\n</rubric>" in call.args[0] for call in self.judge.call_args_list)
+        )
+        added = self.new_rows(before)
+        self.assertEqual({rec["task_id"] for rec in added}, {"code-0"})
+        self.assertEqual({rec["rubric_score"] for rec in added}, {6.5})
+        self.judge.reset_mock()
+        judge_groups.run(**self.options)
+        self.assert_calls(0, 0)
 
     def test_changed_judge_model_rescores_existing_answers(self):
         """Rescore every unchanged answer without calling the answer model."""

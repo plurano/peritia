@@ -516,10 +516,14 @@ class OverlapResumeTests(unittest.TestCase):
             write_skill_file(self.checkouts, "s/c4/SKILL.md", "---\nname: c4\ndescription: desc4\n---\n")
             write_candidates(self.folder, self.rows)
             before = self.out.read_bytes(), self.out.stat().st_mtime_ns
+            archives_before = sorted(p.name for p in self.out.parent.glob("overlap.history-*.tsv"))
             with self.assertRaisesRegex(ValueError, r"overlap\.tsv.*cap of 3 rows"):
                 self.run_overlap(model="second")
             self.assertEqual((self.out.read_bytes(), self.out.stat().st_mtime_ns), before)
-            self.assertFalse(self.out.with_name("overlap.history-4.tsv").exists())
+            self.assertEqual(
+                sorted(p.name for p in self.out.parent.glob("overlap.history-*.tsv")),
+                archives_before,
+            )
 
     def test_publication_interruptions_leave_no_readable_mixed_generation(self):
         """Refuse both an incomplete first generation and a stale manifest on update."""
@@ -728,6 +732,41 @@ class OverlapResumeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"python3 tools/overlap\.py run"):
             overlap.summary(self.out, self.groups, self.candidates)
 
+    def test_legacy_manifest_without_pair_snapshot_is_refused(self):
+        """Require a pair snapshot whenever a legacy stem manifest exists, while keeping unmanifested fallback."""
+        self.assertEqual(self.run_overlap(same_use=True), (3, 1))
+        legacy_manifest = self.folder / "groups.generation.json"
+        overlap._generation_path(self.groups).replace(legacy_manifest)
+        self.assertIn("groups: 1", overlap.summary(self.out, self.groups, self.candidates))
+
+        overlap._current_pairs_path(self.groups).unlink()
+        legacy_overlap = self.folder / "legacy-overlap.tsv"
+        legacy_fields = [field for field in overlap.OVERLAP_FIELDS if field != "judge_fp"]
+        with legacy_overlap.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=legacy_fields, delimiter="\t", lineterminator="\n")
+            writer.writeheader()
+            writer.writerow({"a": "s:c1/SKILL.md", "b": "s:c2/SKILL.md", "same_use": "true"})
+        with self.groups.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=overlap.GROUPS_FIELDS, delimiter="\t", lineterminator="\n")
+            writer.writeheader()
+            writer.writerow({"group_id": "1", "members": "s:c1/SKILL.md,s:c2/SKILL.md",
+                             "edges": "s:c1/SKILL.md|s:c2/SKILL.md", "has_existing": "false"})
+
+        rerun = r"groups\.generation\.json.*python3 tools/overlap\.py run"
+        with self.assertRaisesRegex(ValueError, rerun):
+            overlap.summary(legacy_overlap, self.groups, self.candidates)
+        with self.assertRaisesRegex(ValueError, rerun), overlap.open_overlap_generation(self.groups, legacy_overlap):
+            pass
+
+        saved_groups = self.groups.read_bytes()
+        self.groups.unlink()
+        with self.assertRaisesRegex(ValueError, rerun):
+            overlap.summary(legacy_overlap, self.groups, self.candidates)
+
+        legacy_manifest.unlink()
+        self.groups.write_bytes(saved_groups)
+        self.assertIn("groups: 1", overlap.summary(legacy_overlap, self.groups, self.candidates))
+
 
 class OverlapEmbeddingIdentityTests(unittest.TestCase):
     """Exercise embedding namespace selection and legacy cache migration."""
@@ -906,6 +945,54 @@ class OverlapEmbeddingIdentityTests(unittest.TestCase):
         vectors["e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"] = {"text_sha256": key_a, "vector": [1.0, 0.0, 0.0]}
         self.cache.write_text(json.dumps(data), encoding="utf-8")
         self.assertEqual(overlap.load_embeddings(self.cache, [self.item], "embed", ""), {"item1": [1.0, 0.0, 0.0]})
+
+    def test_mismatched_binding_skips_invalid_vector_and_allows_refill(self):
+        """Skip unbound or mismatched entries before vector validation while rejecting malformed bound entries."""
+        second = replace(self.item, item_id="item2", blob_id="b2", skill_name="name2", description="desc2")
+        overlap.get_embeddings([self.item, second], self.embed, self.cache, model="embed")
+        key_a = text_sha256(overlap.make_embed_text(self.item))
+        key_b = text_sha256(overlap.make_embed_text(second))
+
+        data = self.load_cache_json()
+        vectors = next(iter(data["namespaces"].values()))["vectors"]
+        vectors[key_a] = {"text_sha256": key_b, "vector": {"bad": True}}
+        vectors[key_b] = {"vector": [1.0]}
+        self.cache.write_text(json.dumps(data), encoding="utf-8")
+
+        self.assertEqual(overlap.load_embeddings(self.cache, [self.item, second], "embed", ""), {})
+        self.embed_calls.clear()
+        refilled = overlap.get_embeddings([self.item], self.embed, self.cache, model="embed")
+        self.assertEqual(self.embed_calls, ["name1: desc1"])
+        self.assertEqual(refilled, {"item1": [0.1, 0.2, 0.3]})
+        stored = next(iter(self.load_cache_json()["namespaces"].values()))["vectors"]
+        self.assertEqual(stored[key_a], {"text_sha256": key_a, "vector": [0.1, 0.2, 0.3]})
+        self.embed_calls.clear()
+        self.assertEqual(overlap.get_embeddings([self.item], self.embed, self.cache, model="embed"), refilled)
+        self.assertEqual(self.embed_calls, [])
+
+        for bad_entry in ({"text_sha256": key_a, "vector": "malformed"}, "not-a-dict"):
+            with self.subTest(entry=bad_entry):
+                data = self.load_cache_json()
+                next(iter(data["namespaces"].values()))["vectors"][key_a] = bad_entry
+                self.cache.write_text(json.dumps(data), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, rf"invalid embedding vector for input {key_a}"):
+                    overlap.get_embeddings([self.item], self.embed, self.cache, model="embed")
+
+        blob_key = git_blob_id(b"")
+        data = self.load_cache_json()
+        vectors = next(iter(data["namespaces"].values()))["vectors"]
+        vectors.clear()
+        vectors[blob_key] = {"text_sha256": key_a, "vector": [0.9, 0.8, 0.7]}
+        self.cache.write_text(json.dumps(data), encoding="utf-8")
+        self.embed_calls.clear()
+        self.assertEqual(overlap.get_embeddings([self.item], self.embed, self.cache, model="embed"),
+                         {"item1": [0.9, 0.8, 0.7]})
+        self.assertEqual(self.embed_calls, [])
+
+        vectors[blob_key]["vector"] = [1.0]
+        self.cache.write_text(json.dumps(data), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, rf"invalid embedding vector for input {blob_key}"):
+            overlap.load_embeddings(self.cache, [self.item], "embed", "")
 
     def test_explicit_dims_reject_wrong_response_length(self):
         """Reject a three-dimensional response when the caller requests two dimensions."""
