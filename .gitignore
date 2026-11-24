@@ -3,6 +3,8 @@ bin/
 *.out
 .DS_Store
 .venv/
+__pycache__/
+*.py[cod]
 
 # BEGIN praetor private artifacts (praetorctl adopt)
 .workingdir/

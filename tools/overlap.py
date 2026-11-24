@@ -27,6 +27,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO, TextIO
 
+import networkx
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from check_skills import front_matter_or_empty
@@ -616,25 +618,11 @@ def _read_done_pairs(path: Path, handle: TextIO) -> dict[tuple[str, str], dict[s
 
 
 def _connected_components(graph: dict[str, set[str]]) -> list[set[str]]:
-    """Computes connected components of at least 2 nodes, sorted deterministically."""
-    visited: set[str] = set()
-    components: list[set[str]] = []
-    for node in sorted(graph.keys()):
-        if node not in visited:
-            comp: set[str] = set()
-            queue = [node]
-            visited.add(node)
-            while queue:
-                curr = queue.pop(0)
-                comp.add(curr)
-                for neighbor in graph[curr]:
-                    if neighbor not in visited:
-                        visited.add(neighbor)
-                        queue.append(neighbor)
-            if len(comp) >= 2:
-                components.append(comp)
-    components.sort(key=lambda c: sorted(c)[0])
-    return components
+    """Returns connected components of at least 2 nodes sorted by smallest member, computed via networkx."""
+    return sorted(
+        (set(comp) for comp in networkx.connected_components(networkx.Graph(graph)) if len(comp) >= 2),
+        key=min,
+    )
 
 
 def build_groups(
