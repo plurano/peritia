@@ -1932,13 +1932,6 @@ def resolve_report_path(report: Path | str | None, root: Path) -> Path | None:
     return dest
 
 
-def _validate_outputs(root: Path) -> None:
-    """Refuse publication output symlinks before staging."""
-    for name in (SKILLS_DIR, REUSE_FILE, CREDITS_FILE, LICENCE_NOTICES_FILE):
-        if (root / name).is_symlink():
-            raise ValueError(f'{name}: output symlink refused')
-
-
 def _evaluate_candidates(selected, stage: StageInputs, evaluation: EvaluationInputs, saved, metadata):
     """Keep accepted skills and prepare their metadata without publishing yet."""
     reuse, credits_text = metadata
@@ -1971,7 +1964,6 @@ def run(candidates, groups, census, checkouts, root=Path('.'), *, apply=False,
     if runner is None:
         runner = default_download_runner
     root, checkouts = root.resolve(), checkouts.resolve()
-    _validate_outputs(root)
     report_file = resolve_report_path(report, root)
     parsed = inputs(candidates, groups, census)
     if (report is not None and Path(report).is_symlink()) or (
