@@ -19,7 +19,7 @@ class CheckSkillsLicenceTests(unittest.TestCase):
     def test_readme_licence_exception_example_matches_schema(self):
         """Load the documented example as a licence exception register."""
         readme = Path(__file__).resolve().parent.parent / "README.md"
-        sample = re.search(r"^```yaml\n(exceptions:\n.*?)^```$", readme.read_text(encoding="utf-8"), re.M | re.S)
+        sample = re.search(r"^```yaml\n(exceptions:\n.*?)^```$", readme.read_text(encoding="utf-8"), re.MULTILINE | re.DOTALL)
         self.assertIsNotNone(sample, "README needs a complete YAML exception example")
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
