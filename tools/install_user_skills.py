@@ -138,7 +138,7 @@ def skill_names(tree):
         try:
             return read_install_set(tree)
         except ValueError as exc:
-            raise SystemExit(str(exc))
+            raise SystemExit(str(exc)) from exc
     skills_dir = tree / "skills"
     return sorted(p.name for p in skills_dir.iterdir() if (p / "SKILL.md").is_file()) if skills_dir.is_dir() else []
 
