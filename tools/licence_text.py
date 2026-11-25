@@ -8,6 +8,11 @@ from collections.abc import Iterator
 from itertools import islice, zip_longest
 from pathlib import Path
 
+try:
+    from licence_policy import normalise_licence
+except ImportError:
+    from tools.licence_policy import normalise_licence
+
 MAX_LICENCE_BYTES = 256 * 1024
 LICENCE_NOTICES_FILE = "skills/licence-notices.yaml"
 NOTICE_PREFIXES = ("Copyright ", "©")
@@ -67,13 +72,17 @@ def _validate_metadata(match: re.Match[str], spdx: str) -> None:
     """Require standalone identifier metadata to agree with the declared SPDX ID."""
     if match["kind"].casefold() in _IDENTIFIER_METADATA:
         found = match["value"].removesuffix(_COMMENT_END.get(match["comment"], "")).strip()
-        if found.casefold() != spdx.casefold():
+        found_id, _, found_known = normalise_licence(found)
+        declared_id, _, declared_known = normalise_licence(spdx)
+        if not (found_known and declared_known and found_id == declared_id):
             raise ValueError(f"LICENSE metadata names {found or '<empty>'}; declared {spdx}")
 
 
-def is_licence_notice(line: str) -> bool:
-    """Recognise a notice prefix on a whitespace-collapsed line."""
-    return line.startswith(NOTICE_PREFIXES)
+def is_licence_notice(line: str, *, body_span: str = "") -> bool:
+    """Recognise notice prefixes outside the space-padded template body."""
+    return line.startswith(NOTICE_PREFIXES) and (
+        not body_span or f" {_body_comparison_text(_normalise_body_line(line))} " not in body_span
+    )
 
 
 def _collapsed_licence_lines(text: str) -> Iterator[str]:
@@ -83,30 +92,40 @@ def _collapsed_licence_lines(text: str) -> Iterator[str]:
             yield line
 
 
-def _notice_lines(text: str) -> frozenset[str]:
+def _notice_lines(text: str, *, body_span: str = "") -> frozenset[str]:
     """Collect exact notice lines for comparison with the template or register."""
     return frozenset(
-        line for line in _collapsed_licence_lines(text) if is_licence_notice(line)
+        line for line in _collapsed_licence_lines(text) if is_licence_notice(line, body_span=body_span)
     )
 
 
-def _normalised_lines(text: str, spdx: str, notices: frozenset[str]) -> list[str]:
+def _normalise_body_line(line: str) -> str:
+    """Normalize punctuation and remove the optional bullet prefix."""
+    return BULLET.sub("", line.translate(PUNCTUATION))
+
+
+def _normalised_lines(text: str, spdx: str, notices: frozenset[str], *, body_span: str = "") -> list[str]:
     """Remove reviewed notices and metadata, then normalise the remaining lines."""
     lines = []
     for line in _collapsed_licence_lines(text):
         if metadata := METADATA.fullmatch(line):
             _validate_metadata(metadata, spdx)
-        elif is_licence_notice(line):
+        elif is_licence_notice(line, body_span=body_span):
             if line not in notices:
                 raise ValueError(f"unreviewed copyright notice {line!r}; review {LICENCE_NOTICES_FILE}")
         else:
-            lines.append(BULLET.sub("", line.translate(PUNCTUATION)))
+            lines.append(_normalise_body_line(line))
     return lines
 
 
 def _comparison_text(text: str) -> str:
     """Normalise case, licence spelling and URL schemes for text comparison."""
     return re.sub(r"\b((?:sub)?licen)c(e[s]?)\b", r"\1s\2", text.lower()).replace("https://", "http://")
+
+
+def _body_comparison_text(text: str) -> str:
+    """Normalize comparison text and clause labels for the licence body."""
+    return CLAUSE_LABEL.sub(lambda match: f"({match[1] or match[2]})", _comparison_text(text))
 
 
 def _title_lines(lines: list[str], spdx: str) -> list[str]:
@@ -130,8 +149,7 @@ def _body(lines: list[str], titles: list[str], spdx: str) -> str:
         title_id = line.removeprefix("the ").removesuffix(" license")
         if line in titles or title_id == identifier:
             continue
-        body = _comparison_text(" ".join(lines[index:]))
-        return CLAUSE_LABEL.sub(lambda match: f"({match[1] or match[2]})", body)
+        return _body_comparison_text(" ".join(lines[index:]))
     return ""
 
 
@@ -158,25 +176,31 @@ def _read_licence_template(template_dir: Path, spdx: str) -> str:
         raise ValueError(f"LICENSES/{spdx}.txt missing; run reuse download {spdx}") from exc
 
 
+def _template_comparison(template_dir: Path, spdx: str) -> tuple[list[str], str, frozenset[str]]:
+    """Read the template's optional titles, normalized body and exact notices."""
+    template = _read_licence_template(template_dir, spdx)
+    notices = _notice_lines(template)
+    lines = _normalised_lines(template, spdx, notices)
+    titles = _title_lines(lines, spdx)
+    body = _body(lines, titles, spdx)
+    if not body:
+        raise ValueError(f"LICENSES/{spdx}.txt has no licence body")
+    return titles, body, notices
+
+
 def unreviewed_licence_notices(path: Path, template_dir: Path, spdx: str,
                               reviewed: frozenset[str]) -> frozenset[str]:
     """Read the new notice lines in a staged, bounded licence file."""
     text = read_utf8(path, MAX_LICENCE_BYTES, refuse_links=True)
-    template = _read_licence_template(template_dir, spdx)
-    return _notice_lines(text) - _notice_lines(template) - reviewed
+    _, expected, template_notices = _template_comparison(template_dir, spdx)
+    return _notice_lines(text, body_span=f" {expected} ") - template_notices - reviewed
 
 
 def verify_licence(path: Path, template_dir: Path, spdx: str, *, reviewed: frozenset[str] = frozenset()) -> None:
     """Raise a diagnostic unless the complete body matches the declared SPDX template."""
     text = read_utf8(path, MAX_LICENCE_BYTES, refuse_links=True)
-    template = _read_licence_template(template_dir, spdx)
-    template_notices = _notice_lines(template)
-    template_lines = _normalised_lines(template, spdx, template_notices)
-    titles = _title_lines(template_lines, spdx)
-    expected = _body(template_lines, titles, spdx)
-    if not expected:
-        raise ValueError(f"LICENSES/{spdx}.txt has no licence body")
-    actual_lines = _normalised_lines(text, spdx, template_notices | reviewed)
+    titles, expected, template_notices = _template_comparison(template_dir, spdx)
+    actual_lines = _normalised_lines(text, spdx, template_notices | reviewed, body_span=f" {expected} ")
     actual = _body(actual_lines, titles, spdx).split()
     if not actual:
         raise ValueError("LICENSE has no licence body")

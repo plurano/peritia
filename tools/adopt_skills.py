@@ -24,7 +24,7 @@ import urllib.parse
 from collections import Counter
 from collections.abc import Callable
 from contextlib import contextmanager, nullcontext, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
 # isort: split
@@ -413,7 +413,12 @@ def licence_text(row, checkout, pin, skill, inputs: StageInputs):
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
         raise Refused('licence-text-missing') from error
     destination = skill / name
-    destination.write_bytes(data)
+    try:
+        with destination.open('xb') as handle:
+            handle.write(data)
+    except FileExistsError as error:
+        if destination.is_symlink() or not destination.is_file() or destination.read_bytes() != data:
+            raise Refused(f'licence-text-conflict: {name}') from error
     discovered = find_folder_licence_file(skill)
     if discovered is not None and discovered != destination:
         raise Refused(f'licence-text-shadowed: {name} by {discovered.name}')
@@ -755,6 +760,7 @@ class StageInputs:
     template_cache: Path
     runner: Callable
     licence_scan: check_skills.LicenceScan
+    download_failures: dict[str, str] = field(default_factory=dict, init=False)
 
 
 def _check_staged_skill(skill: Path, template_dir: Path, licence_scan: check_skills.LicenceScan) -> None:
@@ -781,7 +787,7 @@ def stage_one(row, pin, staging, inputs: StageInputs, spdx: str):
     lic_note = licence_text(row, checkout, pin, skill, inputs)
     note = build_notes(skill, filter_notes, normalized, {}, {}, lic_note, patched=patched)
     attribution(skill, row, folder, pin, note, fence_changed=bool(fenced_files))
-    template_dir = _stage_licence_template(inputs.root, inputs.template_cache, spdx, inputs.runner)
+    template_dir = _stage_licence_template(inputs, spdx)
     year = git(checkout, 'show', '-s', '--format=%cs', pin).decode().strip()[:4]
     return skill, year, folder, (filter_notes, normalized, lic_note, fenced_files, patched), template_dir
 
@@ -1225,10 +1231,10 @@ def evaluate(row, staging, stage: StageInputs, inputs: EvaluationInputs):
         if spdx is None:
             raise Refused(f"licence {row['licence']} not recognised")
         skill, year, folder, state, template_dir = stage_one(row, pin, staging, stage, spdx)
-        staged_scan, notices = _staged_notice_scan(skill, template_dir, spdx, stage.licence_scan)
+        staged_scan, _ = _staged_notice_scan(skill, template_dir, spdx, stage.licence_scan)
         _check_staged_skill(skill, template_dir, staged_scan)
         run_gates(stage.root, staging, skill, row, folder, pin, state, inputs.gates)
-        # A future gate fixer must preserve the checker contract too.
+        staged_scan, notices = _staged_notice_scan(skill, template_dir, spdx, stage.licence_scan)
         _check_staged_skill(skill, template_dir, staged_scan)
         result.update(verdict='adopted', directory=f'{SKILLS_DIR}/{skill.name}')
         if notices:
@@ -1302,13 +1308,20 @@ def _download_licence(root: Path, spdx: str, runner) -> Path:
     return target
 
 
-def _stage_licence_template(root: Path, cache: Path, spdx: str, runner) -> Path:
-    """Use a local SPDX template or download it once into the staging cache."""
+def _stage_licence_template(inputs: StageInputs, spdx: str) -> Path:
+    """Use a local template or memoize the download outcome for this run."""
+    if spdx in inputs.download_failures:
+        raise _LicenceDownloadError(inputs.download_failures[spdx])
     filename = f'{spdx}.txt'
-    if _licence_target_present(root, filename):
-        return root / LICENCES_DIR
+    if _licence_target_present(inputs.root, filename):
+        return inputs.root / LICENCES_DIR
+    cache = inputs.template_cache
     if not _licence_target_present(cache, filename):
-        _download_licence(cache, spdx, runner)
+        try:
+            _download_licence(cache, spdx, inputs.runner)
+        except _LicenceDownloadError as error:
+            inputs.download_failures[spdx] = str(error)
+            raise
     return cache / LICENCES_DIR
 
 
@@ -1909,7 +1922,10 @@ def resolve_report_path(report: Path | str | None, root: Path) -> Path | None:
     dest = raw_report
     if not dest.is_symlink():
         dest = dest.resolve()
-        if dest.is_dir() or os.fspath(report).endswith(('/', '\\')):
+        directory_hint = os.fspath(report).endswith(('/', '\\'))
+        if directory_hint and dest.is_file():
+            raise ValueError(f'report directory is a file: {dest}')
+        if directory_hint or dest.is_dir():
             dest /= DEFAULT_REPORT_FILE
     if dest.is_symlink():
         raise ValueError('report output symlink refused')

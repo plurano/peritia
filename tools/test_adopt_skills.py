@@ -50,7 +50,9 @@ REAL_RUN = subprocess.run
 
 
 def run_fixture_command(args, **kwargs):
-    """Run local fixtures without inheriting Git's configuration or repository state."""
+    """Run local fixtures without inheriting Git configuration or downloading licences."""
+    if args[:2] == ['reuse', 'download']:
+        raise AssertionError('licence download fixtures must use a fake runner')
     explicit_env = kwargs.get('env')
     original_env = os.environ if explicit_env is None else explicit_env
     env = {key: value for key, value in original_env.items() if not key.startswith('GIT_')}
@@ -446,6 +448,42 @@ class AdoptionTests(unittest.TestCase):
         self.assertEqual(rows[0]["verdict"], "refused")
         self.assertEqual(rows[0]["reason"], "licence-text-shadowed: LICENSE.md by LICENSE")
 
+    def test_repository_licence_keeps_identical_and_writes_missing_file(self):
+        """Adopt matching and missing destinations and refuse conflicting bytes."""
+        names = ('identical', 'missing', 'different')
+        files = {f'pack/{name}/SKILL.md': MD.format(name=name) for name in names}
+        pin = self.source(files | {
+            'LICENSE': LICENCE,
+            'pack/identical/LICENSE': LICENCE,
+            'pack/different/LICENSE': 'Different terms.\n',
+        })
+        for name in names:
+            self.candidate(name=name, folder=f'pack/{name}', pin=pin, evidence='repository:self')
+        rows, _ = self.invoke()
+        self.assertEqual([row['verdict'] for row in rows], ['adopted', 'adopted', 'refused'], rows)
+        self.assertEqual(rows[2]['reason'], 'licence-text-conflict: LICENSE')
+        for name in names[:2]:
+            self.assertEqual((self.root / 'skills' / name / 'LICENSE').read_bytes(), LICENCE.encode())
+        self.assertFalse((self.root / 'skills/different').exists())
+
+    def test_staged_licence_conflict_preserves_file_and_symlink_target(self):
+        """Refuse replacements while preserving staged bytes and symlink targets."""
+        for is_link in (False, True):
+            with self.subTest(is_link=is_link):
+                skill = self.base / f'staged-skill-{is_link}'
+                skill.mkdir()
+                destination = skill / 'LICENSE'
+                target = self.base / 'target'
+                original = target if is_link else destination
+                original.write_bytes(b'Different terms.\n')
+                if is_link:
+                    destination.symlink_to(target)
+                with (patch.object(adopt, '_selected_licence_text', return_value=('LICENSE', LICENCE.encode(), '')),
+                      self.assertRaisesRegex(adopt.Refused, r'^licence-text-conflict: LICENSE$')):
+                    adopt.licence_text({'licence_evidence': 'repository:self'}, None, None, skill, None)
+                self.assertEqual(original.read_bytes(), b'Different terms.\n')
+                self.assertEqual(destination.is_symlink(), is_link)
+
     def test_upstream_api_is_pinned_and_recorded(self):
         self.fixture(evidence='upstream:upstream/original')
         rows, _ = self.invoke()
@@ -470,9 +508,9 @@ class AdoptionTests(unittest.TestCase):
         rows, _ = self.invoke()
         self.assertEqual([r['directory'] for r in rows], ['skills/demo-name', 'skills/demo-name-owner'])
         self.assertIn('pack/first', rows[0]['candidate'])
-        credits = (self.root / 'CREDITS.md').read_text()
-        self.assertEqual(credits.count('https://github.com/owner/repo'), 1)
-        self.assertIn('`demo-name`, `demo-name-owner`', credits)
+        credits_text = (self.root / 'CREDITS.md').read_text()
+        self.assertEqual(credits_text.count('https://github.com/owner/repo'), 1)
+        self.assertIn('`demo-name`, `demo-name-owner`', credits_text)
         self.assertEqual(check_skills.check(self.root), 0)
 
     def test_second_collision_refused_without_overwrite(self):
@@ -645,6 +683,33 @@ class AdoptionTests(unittest.TestCase):
         self.assertEqual(sorted(path.name for path in (self.root / 'skills').iterdir()), ['INDEX.tsv', 'good', 'licence-notices.yaml'])
         self.assertFalse((self.root / 'LICENSES/MIT-0.txt').exists())
 
+    def test_failed_template_download_is_cached_for_one_run_per_spdx(self):
+        """Refuse repeated failed IDs with one download and retry on a new run."""
+        licences = {'first': ('MIT-0', MIT_ZERO_LICENCE), 'second': ('MIT-0', MIT_ZERO_LICENCE),
+                    'other': ('MIT', LICENCE)}
+        files = {f'pack/{name}/{file}': text for name, (_, body) in licences.items()
+                 for file, text in [('SKILL.md', MD.format(name=name)), ('LICENSE', body)]}
+        pin = self.source(files)
+        for name, (spdx, _) in licences.items():
+            self.candidate(name=name, folder=f'pack/{name}', pin=pin)['licence'] = spdx
+        (self.root / 'LICENSES/MIT.txt').unlink()
+        downloads = []
+
+        def runner(cmd, *, cwd=None):
+            """Record downloads and simulate a timeout for MIT-0 only."""
+            downloads.append(cmd[-1])
+            if cmd[-1] == 'MIT-0':
+                raise subprocess.TimeoutExpired(cmd, adopt.TIMEOUT)
+            Path(cmd[cmd.index('-o') + 1]).write_text(LICENCE, encoding='utf-8')
+
+        rows, _ = self.invoke(apply=False, runner=runner)
+        self.assertEqual([row['verdict'] for row in rows], ['refused', 'refused', 'adopted'], rows)
+        reason = f'licence download failed for MIT-0: timed out after {adopt.TIMEOUT:g} seconds'
+        self.assertEqual([row['reason'] for row in rows[:2]], [reason, reason])
+        self.assertEqual(downloads, ['MIT-0', 'MIT'])
+        self.assertEqual(self.invoke(runner=runner)[0], rows)
+        self.assertEqual(downloads, ['MIT-0', 'MIT', 'MIT-0', 'MIT'])
+
     def test_staged_licence_requires_exact_reviewed_pin(self):
         """Require the staged licence bytes to match the reviewed exception."""
         body = LICENCE + '\nReviewed upstream note.\n'
@@ -705,6 +770,37 @@ class AdoptionTests(unittest.TestCase):
             "notices:", "- Copyright (c) 2025 Owner", f"- {added}", "- Copyright Z Existing Holder",
         ])
         self.assertEqual(check_skills.check(self.root), 0)
+
+    def test_adoption_does_not_propose_wrapped_cc0_terms_as_notices(self):
+        """Treat wrapped CC0 terms spanning template lines as part of the body."""
+        spdx = 'CC0-1.0'
+        template = (REPO / f'LICENSES/{spdx}.txt').read_text(encoding='utf-8')
+        body = template.replace(
+            'exclusive Copyright and Related Rights (defined below) upon the creator\nand subsequent',
+            'exclusive\nCopyright and Related Rights (defined below) upon the creator and subsequent\n',
+        )
+        self.assertIn('\nCopyright and Related Rights', body)
+        (self.root / f'LICENSES/{spdx}.txt').write_text(template, encoding='utf-8')
+        self.fixture(extra={'pack/demo/LICENSE': body})['licence'] = spdx
+        rows, _ = self.invoke()
+        self.assertEqual(rows[0]['verdict'], 'adopted', rows)
+        self.assertEqual(rows[0]['reason'], '')
+        self.assertFalse((self.root / LICENCE_NOTICES_FILE).exists())
+
+    def test_adoption_reports_and_registers_only_post_gate_notices(self):
+        """Publish only notices that survive a gate's licence edit."""
+        dropped = 'Copyright The Example Authors.'
+        self.fixture(extra={'pack/demo/LICENSE': f'{dropped}\n{LICENCE}'})
+
+        def drop_notice(_root, _staging, skill):
+            """Drop the planted notice while preserving the valid MIT text."""
+            (skill / 'LICENSE').write_text(LICENCE, encoding='utf-8')
+
+        rows, _ = self.invoke(gate=drop_notice)
+        self.assertEqual(rows[0]['verdict'], 'adopted', rows)
+        self.assertEqual(rows[0]['reason'], 'licence notices added: Copyright (c) 2025 Owner')
+        self.assertEqual(check_skills.read_licence_notices(self.root), {'Copyright (c) 2025 Owner'})
+        self.assertEqual((self.root / 'skills/demo/LICENSE').read_text(encoding='utf-8'), LICENCE)
 
     def test_licence_notice_register_output_symlink_refused(self):
         """Keep an ordinary file unchanged when the notice register points to it."""
@@ -915,6 +1011,26 @@ class AdoptionTests(unittest.TestCase):
                 self.assertEqual(
                     destination.read_text(encoding='utf-8'), adopt.report_text(rows),
                 )
+
+    def test_trailing_separator_requires_report_path_to_be_a_directory(self):
+        """Refuse a file before apply and accept existing and missing directories."""
+        self.fixture()
+        report_file = self.base / 'existing.tsv'
+        report_file.write_text('existing report\n', encoding='utf-8')
+        before = snapshot(self.root)
+        with self.assertRaisesRegex(ValueError, 'report directory is a file:') as ctx:
+            self.invoke(report=f'{report_file}/')
+        self.assertEqual(str(ctx.exception), f'report directory is a file: {report_file}')
+        self.assertEqual(report_file.read_text(encoding='utf-8'), 'existing report\n')
+        self.assertEqual(snapshot(self.root), before)
+
+        existing = self.base / 'existing-dir'
+        existing.mkdir()
+        for directory in (existing, self.base / 'missing-dir'):
+            with self.subTest(directory=directory):
+                rows, _ = self.invoke(apply=False, report=f'{directory}/')
+                self.assertEqual(rows[0]['verdict'], 'adopted', rows)
+                self.assertEqual((directory / 'adopt-report.tsv').read_text(encoding='utf-8'), adopt.report_text(rows))
 
     def test_failed_licence_download_refuses_row_and_keeps_root(self):
         """Refuse the failed candidate and keep the installed root byte-identical."""
@@ -1373,7 +1489,8 @@ class AdoptionTests(unittest.TestCase):
         """Refuse previews, malformed journals, escaped paths and symlinks without modifying root."""
         self._seed_existing_skill()
         fake_runner, _ = self._two_mit0_candidates()
-        self.assertEqual([r['verdict'] for r in self.invoke(apply=False)[0]], ['adopted', 'adopted'])
+        preview, _ = self.invoke(apply=False, runner=fake_runner)
+        self.assertEqual([r['verdict'] for r in preview], ['adopted', 'adopted'])
         self._fork_kill_on_second_skill(fake_runner)
         journal_file = self.root / adopt.JOURNAL_NAME
         valid_payload = json.loads(journal_file.read_text(encoding='utf-8'))

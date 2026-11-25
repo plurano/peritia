@@ -35,20 +35,32 @@ to the licence file.
 
 Keep vendored licence files unchanged. Copyright notice lines start with the
 word `Copyright` and a space, or with `©`, including `©2026` without a space.
-Lettered clause lines such as `(c)` stay in the licence body comparison. The
-checker accepts exact notices from the selected SPDX template or the
+Lettered clauses and wrapped template terms such as `Copyright and Related
+Rights` stay in the body comparison.
+The checker accepts exact notices from the selected SPDX template or the
 reviewed [`skills/licence-notices.yaml`](skills/licence-notices.yaml) register.
 It collapses whitespace before matching the line, preserving case and
 punctuation. Adoption lists each proposed addition in its report and writes a
 sorted, deduplicated register with the adopted skills. Review each new line in
 the diff.
 
-For a reviewed licence body variant at exactly `skills/<name>/LICENSE`, record
-the path, SPDX ID, SHA-256 hash of the original bytes, and reason in
-[`skills/licence-exceptions.yaml`](skills/licence-exceptions.yaml). A pin
-applies only to that `LICENSE` path. Files named `LICENSE.rst`, `LICENSE.md`, or
-otherwise still require a matching body. Use category D with an expiry 120
-days after the entry date, and review the exception again when it expires.
+Pin a reviewed licence body variant at `skills/<name>/LICENSE` in
+[`skills/licence-exceptions.yaml`](skills/licence-exceptions.yaml). Use the
+SHA-256 of the original bytes and review the pin again when it expires.
+Category D expires 120 days after entry. Other filenames still require a
+matching body.
+
+```yaml
+exceptions:
+  - rule: skill-licence-text
+    path: skills/example/LICENSE
+    spdx: MIT
+    sha256: b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5
+    reason: Reviewed variant with an upstream attribution note.
+    category: D
+    entered: '2026-11-25'
+    expires: '2027-03-25'
+```
 
 ## Using it
 

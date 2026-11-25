@@ -397,7 +397,7 @@ def _load_front_matter(text: str, loader: type[yaml.SafeLoader]) -> dict:
 def front_matter(
     text: str, *, exact_license: bool = False, require_string_licence: bool = False,
 ) -> dict[str, str]:
-    """Project up to 100 YAML fields, optionally requiring string licence values."""
+    """Project 100 YAML fields and retain both licence keys in strict mode."""
     strict = exact_license or require_string_licence
     loader = _UniqueKeyLoader if strict else yaml.SafeLoader
     data = _load_front_matter(text, loader)
@@ -413,9 +413,13 @@ def front_matter(
             meta[str(k)] = v.strip()
         elif not isinstance(v, (list, dict, type(None))):
             meta[str(k)] = str(v)
-    if exact_license and "license" in data:
-        licence = data["license"]
-        meta["license"] = licence if isinstance(licence, str) else f"<{type(licence).__name__}>"
+    if strict:
+        for key in ("license", "licence"):
+            value = data.get(key)
+            if isinstance(value, str):
+                meta.setdefault(key, value.strip())
+    if exact_license and "license" in data and not isinstance(data["license"], str):
+        meta["license"] = f"<{type(data['license']).__name__}>"
     return meta
 
 
@@ -980,6 +984,16 @@ class _LicenceRegressionTests(unittest.TestCase):
                 body = f"{prefix} miT{suffix}\n{self.mit}"
                 self.assertEqual(skill_problems(self._plant(body)), [])
 
+    def test_spdx_metadata_normalises_lgpl_only_alias(self):
+        """Accept the bare LGPL ID and reject other or unknown identifiers."""
+        spdx = "LGPL-3.0-only"
+        (self.templates / f"{spdx}.txt").write_text(self.mit, encoding="utf-8")
+        identifier = "SPDX-License-Identifier" + ":"
+        self.assertEqual(skill_problems(self._plant(f"{identifier} LGPL-3.0\n{self.mit}", spdx)), [])
+        for found in ("LGPL-3.0-or-later", "Unknown-Licence"):
+            with self.subTest(found=found):
+                self._refused(self._plant(f"{identifier} {found}\n{self.mit}", spdx), f"{found}; declared {spdx}")
+
     def _write_licence_notices(self, notices):
         """Write a fixture notice register."""
         register = self.root / "skills/licence-notices.yaml"
@@ -1047,6 +1061,21 @@ class _LicenceRegressionTests(unittest.TestCase):
         for spdx, body in (("MIT", self.mit), ("MIT-0", self.mit_zero), ("Apache-2.0", self.apache)):
             with self.subTest(spdx=spdx):
                 self.assertEqual(skill_problems(self._plant(body, spdx)), [])
+
+    def test_wrapped_cc0_copyright_terms_stay_in_licence_body(self):
+        """Accept wrapped CC0 terms and still require review of real notices."""
+        spdx = "CC0-1.0"
+        template = _fixture_licence(spdx)
+        (self.templates / f"{spdx}.txt").write_text(template, encoding="utf-8")
+        body = template.replace("exclusive Copyright and Related Rights", "exclusive\nCopyright and Related Rights")
+        self.assertIn("\nCopyright and Related Rights", body)
+        self.assertEqual(skill_problems(self._plant(body, spdx)), [])
+        for notice in ("Copyright (c) 2025 Example Org", "Copyright The Example Authors."):
+            with self.subTest(notice=notice):
+                skill = self._plant(f"{notice}\n{body}", spdx)
+                self._refused(skill, f"unreviewed copyright notice {notice!r}")
+                self._write_licence_notices([notice])
+                self.assertEqual(skill_problems(skill), [])
 
     def test_licence_notice_register_limits(self):
         """Enforce count, length, sorted order and uniqueness."""
