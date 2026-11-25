@@ -992,7 +992,7 @@ class AdoptionTests(unittest.TestCase):
         self.assertIn('demo\towner/repo\ttesting;coding\t\t',
                       (self.root / 'skills/INDEX.tsv').read_text(encoding='utf-8'))
         (self.root / 'skills/INDEX.tsv').unlink()
-        adopt.publish(self.root, self.base, [], 'version = 1\n', '# Credits\n', runner=unexpected_runner)
+        adopt.publish(self.root, self.base, [], ('version = 1\n', '# Credits\n'), runner=unexpected_runner)
         self.assertIn('demo\towner/repo\t\t\t', (self.root / 'skills/INDEX.tsv').read_text(encoding='utf-8'))
         self.assertEqual([p.name for p in self.root.iterdir() if p.name.startswith('.adopt-publish')], [])
 

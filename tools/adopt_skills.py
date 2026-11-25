@@ -1887,16 +1887,15 @@ def _publication_staging(root: Path | None):
             shutil.rmtree(staging, ignore_errors=True)
 
 
-def publish(root, saved, rows, reuse, credits, adopted_map=None, group_map=None,
-            runner=default_download_runner, *, staging=None, notice_register: bytes | None = None):
-    """Stage and journal the verified skills, licence templates and metadata."""
+def publish(root, saved, rows, metadata, adopted_map=None, group_map=None,
+            runner=default_download_runner, *, staging=None):
+    """Stage and journal verified skills, licence templates and the (REUSE, credits) metadata pair."""
     _check_output_symlinks(root)
-    metadata = {REUSE_FILE: reuse, CREDITS_FILE: credits}
+    reuse, credits_text = metadata
+    outputs = {REUSE_FILE: reuse, CREDITS_FILE: credits_text}
     with _publication_staging(root) if staging is None else nullcontext(staging) as work:
-        if notice_register is not None:
-            _staged_target_path(work, root / LICENCE_NOTICES_FILE).write_bytes(notice_register)
         licences, skills, index_staged = _stage_publish(
-            root, work, saved, rows, metadata, adopted_map, group_map, runner,
+            root, work, saved, rows, outputs, adopted_map, group_map, runner,
             template_cache=staging,
         )
         _commit_publish(root, work, licences, skills, index_staged)
@@ -2027,13 +2026,15 @@ def _evaluate_and_publish(root: Path, checkouts: Path, parsed: tuple, opts: _Run
         stage = StageInputs(checkouts, root, occupied, opts.apply, opts.reader, template_cache,
                             opts.runner, licence_scan)
         evaluation = EvaluationInputs(grouped, order, pins, opts.include_grouped, copies_map, present, opts.gates)
-        rows, adopted_map, reuse, credits = _evaluate_candidates(selected, stage, evaluation, saved, metadata)
+        rows, adopted_map, reuse, credits_text = _evaluate_candidates(selected, stage, evaluation, saved, metadata)
         register = (
             _render_notice_register(licence_scan.notices) if licence_scan.notices != existing_notices else None
         )
         if opts.apply:
-            publish(root, saved, rows, reuse, credits, adopted_map, group_map, opts.runner,
-                    staging=template_cache, notice_register=register)
+            if register is not None:
+                _staged_target_path(template_cache, root / LICENCE_NOTICES_FILE).write_bytes(register)
+            publish(root, saved, rows, (reuse, credits_text), adopted_map, group_map, opts.runner,
+                    staging=template_cache)
     return rows
 
 
