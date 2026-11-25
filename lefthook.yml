@@ -11,6 +11,11 @@
 # REUSE.toml or LICENSES/ was present at adoption: the reuse-lint job runs
 # reuse lint at the release line fsfe/reuse-action@v6 runs in CI.
 # It skips where reuse is not installed and fails on another reuse major.
+# Peritia additions to the generated jobs: pre-commit python-lint (make
+# python-lint: pinned Ruff with ruff.toml when a Python file, ruff.toml or the
+# tool lock is staged) and pre-push python-lint (the same check over the whole
+# tree: the gate job signs no receipt for a root without go.mod or Cargo.lock,
+# so it does not cover Python).
 ---
 agent-checkpoint-tool:
   commands:
@@ -58,6 +63,12 @@ pre-commit:
       run: sh .config/lefthook/engine.sh compile-context --verify
     hiss-audit:
       run: sh .config/lefthook/engine.sh audit --offline
+    python-lint:
+      glob:
+        - "*.py"
+        - "ruff.toml"
+        - "requirements/tools.txt"
+      run: make python-lint
 
 post-commit:
   commands:
@@ -98,5 +109,7 @@ pre-push:
       run: sh .config/lefthook/engine.sh flavor audit .
     audit:
       run: sh .config/lefthook/engine.sh audit
+    python-lint:
+      run: make python-lint
     gate:
       run: sh .config/lefthook/engine.sh gate run --path=. --admit-unsupported

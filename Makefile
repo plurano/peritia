@@ -5,11 +5,11 @@ PRAETORCTL ?= $(shell command -v praetorctl 2>/dev/null || command -v standardsc
 VENV ?= .venv
 BIN = $(VENV)/bin
 PYTHON ?= python3
-.PHONY: all verify-all compile-context compile-context-verify caveman-sources audit build test tools
+.PHONY: all verify-all compile-context compile-context-verify caveman-sources audit build test tools python-lint
 
 all: build
 
-verify-all: compile-context-verify caveman-sources audit test
+verify-all: compile-context-verify caveman-sources audit python-lint test
 
 compile-context:
 	@$(PRAETORCTL) compile-context
@@ -42,6 +42,12 @@ test: tools build
 		$(BIN)/python -B "$$file" || { printf 'test failed: %s\n' "$$file" >&2; exit 1; }; \
 	done
 	@reuse lint
+
+# Ruff with the rule set and baseline in ruff.toml, which mirror Codacy's Ruff patterns, so a
+# finding fails here before Codacy reports it on the pull request. Ruff is pinned in
+# requirements/tools.txt; --no-cache leaves no .ruff_cache in the tree.
+python-lint: tools
+	@$(BIN)/ruff check --no-cache --output-format concise .
 
 build: tools
 	@$(BIN)/python -B tools/check_skills.py

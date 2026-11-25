@@ -1,0 +1,70 @@
+# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
+# SPDX-License-Identifier: EUPL-1.2
+#
+# Ruff configuration for the local gate (`make python-lint`, run by `make verify-all` and by
+# the pre-commit and pre-push python-lint jobs in lefthook.yml). Ruff is pinned with hashes in
+# requirements/tools.txt, and Renovate replays the uv pip compile command in its header.
+#
+# The rule set mirrors the 86 Ruff patterns Codacy enables for this repository
+# (codacy_list_repository_tool_patterns, read 2026-11-25), so a finding fails before a push
+# instead of after it. FURB167 is added on top: Codacy reported it on pull request 44 although
+# the pattern list shows it disabled, and nothing local caught it. A change to the Codacy
+# pattern set is mirrored here by hand.
+
+target-version = "py312"
+
+[lint]
+select = [
+    # Codacy Ruff patterns.
+    "B002", "B003", "B006", "B008", "B011", "B012", "B016", "B017", "B019",
+    "B023", "B025", "B026", "B027", "B029", "B030", "B031", "B032", "B035",
+    "B039", "B904",
+    "E722", "E902", "FA102", "PLE2502", "PLW1509", "RUF001",
+    "S101", "S102", "S103", "S104", "S105", "S106", "S107", "S108", "S110",
+    "S112", "S113",
+    "S201", "S202",
+    "S301", "S302", "S303", "S304", "S305", "S306", "S307", "S308", "S310",
+    "S311", "S312", "S313", "S314", "S315", "S316", "S317", "S318", "S319",
+    "S321", "S323", "S324",
+    "S501", "S502", "S503", "S504", "S505", "S506", "S507", "S508", "S509",
+    "S601", "S602", "S603", "S604", "S605", "S606", "S607", "S608", "S609",
+    "S610", "S611", "S612",
+    "S701", "S702", "S704", "TID251", "W605",
+    # Codacy finding on pull request 44 (regex flag alias such as re.M).
+    "FURB167",
+    # A blanket `# noqa` would silence every rule on its line, this gate included.
+    "PGH004",
+]
+
+# The baseline: findings that were on main when this gate was added (1e45c91). Each entry is
+# one file with the rules it may still break, the reason, and the exception category with its
+# expiry, as in .codacy.yml. Any other file, and any other rule in these files, fails.
+#
+# Category C (10 days, entered 2026-11-25, expires 2026-12-05): regex flag aliases (FURB167)
+# and one import-time assert (S101) in files pull request 44 rewrites. Fixing them here would
+# conflict with it; they are fixed once it lands, and the entries go.
+#
+# Category D (120 days, entered 2026-11-25, expires 2027-03-25): subprocess calls (S603, and
+# S607 for a bare program name such as git or reuse). Each passes an argument list without a
+# shell. The entries for the tests and the two skill scripts match the Bandit and Opengrep
+# verdicts in .codacy.yml (peritia-decided-codacy-trial-verdict-27-test-subprocess,
+# peritia-decided-codacy-verdict-62-test-subprocess and
+# peritia-decided-codacy-verdict-62-skill-subprocess). The S101 entry for check_skills.py
+# covers the asserts of its selftest, which `make test` runs without -O.
+[lint.per-file-ignores]
+# Category C (FURB167) and D (S603, S607).
+"tools/adopt_skills.py" = ["FURB167", "S603", "S607"]
+# Category C (FURB167, S101 on the CORE_FUNCTIONS check) and D (S603, S607).
+"tools/candidates.py" = ["FURB167", "S101", "S603", "S607"]
+# Category C (FURB167) and D (S101 selftest asserts).
+"tools/check_skills.py" = ["FURB167", "S101"]
+# Category D.
+"tools/census.py" = ["S603"]
+"tools/install_user_skills.py" = ["S603", "S607"]
+"tools/test_adopt_skills.py" = ["S603"]
+"tools/test_skill_patches.py" = ["S603"]
+"skills/cellprofiler/scripts/nuclei_assay.py" = ["S603"]
+"skills/mageck/scripts/screen_analysis.py" = ["S603"]
+# Category D. Praetor vendors this hook script and `praetorctl audit` locks it byte for
+# byte, so it cannot carry a marker here.
+".config/lefthook/scripts/common.py" = ["S603", "S607"]
