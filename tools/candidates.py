@@ -31,7 +31,7 @@ _TOOLS_DIR = Path(__file__).resolve().parent
 if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
-from classify import DOMAINS, FUNCTIONS  # noqa: E402
+from classify import DOMAINS, FUNCTIONS, latest_classifications
 
 # Preserve the licence policy names exposed by earlier candidate versions.
 LICENSE_FILE_PATTERN = licence_policy.LICENSE_FILE_PATTERN
@@ -507,22 +507,20 @@ def decide_row(
 
 
 def load_classified(path: Path) -> dict[str, ClassifiedRow]:
-    classified = {}
-    with path.open(newline="", encoding="utf-8") as handle:
-        for i, row in enumerate(csv.DictReader(handle, delimiter="\t")):
-            if i >= MAX_ROWS:
-                break
-            classified[row["blob_id"]] = ClassifiedRow(
-                blob_id=row["blob_id"],
-                source=row["source"],
-                path=row["path"],
-                skill_name=row["skill_name"],
-                functions=row.get("functions", ""),
-                domains=row.get("domains", ""),
-                model=row.get("model", ""),
-                status=row.get("status", ""),
-            )
-    return classified
+    """Read the latest classification for each blob in the shared history."""
+    return {
+        blob: ClassifiedRow(
+            blob_id=blob,
+            source=row["source"],
+            path=row["path"],
+            skill_name=row["skill_name"],
+            functions=row.get("functions", ""),
+            domains=row.get("domains", ""),
+            model=row.get("model", ""),
+            status=row.get("status", ""),
+        )
+        for blob, row in latest_classifications(path).items()
+    }
 
 
 def read_census_items(path: Path) -> list[CensusRow]:

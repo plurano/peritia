@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import candidates
+import classify
 from licence_text import MAX_LICENCE_BYTES
 
 CENSUS_FIELDS = [
@@ -79,6 +80,28 @@ def write_skill(
 
 
 class CandidatesTests(unittest.TestCase):
+    def test_latest_classification_revision_is_shared_with_summary(self):
+        """Read the newest row within the cap through both public entry points."""
+        with tempfile.TemporaryDirectory() as folder:
+            path = write_classified(Path(folder), [
+                {"blob_id": "blob", "model": "old", "status": "error"},
+                {"blob_id": "blob", "model": "current", "status": "ok"},
+            ])
+            with patch.object(classify, "MAX_ROWS", 2):
+                self.assertEqual(candidates.load_classified(path)["blob"].model, "current")
+                self.assertIn("rows=1 ok=1 error=0 models=current", classify.summary(path))
+
+    def test_classification_history_over_cap_is_refused(self):
+        """Report the same bounded-scan error to both consumers."""
+        with tempfile.TemporaryDirectory() as folder:
+            path = write_classified(Path(folder), [{"blob_id": "blob"}, {"blob_id": "blob"}])
+            with patch.object(classify, "MAX_ROWS", 1):
+                for read in (candidates.load_classified, classify.summary):
+                    with self.subTest(reader=read.__name__), self.assertRaisesRegex(
+                        ValueError, r"classified\.tsv.*cap.*1"
+                    ):
+                        read(path)
+
     def test_only_supported_spdx_ids_have_licence_classes(self) -> None:
         """Keep unsupported SPDX identifiers outside the candidate classes."""
         for spdx in ("LGPL-NONSENSE", "GPL-NONSENSE", "MIT-only", "Apache-2.0-or-later"):

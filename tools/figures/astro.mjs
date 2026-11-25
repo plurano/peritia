@@ -39,12 +39,12 @@
 //
 // Option `root`: the repository root that holds docs/assets/figures/, as a path or a file: URL. By
 // default it is the directory two levels above this file, where build.mjs writes the figures.
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { gunzipSync } from 'node:zlib';
-import { CheckError, OUT_DIR, ROOT, figureMeta, figureSlug, filesDigest, fillSlots } from './checks.mjs';
+import { CheckError, OUT_DIR, ROOT, UTF8, figureMeta, figureSlug, filesDigest, fillSlots, readBoundedBytesAsync } from './checks.mjs';
 import { sha256 } from './core.mjs';
 import { FIGURES_URI, PLAYER_URI, basePath, mountFiles, publish, staticHandler, statOrNull } from './serve.mjs';
 
@@ -103,10 +103,12 @@ export const figuresDigest = (figuresDir) => filesDigest(figuresDir, mountFiles(
 export function watchFigures(server, figuresDir, logger, delay = RESTART_DELAY_MS) {
   const dir = resolve(figuresDir);
   let timer = null;
+  /** Restart the development server and report a restart failure. */
   const restart = () => {
     logger?.info(`${dir}: a figure changed, so the development server restarts to render it again`);
     Promise.resolve(server.restart()).catch((error) => logger?.error(`figures: the development server did not restart: ${error.message}`));
   };
+  /** Debounce restarts for JSON figure changes in the watched directory. */
   const onEvent = (path) => {
     if (dirname(resolve(path)) !== dir || !isFigureJson(path)) return;
     clearTimeout(timer);
@@ -206,6 +208,7 @@ export function satteriFigures(options) {
     name: NAME,
     options: { position: true },
     figures: options,
+    /** Replace a figure code block with validated figure markup. */
     code(node, ctx) {
       if (!isFigureBlock(node)) return undefined;
       const errors = [];
@@ -265,12 +268,12 @@ function resolveLockFile(root) {
   return statOrNull(candidate)?.isFile() ? candidate : LOCK_FILE;
 }
 
-/** Reads and parses the player lock JSON file under size limits. */
-function readPlayerLock(lockFile) {
+/** Reads and parses the player lock JSON under a byte limit and the async reader's deadline. */
+export async function readPlayerLock(lockFile, timeoutMs) {
   let data;
   try {
-    if (statSync(lockFile).size > MAX_ARCHIVE_BYTES) throw new CheckError(`${lockFile} exceeds ${MAX_ARCHIVE_BYTES} bytes`);
-    data = JSON.parse(readFileSync(lockFile, 'utf8'));
+    const bytes = await readBoundedBytesAsync(lockFile, MAX_ARCHIVE_BYTES, timeoutMs);
+    data = JSON.parse(UTF8.decode(bytes));
   } catch (error) {
     if (error instanceof CheckError) throw error;
     throw new CheckError(`cannot read ${lockFile}: ${error.message}`, { cause: error });
@@ -465,12 +468,15 @@ export function extractPlayerArchive(raw) {
 }
 
 /** Fetches, verifies, and mounts the locked release player bundle. */
-function resolveLockedPlayer(mounts, lockFile, logger, download = downloadPlayerArchive) {
-  if (!statOrNull(lockFile)?.isFile()) {
+async function resolveLockedPlayer(mounts, lockFile, logger, download = downloadPlayerArchive) {
+  let lock;
+  try {
+    lock = await readPlayerLock(lockFile);
+  } catch (error) {
+    if (!['ENOENT', 'ENOTDIR'].includes(error.cause?.code)) throw error;
     logger?.warn(svgFallbackWarning(`unknown (${basename(lockFile)} is missing; praetorctl adopt writes it)`));
     return null;
   }
-  const lock = readPlayerLock(lockFile);
   const release = String(lock.release ?? '').trim();
   if (!release) {
     // Log unreleased pins at INFO so strict builds do not fail on a warning.
