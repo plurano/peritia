@@ -15,7 +15,7 @@ description: >
   also check here for a matching course or tutorial — a docs-grounded answer
   and an Academy recommendation belong together. Only recommend on a strong
   match; never invent Academy content.
-license: Complete terms in LICENSE.txt
+license: Complete terms in LICENSE
 ---
 
 # Claude Academy guide

@@ -15,7 +15,8 @@ import sys
 import tempfile
 import threading
 import unittest
-from contextlib import contextmanager, redirect_stderr
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
@@ -30,11 +31,18 @@ import census
 import check_skills
 import input_identity
 import overlap
+from licence_text import (
+    LICENCE_NOTICES_FILE,
+    MAX_LICENCE_BYTES,
+)
 
 REPO = Path(__file__).resolve().parent.parent
 MD = '---\nname: {name}\ndescription: Use when testing adoption.\n---\n\n# Example\n\nCheck the result.\n'
 COPY_MD = '---\nname: {name}\ndescription: Use when testing copied adoption.\n---\n\n# Example\n\nCheck the copy.\n'
-LICENCE = 'MIT License\n\nCopyright (c) 2025 owner\n'
+LICENCE = (REPO / 'LICENSES/MIT.txt').read_text(encoding='utf-8').replace(
+    'Copyright (c) <year> <copyright holders>', 'Copyright (c) 2025 Owner',
+)
+MIT_ZERO_LICENCE = (REPO / 'LICENSES/MIT-0.txt').read_text(encoding='utf-8')
 CANDIDATE_FIELDS = ['source', 'path', 'skill_name', 'verdict', 'licence', 'licence_evidence', 'functions']
 EMBED_MODEL = 'fixture-embed'
 EMBED_PROVIDER = 'https://models.example.test/v1'
@@ -42,7 +50,9 @@ REAL_RUN = subprocess.run
 
 
 def run_fixture_command(args, **kwargs):
-    """Run local fixtures without inheriting Git's configuration or repository state."""
+    """Run local fixtures without inheriting Git configuration or downloading licences."""
+    if args[:2] == ['reuse', 'download']:
+        raise AssertionError('licence download fixtures must use a fake runner')
     explicit_env = kwargs.get('env')
     original_env = os.environ if explicit_env is None else explicit_env
     env = {key: value for key, value in original_env.items() if not key.startswith('GIT_')}
@@ -86,6 +96,29 @@ class _OsReplaceProxy:
         return getattr(os, name)
 
 
+class DefaultDownloadRunnerTests(unittest.TestCase):
+    def test_returns_stdout_bytes(self):
+        args = ['reuse', 'download', 'MIT-0']
+        cwd = Path('fixture')
+        with patch.object(adopt, 'command', return_value=b'Downloaded') as command:
+            self.assertEqual(adopt.default_download_runner(args, cwd=cwd), b'Downloaded')
+        command.assert_called_once_with(args, cwd=cwd, timeout=adopt.TIMEOUT)
+
+    def test_failure_names_licence_and_includes_stderr(self):
+        """Report the requested licence and the downloader's failure detail."""
+        error = adopt.Refused('command: reuse: network error')
+        with (patch.object(adopt, 'command', side_effect=error),
+              self.assertRaisesRegex(ValueError, '^licence download failed for MIT-0: network error$')):
+            adopt.default_download_runner(['reuse', 'download', 'MIT-0'])
+
+    def test_empty_args_name_unknown_licence(self):
+        """Reject a download request with no licence argument."""
+        with (patch.object(adopt, 'command') as command,
+              self.assertRaisesRegex(ValueError, '^licence download failed for unknown$')):
+            adopt.default_download_runner([])
+        command.assert_not_called()
+
+
 class AdoptionTests(unittest.TestCase):
     def setUp(self):
         """Prepare an isolated temporary worktree and synthetic source repositories."""
@@ -99,6 +132,8 @@ class AdoptionTests(unittest.TestCase):
         self.base = Path(self.temp.name)
         self.root = self.base / 'root'
         self.root.mkdir()
+        (self.root / 'LICENSES').mkdir(exist_ok=True)
+        shutil.copyfile(REPO / 'LICENSES/MIT.txt', self.root / 'LICENSES/MIT.txt')
         for name in ('.standards.yaml', '.standards-baseline.json'):
             src = REPO / name
             if src.is_file():
@@ -199,6 +234,7 @@ class AdoptionTests(unittest.TestCase):
         return path
 
     def test_folder_licence_origin_reuse_and_checker(self):
+        """Verify the copied licence and the generated REUSE entry."""
         self.fixture(extra={'pack/demo/scripts/helper.py': 'print("example")\n'})
         checkout = self.checkouts / 'owner__repo'
         self.assertFalse((checkout / 'pack/demo/scripts/helper.py').exists())
@@ -389,17 +425,64 @@ class AdoptionTests(unittest.TestCase):
         self.assertNotIn('code fences without a language marked text', origin)
 
     def test_root_licence_for_repository_and_frontmatter(self):
-        for evidence in ('repository', 'frontmatter', 'repository:self'):
-            with self.subTest(evidence=evidence):
-                if not self.candidates:
-                    pin = self.source({'pack/demo/SKILL.md': MD.format(name='demo'), 'LICENSE.txt': LICENCE})
-                    self.candidate(pin=pin, evidence=evidence)
-                self.candidates[0]['licence_evidence'] = evidence
-                rows, _ = self.invoke(apply=False)
-                self.assertEqual(rows[0]['verdict'], 'adopted', rows)
+        """Publish the selected root filename for every repository-backed evidence type."""
+        kinds = {"repo": "repository", "self": "repository:self", "front": "frontmatter"}
+        files = {f"pack/{name}/SKILL.md": MD.format(name=name) for name in kinds}
+        pin = self.source(files | {"LICENSE.md": LICENCE})
+        for name, evidence in kinds.items():
+            self.candidate(name=name, folder=f"pack/{name}", pin=pin, evidence=evidence)
         rows, _ = self.invoke()
-        self.assertEqual(rows[0]['verdict'], 'adopted', rows)
-        self.assertEqual((self.root / 'skills/demo/LICENSE').read_text(), LICENCE)
+        self.assertEqual([row["verdict"] for row in rows], ["adopted"] * len(kinds), rows)
+        for name in kinds:
+            with self.subTest(name=name):
+                skill = self.root / "skills" / name
+                self.assertTrue((skill / "LICENSE.md").is_file(), "selected licence basename LICENSE.md missing")
+                self.assertEqual((skill / "LICENSE.md").read_text(encoding="utf-8"), LICENCE)
+                self.assertFalse((skill / "LICENSE").exists())
+        self.assertEqual(check_skills.check(self.root), 0)
+
+    def test_repository_licence_shadowed_by_folder_refused(self):
+        """Require the file discovered by the checker to be the selected licence."""
+        self.fixture(extra={"LICENSE.md": LICENCE}, evidence="repository")
+        rows, _ = self.invoke()
+        self.assertEqual(rows[0]["verdict"], "refused")
+        self.assertEqual(rows[0]["reason"], "licence-text-shadowed: LICENSE.md by LICENSE")
+
+    def test_repository_licence_keeps_identical_and_writes_missing_file(self):
+        """Adopt matching and missing destinations and refuse conflicting bytes."""
+        names = ('identical', 'missing', 'different')
+        files = {f'pack/{name}/SKILL.md': MD.format(name=name) for name in names}
+        pin = self.source(files | {
+            'LICENSE': LICENCE,
+            'pack/identical/LICENSE': LICENCE,
+            'pack/different/LICENSE': 'Different terms.\n',
+        })
+        for name in names:
+            self.candidate(name=name, folder=f'pack/{name}', pin=pin, evidence='repository:self')
+        rows, _ = self.invoke()
+        self.assertEqual([row['verdict'] for row in rows], ['adopted', 'adopted', 'refused'], rows)
+        self.assertEqual(rows[2]['reason'], 'licence-text-conflict: LICENSE')
+        for name in names[:2]:
+            self.assertEqual((self.root / 'skills' / name / 'LICENSE').read_bytes(), LICENCE.encode())
+        self.assertFalse((self.root / 'skills/different').exists())
+
+    def test_staged_licence_conflict_preserves_file_and_symlink_target(self):
+        """Refuse replacements while preserving staged bytes and symlink targets."""
+        for is_link in (False, True):
+            with self.subTest(is_link=is_link):
+                skill = self.base / f'staged-skill-{is_link}'
+                skill.mkdir()
+                destination = skill / 'LICENSE'
+                target = self.base / 'target'
+                original = target if is_link else destination
+                original.write_bytes(b'Different terms.\n')
+                if is_link:
+                    destination.symlink_to(target)
+                with (patch.object(adopt, '_selected_licence_text', return_value=('LICENSE', LICENCE.encode(), '')),
+                      self.assertRaisesRegex(adopt.Refused, r'^licence-text-conflict: LICENSE$')):
+                    adopt.licence_text({'licence_evidence': 'repository:self'}, None, None, skill, None)
+                self.assertEqual(original.read_bytes(), b'Different terms.\n')
+                self.assertEqual(destination.is_symlink(), is_link)
 
     def test_upstream_api_is_pinned_and_recorded(self):
         self.fixture(evidence='upstream:upstream/original')
@@ -425,9 +508,9 @@ class AdoptionTests(unittest.TestCase):
         rows, _ = self.invoke()
         self.assertEqual([r['directory'] for r in rows], ['skills/demo-name', 'skills/demo-name-owner'])
         self.assertIn('pack/first', rows[0]['candidate'])
-        credits = (self.root / 'CREDITS.md').read_text()
-        self.assertEqual(credits.count('https://github.com/owner/repo'), 1)
-        self.assertIn('`demo-name`, `demo-name-owner`', credits)
+        credits_text = (self.root / 'CREDITS.md').read_text()
+        self.assertEqual(credits_text.count('https://github.com/owner/repo'), 1)
+        self.assertIn('`demo-name`, `demo-name-owner`', credits_text)
         self.assertEqual(check_skills.check(self.root), 0)
 
     def test_second_collision_refused_without_overwrite(self):
@@ -535,8 +618,8 @@ class AdoptionTests(unittest.TestCase):
         self.assertTrue((self.root / 'skills/good').exists())
 
     def test_missing_licence_text_triggers_download_through_runner(self):
-        """Download a missing licence into staging with reuse download -o before root changes."""
-        files = {'pack/demo/SKILL.md': MD.format(name='demo'), 'pack/demo/LICENSE': 'MIT-0\n'}
+        """Verify the downloaded template in staging and install the verified copy on apply."""
+        files = {'pack/demo/SKILL.md': MD.format(name='demo'), 'pack/demo/LICENSE': MIT_ZERO_LICENCE}
         pin = self.source(files)
         row = {
             'source': 'owner/repo', 'path': 'pack/demo/SKILL.md', 'skill_name': 'demo',
@@ -550,37 +633,417 @@ class AdoptionTests(unittest.TestCase):
         def fake_runner(cmd, *, cwd=None):
             """Check the staged download target and write the licence text there."""
             commands.append((list(cmd), cwd))
-            self.assertEqual(cwd.parent, self.root)
             self.assertTrue(cwd.name.startswith('.adopt-publish-'))
             self.assertFalse((self.root / 'skills/demo').exists())
             self.assertFalse((self.root / 'LICENSES/MIT-0.txt').exists())
             out_path = Path(cmd[cmd.index('-o') + 1])
             self.assertEqual(out_path, cwd / 'LICENSES/MIT-0.txt')
-            out_path.write_text('Downloaded MIT-0\n', encoding='utf-8')
+            out_path.write_text(MIT_ZERO_LICENCE, encoding='utf-8')
             return b'Downloaded'
 
+        preview, _ = self.invoke(apply=False, runner=fake_runner)
+        self.assertEqual(preview[0]['verdict'], 'adopted', preview)
+        self.assertFalse((self.root / 'LICENSES/MIT-0.txt').exists())
         rows, _ = self.invoke(apply=True, runner=fake_runner)
+        self.assertEqual(rows, preview)
         self.assertEqual(rows[0]['verdict'], 'adopted')
-        self.assertEqual(len(commands), 1)
-        cmd, stage_cwd = commands[0]
-        self.assertEqual(cmd, ['reuse', 'download', '-o', str(stage_cwd / 'LICENSES/MIT-0.txt'), 'MIT-0'])
-        self.assertFalse(stage_cwd.exists())
+        self.assertEqual(len(commands), 2)
+        self.assertTrue(all(cwd != self.root for _, cwd in commands))
+        self.assertEqual(commands[1][1].parent, self.root)
+        for cmd, stage_cwd in commands:
+            self.assertEqual(cmd, ['reuse', 'download', '-o', str(stage_cwd / 'LICENSES/MIT-0.txt'), 'MIT-0'])
+            self.assertFalse(stage_cwd.exists())
         self.assertEqual([p.name for p in self.root.iterdir() if p.name.startswith('.adopt-publish')], [])
-        self.assertEqual((self.root / 'LICENSES/MIT-0.txt').read_text(encoding='utf-8'), 'Downloaded MIT-0\n')
+        self.assertEqual((self.root / 'LICENSES/MIT-0.txt').read_text(encoding='utf-8'), MIT_ZERO_LICENCE)
         self.assertTrue((self.root / 'skills/demo').is_dir())
         self.assertIn('demo\towner/repo\ttesting\t\t', (self.root / 'skills/INDEX.tsv').read_text(encoding='utf-8'))
         self.assertEqual(check_skills.check(self.root), 0)
 
-    def test_failed_licence_download_fails_run(self):
-        """Keep existing skills, metadata, index and licences byte-identical when download fails."""
-        (self.root / 'LICENSES').mkdir()
+    def test_bad_licence_templates_refuse_rows_and_continue(self):
+        """Reject unavailable or unsupported templates and publish the eligible row."""
+        licences = {'unavailable': ('MIT-0', MIT_ZERO_LICENCE), 'unsupported': ('LGPL-NONSENSE', LICENCE),
+                    'good': ('MIT', LICENCE)}
+        files = {f'pack/{name}/{file}': text for name, (_, body) in licences.items()
+                 for file, text in [('SKILL.md', MD.format(name=name)), ('LICENSE', body)]}
+        pin = self.source(files)
+        for name, (spdx, _) in licences.items():
+            self.candidate(name=name, folder=f'pack/{name}', pin=pin)['licence'] = spdx
+        downloads = []
+
+        def failing_runner(cmd, *, cwd=None):
+            """Record the requested licence and simulate a download failure."""
+            downloads.append(cmd[-1])
+            raise OSError('network error')
+
+        rows, _ = self.invoke(apply=True, runner=failing_runner)
+        self.assertEqual([row['verdict'] for row in rows], ['refused', 'refused', 'adopted'], rows)
+        self.assertIn('licence download failed for MIT-0: network error', rows[0]['reason'])
+        self.assertIn('licence LGPL-NONSENSE not recognised', rows[1]['reason'])
+        self.assertEqual(downloads, ['MIT-0'])
+        self.assertEqual(sorted(path.name for path in (self.root / 'skills').iterdir()), ['INDEX.tsv', 'good', 'licence-notices.yaml'])
+        self.assertFalse((self.root / 'LICENSES/MIT-0.txt').exists())
+
+    def test_failed_template_download_is_cached_for_one_run_per_spdx(self):
+        """Refuse repeated failed IDs with one download and retry on a new run."""
+        licences = {'first': ('MIT-0', MIT_ZERO_LICENCE), 'second': ('MIT-0', MIT_ZERO_LICENCE),
+                    'other': ('MIT', LICENCE)}
+        files = {f'pack/{name}/{file}': text for name, (_, body) in licences.items()
+                 for file, text in [('SKILL.md', MD.format(name=name)), ('LICENSE', body)]}
+        pin = self.source(files)
+        for name, (spdx, _) in licences.items():
+            self.candidate(name=name, folder=f'pack/{name}', pin=pin)['licence'] = spdx
+        (self.root / 'LICENSES/MIT.txt').unlink()
+        downloads = []
+
+        def runner(cmd, *, cwd=None):
+            """Record downloads and simulate a timeout for MIT-0 only."""
+            downloads.append(cmd[-1])
+            if cmd[-1] == 'MIT-0':
+                raise subprocess.TimeoutExpired(cmd, adopt.TIMEOUT)
+            Path(cmd[cmd.index('-o') + 1]).write_text(LICENCE, encoding='utf-8')
+
+        rows, _ = self.invoke(apply=False, runner=runner)
+        self.assertEqual([row['verdict'] for row in rows], ['refused', 'refused', 'adopted'], rows)
+        reason = f'licence download failed for MIT-0: timed out after {adopt.TIMEOUT:g} seconds'
+        self.assertEqual([row['reason'] for row in rows[:2]], [reason, reason])
+        self.assertEqual(downloads, ['MIT-0', 'MIT'])
+        self.assertEqual(self.invoke(runner=runner)[0], rows)
+        self.assertEqual(downloads, ['MIT-0', 'MIT', 'MIT-0', 'MIT'])
+
+    def test_staged_licence_requires_exact_reviewed_pin(self):
+        """Require the staged licence bytes to match the reviewed exception."""
+        body = LICENCE + '\nReviewed upstream note.\n'
+        self.fixture(extra={'pack/demo/LICENSE': body})
+        rows, _ = self.invoke(apply=False)
+        self.assertEqual(rows[0]['verdict'], 'refused', rows)
+        self.assertIn('LICENSE differs from MIT', rows[0]['reason'])
+        (self.root / 'skills').mkdir()
+        register = self.root / 'skills/licence-exceptions.yaml'
+        for exact in (False, True):
+            with self.subTest(exact=exact):
+                digest = hashlib.sha256(body.encode()).hexdigest() if exact else '0' * 64
+                register.write_text(
+                    'exceptions:\n  - rule: skill-licence-text\n    path: skills/demo/LICENSE\n'
+                    f'    spdx: MIT\n    sha256: "{digest}"\n    reason: Reviewed upstream note.\n'
+                    '    category: A\n    entered: "2000-01-01"\n    expires: "9999-12-31"\n', encoding='utf-8',
+                )
+                rows, _ = self.invoke(apply=exact)
+                self.assertEqual(rows[0]['verdict'], 'adopted' if exact else 'refused', rows)
+                if not exact:
+                    self.assertIn('hash mismatch', rows[0]['reason'])
+        self.assertEqual((self.root / 'skills/demo/LICENSE').read_bytes(), body.encode())
+        self.assertEqual(check_skills.check(self.root), 0)
+
+    def test_adoption_keeps_the_discovered_licence_named_by_front_matter(self):
+        """Preserve the discovered filename referenced from front matter."""
+        markdown = MD.format(name='demo').replace('\n---\n', '\nlicense: See LICENSE.rst\n---\n', 1)
+        pin = self.source({'pack/demo/SKILL.md': markdown, 'pack/demo/LICENSE.rst': LICENCE})
+        self.candidate(pin=pin)
+        rows, _ = self.invoke()
+        self.assertEqual(rows[0]['verdict'], 'adopted', rows)
+        self.assertEqual((self.root / 'skills/demo/LICENSE.rst').read_text(), LICENCE)
+        self.assertEqual(check_skills.check(self.root), 0)
+
+    def test_adoption_registers_new_licence_notices(self):
+        """Publish only adopted notices, once each, and disclose them on the report."""
+        added = "Copyright 2026 New Holder"
+        refused = "Copyright 2026 Refused Holder"
+        pin = self.source({
+            "pack/demo/SKILL.md": MD.format(name="demo"),
+            "pack/demo/LICENSE": f"{added}\n{LICENCE}\n{added}\n",
+            "pack/refused/SKILL.md": MD.format(name="refused"),
+            "pack/refused/LICENSE": f"{refused}\nModified terms.\n",
+        })
+        self.candidate(pin=pin)
+        self.candidate(name="refused", folder="pack/refused", pin=pin)
+        register = self.root / "skills/licence-notices.yaml"
+        register.parent.mkdir()
+        register.write_text("notices:\n- Copyright Z Existing Holder\n", encoding="utf-8")
+        preview, _ = self.invoke(apply=False)
+        self.assertEqual(register.read_text(encoding="utf-8"), "notices:\n- Copyright Z Existing Holder\n")
+        rows, _ = self.invoke()
+        self.assertEqual(rows, preview)
+        self.assertEqual([row["verdict"] for row in rows], ["adopted", "refused"])
+        self.assertEqual(f"licence notices added: Copyright (c) 2025 Owner; {added}", rows[0]["reason"])
+        self.assertIn("LICENSE differs from MIT", rows[1]["reason"])
+        self.assertEqual(register.read_text(encoding="utf-8").splitlines(), [
+            "notices:", "- Copyright (c) 2025 Owner", f"- {added}", "- Copyright Z Existing Holder",
+        ])
+        self.assertEqual(check_skills.check(self.root), 0)
+
+    def test_adoption_does_not_propose_wrapped_cc0_terms_as_notices(self):
+        """Treat wrapped CC0 terms spanning template lines as part of the body."""
+        spdx = 'CC0-1.0'
+        template = (REPO / f'LICENSES/{spdx}.txt').read_text(encoding='utf-8')
+        body = template.replace(
+            'exclusive Copyright and Related Rights (defined below) upon the creator\nand subsequent',
+            'exclusive\nCopyright and Related Rights (defined below) upon the creator and subsequent\n',
+        )
+        self.assertIn('\nCopyright and Related Rights', body)
+        (self.root / f'LICENSES/{spdx}.txt').write_text(template, encoding='utf-8')
+        self.fixture(extra={'pack/demo/LICENSE': body})['licence'] = spdx
+        rows, _ = self.invoke()
+        self.assertEqual(rows[0]['verdict'], 'adopted', rows)
+        self.assertEqual(rows[0]['reason'], '')
+        self.assertFalse((self.root / LICENCE_NOTICES_FILE).exists())
+
+    def test_adoption_reports_and_registers_only_post_gate_notices(self):
+        """Publish only notices that survive a gate's licence edit."""
+        dropped = 'Copyright The Example Authors.'
+        self.fixture(extra={'pack/demo/LICENSE': f'{dropped}\n{LICENCE}'})
+
+        def drop_notice(_root, _staging, skill):
+            """Drop the planted notice while preserving the valid MIT text."""
+            (skill / 'LICENSE').write_text(LICENCE, encoding='utf-8')
+
+        rows, _ = self.invoke(gate=drop_notice)
+        self.assertEqual(rows[0]['verdict'], 'adopted', rows)
+        self.assertEqual(rows[0]['reason'], 'licence notices added: Copyright (c) 2025 Owner')
+        self.assertEqual(check_skills.read_licence_notices(self.root), {'Copyright (c) 2025 Owner'})
+        self.assertEqual((self.root / 'skills/demo/LICENSE').read_text(encoding='utf-8'), LICENCE)
+
+    def test_licence_notice_register_output_symlink_refused(self):
+        """Keep an ordinary file unchanged when the notice register points to it."""
+        self.fixture()
+        target = self.base / "register.yaml"
+        target.write_text("notices: []\n", encoding="utf-8")
+        register = self.root / "skills/licence-notices.yaml"
+        register.parent.mkdir()
+        register.symlink_to(target)
+        with self.assertRaisesRegex(ValueError, "skills/licence-notices.yaml: output symlink refused"):
+            self.invoke()
+        self.assertEqual(target.read_text(encoding="utf-8"), "notices: []\n")
+
+    def _register_seed(self, published_size):
+        """Build a register that reaches the given byte size after adoption."""
+        incoming = "Copyright (c) 2025 Owner"
+        notices = [f"Copyright {i:03}" for i in range(500)]
+        original = check_skills.licence_notices_yaml(frozenset([incoming, *notices]))
+        overhead = len(original.encode())
+        width, remainder = divmod(published_size - overhead, len(notices))
+        seeded = set()
+        for index, notice in enumerate(notices):
+            wide, narrow = divmod(width + (index < remainder), len("界".encode()))
+            seeded.add(notice + "界" * wide + "x" * narrow)
+        self.assertLessEqual(
+            max(map(len, seeded)), check_skills.MAX_LICENCE_NOTICE_CHARS,
+        )
+        rendered = check_skills.licence_notices_yaml(frozenset({incoming, *seeded}))
+        self.assertEqual(len(rendered.encode()), published_size)
+        return check_skills.licence_notices_yaml(frozenset(seeded))
+
+    def test_adoption_register_serialized_byte_limit(self):
+        """Refuse cap plus one before writing and publish exactly at the cap."""
+        self.fixture()
+        (self.root / adopt.APPLY_LOCK_NAME).touch()
+        register = self.root / LICENCE_NOTICES_FILE
+        register.parent.mkdir()
+        overflow = MAX_LICENCE_BYTES + 1
+        register.write_text(self._register_seed(overflow), encoding='utf-8')
+        before = snapshot(self.root)
+        detail = (
+            f'{LICENCE_NOTICES_FILE}: serialized size {overflow} bytes '
+            f'exceeds {MAX_LICENCE_BYTES} bytes'
+        )
+        for apply in (False, True):
+            with self.subTest(apply=apply):
+                report = self.base / f'overflow-{apply}.tsv'
+                with self.assertRaisesRegex(ValueError, detail):
+                    self.invoke(apply=apply, report=report)
+                self.assertEqual(snapshot(self.root), before)
+                self.assertFalse(report.exists())
+
+        report = self.base / 'report.tsv'
+        register.write_text(self._register_seed(MAX_LICENCE_BYTES), encoding='utf-8')
+        rows, _ = self.invoke(report=report)
+        self.assertEqual(rows[0]['verdict'], 'adopted', rows)
+        self.assertEqual(register.stat().st_size, MAX_LICENCE_BYTES)
+        self.assertIn(
+            'Copyright (c) 2025 Owner', check_skills.read_licence_notices(self.root),
+        )
+        self.assertEqual(report.read_text(encoding='utf-8'), adopt.report_text(rows))
+
+    def test_adoption_refuses_invalid_notice_register(self):
+        """Report bad register types and aliases without changing adoption outputs."""
+        self.fixture()
+        (self.root / adopt.APPLY_LOCK_NAME).touch()
+        register = self.root / LICENCE_NOTICES_FILE
+        register.parent.mkdir()
+        for body, message in (
+            ('notices: [42]\n', 'notice 1: expected a string'),
+            ('notices: 42\n', 'notices: expected a list'),
+            (
+                'notices: [&owner Copyright Owner, *owner]\n',
+                'invalid YAML: YAML aliases are not allowed',
+            ),
+        ):
+            with self.subTest(message=message):
+                register.write_text(body, encoding='utf-8')
+                before = snapshot(self.root)
+                with self.assertRaisesRegex(
+                    ValueError, f'{LICENCE_NOTICES_FILE}: {message}',
+                ):
+                    self.invoke()
+                self.assertEqual(snapshot(self.root), before)
+
+    def test_adoption_reports_staged_notice_type_error(self):
+        """Convert a staged validation type failure into the candidate refusal."""
+        self.fixture()
+        message = 'notice 1: expected a string'
+        with patch.object(
+            check_skills, 'validate_licence_notices', side_effect=TypeError(message),
+        ):
+            rows, _ = self.invoke(apply=False)
+        self.assertEqual(rows[0]['verdict'], 'refused')
+        self.assertEqual(rows[0]['reason'], f'{LICENCE_NOTICES_FILE}: {message}')
+
+    def test_report_output_symlink_refused(self):
+        """Keep the target of an explicit report symlink unchanged."""
+        self.fixture()
+        target = self.base / "victim.tsv"
+        target.write_text("keep me\n", encoding="utf-8")
+        report = self.base / "report.tsv"
+        report.symlink_to(target)
+        with self.assertRaisesRegex(ValueError, "report output symlink refused"):
+            self.invoke(report=report)
+        self.assertEqual(target.read_text(encoding="utf-8"), "keep me\n")
+
+    def test_derived_report_output_symlink_refused(self):
+        """Refuse a symlink at the default destination within a report directory."""
+        directory = self.base / 'reports'
+        directory.mkdir()
+        target = directory / 'missing.tsv'
+        (directory / 'adopt-report.tsv').symlink_to(target)
+        with self.assertRaisesRegex(ValueError, 'report output symlink refused'):
+            self.invoke(apply=False, report=directory)
+        self.assertFalse(target.exists())
+
+    def test_report_path_cannot_overlap_publication_outputs(self):
+        """Keep every output intact when a report would land at or under it."""
+        self.fixture()
+        register = self.root / LICENCE_NOTICES_FILE
+        register.parent.mkdir()
+        register.write_text('notices: []\n', encoding='utf-8')
+        before = snapshot(self.root)
+        for output, suffix in (
+            (LICENCE_NOTICES_FILE, ''), ('REUSE.toml', ''), ('CREDITS.md', ''),
+            ('skills/INDEX.tsv', ''), ('LICENSES', '/report.tsv'),
+            ('skills/demo', '/report.tsv'),
+        ):
+            with (
+                self.subTest(output=output, suffix=suffix),
+                tempfile.TemporaryDirectory(dir=self.base) as tmp,
+            ):
+                root = Path(tmp) / 'root'
+                shutil.copytree(self.root, root)
+                expected = 'skills' if output == 'skills/demo' else output
+                with patch.object(self, 'root', root), self.assertRaisesRegex(
+                    ValueError, f'report path overlaps publication output: {expected}$',
+                ):
+                    self.invoke(report=root / 'LICENSES' / '..' / (output + suffix))
+                self.assertEqual(snapshot(root), before)
+
+    def test_report_path_cannot_land_in_publication_trees(self):
+        """Refuse derived and explicit destinations before dry-run or apply writes."""
+        self.fixture()
+        (self.root / 'skills').mkdir()
+        before = snapshot(self.root)
+        for apply in (False, True):
+            for output in ('skills', 'LICENSES'):
+                for filename in ('', 'new-report.tsv'):
+                    with (
+                        self.subTest(apply=apply, output=output, filename=filename),
+                        tempfile.TemporaryDirectory(dir=self.base) as tmp,
+                    ):
+                        root = Path(tmp) / 'root'
+                        shutil.copytree(self.root, root)
+                        directory = root / output
+                        message = f'report path overlaps publication output: {output}$'
+                        with patch.object(self, 'root', root), self.assertRaisesRegex(
+                            ValueError, message,
+                        ):
+                            self.invoke(apply=apply, report=directory / filename)
+                        self.assertEqual(snapshot(root), before)
+                        self.assertFalse((directory / 'adopt-report.tsv').exists())
+                        self.assertFalse((directory / 'new-report.tsv').exists())
+
+    def test_cli_report_directory_with_trailing_slash_refused(self):
+        """Refuse a directory argument with a trailing slash in both CLI modes."""
+        self.invoke(apply=False)
+        directory = self.root / 'skills'
+        directory.mkdir()
+        before = snapshot(self.root)
+        argv = [
+            '--candidates', str(self.base / 'candidates.tsv'),
+            '--groups', str(self.base / 'groups.tsv'),
+            '--census', str(self.base / 'census.tsv'),
+            '--checkouts', str(self.checkouts), '--root', str(self.root),
+            '--report', f'{directory}/',
+        ]
+        for flags in ([], ['--apply']):
+            with (
+                self.subTest(flags=flags),
+                redirect_stderr(StringIO()) as errors,
+                redirect_stdout(StringIO()),
+            ):
+                self.assertEqual(adopt.main([*argv, *flags]), 1)
+                self.assertEqual(
+                    errors.getvalue(),
+                    'adopt-skills: report path overlaps publication output: skills\n',
+                )
+                self.assertEqual(snapshot(self.root), before)
+                self.assertFalse((directory / 'adopt-report.tsv').exists())
+
+    def test_report_path_allows_unrelated_directory_and_skills_prefix(self):
+        """Accept safe destinations derived from directories or a sibling file."""
+        self.fixture()
+        directory = self.base / 'reports'
+        directory.mkdir()
+        sibling = self.root / 'skills-report.tsv'
+        for report, destination in (
+            (directory, directory / 'adopt-report.tsv'),
+            (self.base, self.base / 'adopt-report.tsv'),
+            (sibling, sibling),
+        ):
+            with self.subTest(report=report):
+                rows, _ = self.invoke(apply=False, report=report)
+                self.assertEqual(rows[0]['verdict'], 'adopted', rows)
+                self.assertEqual(
+                    destination.read_text(encoding='utf-8'), adopt.report_text(rows),
+                )
+
+    def test_trailing_separator_requires_report_path_to_be_a_directory(self):
+        """Refuse a file before apply and accept existing and missing directories."""
+        self.fixture()
+        report_file = self.base / 'existing.tsv'
+        report_file.write_text('existing report\n', encoding='utf-8')
+        before = snapshot(self.root)
+        with self.assertRaisesRegex(ValueError, 'report directory is a file:') as ctx:
+            self.invoke(report=f'{report_file}/')
+        self.assertEqual(str(ctx.exception), f'report directory is a file: {report_file}')
+        self.assertEqual(report_file.read_text(encoding='utf-8'), 'existing report\n')
+        self.assertEqual(snapshot(self.root), before)
+
+        existing = self.base / 'existing-dir'
+        existing.mkdir()
+        for directory in (existing, self.base / 'missing-dir'):
+            with self.subTest(directory=directory):
+                rows, _ = self.invoke(apply=False, report=f'{directory}/')
+                self.assertEqual(rows[0]['verdict'], 'adopted', rows)
+                self.assertEqual((directory / 'adopt-report.tsv').read_text(encoding='utf-8'), adopt.report_text(rows))
+
+    def test_failed_licence_download_refuses_row_and_keeps_root(self):
+        """Refuse the failed candidate and keep the installed root byte-identical."""
         (self.root / 'LICENSES/MIT.txt').write_text(LICENCE, encoding='utf-8')
         self.fixture()
-        self.invoke(apply=True)
+        seeded, _ = self.invoke(apply=True)
+        self.assertEqual(seeded[0]['verdict'], 'adopted', seeded)
         before = snapshot(self.root)
         self.candidates, self.census = [], []
-        pin = self.source({'pack/extra/SKILL.md': MD.format(name='extra'), 'pack/extra/LICENSE': 'MIT-0\n'},
-                          source='other/repo')
+        pin = self.source({
+            'pack/extra/SKILL.md': MD.format(name='extra'),
+            'pack/extra/LICENSE': MIT_ZERO_LICENCE,
+        }, source='other/repo')
         self.candidates.append({
             'source': 'other/repo', 'path': 'pack/extra/SKILL.md',
             'skill_name': 'extra', 'verdict': 'candidate', 'licence': 'MIT-0',
@@ -593,21 +1056,21 @@ class AdoptionTests(unittest.TestCase):
             self.assertIsNotNone(cwd)
             raise subprocess.CalledProcessError(1, cmd, stderr=b'network error')
 
-        with self.assertRaises(ValueError) as ctx:
-            self.invoke(apply=True, runner=failing_runner)
-        self.assertIn('MIT-0', str(ctx.exception))
-        self.assertIn('network error', str(ctx.exception))
+        rows, _ = self.invoke(apply=True, runner=failing_runner)
+        self.assertEqual(rows[0]['verdict'], 'refused', rows)
+        self.assertIn('licence download failed for MIT-0', rows[0]['reason'])
+        self.assertIn('network error', rows[0]['reason'])
         self.assertEqual(snapshot(self.root), before)
 
     def test_timed_out_licence_download_leaves_root_unchanged(self):
         """Keep root byte-identical with no staging leftovers and name the deadline on timeout."""
-        (self.root / 'LICENSES').mkdir()
+        (self.root / 'LICENSES').mkdir(exist_ok=True)
         (self.root / 'LICENSES/MIT.txt').write_text(LICENCE, encoding='utf-8')
         self.fixture()
         self.invoke(apply=True)
         before = snapshot(self.root)
         self.candidates, self.census = [], []
-        pin = self.source({'pack/extra/SKILL.md': MD.format(name='extra'), 'pack/extra/LICENSE': 'MIT-0\n'},
+        pin = self.source({'pack/extra/SKILL.md': MD.format(name='extra'), 'pack/extra/LICENSE': MIT_ZERO_LICENCE},
                           source='other/repo')
         self.candidates.append({
             'source': 'other/repo', 'path': 'pack/extra/SKILL.md',
@@ -621,16 +1084,17 @@ class AdoptionTests(unittest.TestCase):
             self.assertIsNotNone(cwd)
             raise subprocess.TimeoutExpired(cmd, adopt.TIMEOUT)
 
-        with self.assertRaises(ValueError) as ctx:
-            self.invoke(apply=True, runner=timeout_runner)
-        self.assertIn('MIT-0', str(ctx.exception))
-        self.assertIn(f'{adopt.TIMEOUT} seconds', str(ctx.exception))
+        rows, _ = self.invoke(apply=True, runner=timeout_runner)
+        self.assertEqual(rows[0]['verdict'], 'refused', rows)
+        self.assertIn('licence download failed for MIT-0', rows[0]['reason'])
+        self.assertIn(f'{adopt.TIMEOUT} seconds', rows[0]['reason'])
         self.assertEqual(snapshot(self.root), before)
 
     def test_present_licence_skips_download_and_writes_index(self):
         """Skip downloads when LICENSES already holds the text or no licence is missing."""
-        (self.root / 'LICENSES').mkdir()
-        (self.root / 'LICENSES/MIT.txt').write_text('Existing MIT text\n', encoding='utf-8')
+        (self.root / 'LICENSES').mkdir(exist_ok=True)
+        existing_licence = LICENCE
+        (self.root / 'LICENSES/MIT.txt').write_text(existing_licence, encoding='utf-8')
         self.fixture()
 
         def unexpected_runner(cmd, *, cwd=None):
@@ -640,11 +1104,11 @@ class AdoptionTests(unittest.TestCase):
 
         rows, _ = self.invoke(apply=True, runner=unexpected_runner)
         self.assertEqual(rows[0]['verdict'], 'adopted')
-        self.assertEqual((self.root / 'LICENSES/MIT.txt').read_text(encoding='utf-8'), 'Existing MIT text\n')
+        self.assertEqual((self.root / 'LICENSES/MIT.txt').read_text(encoding='utf-8'), existing_licence)
         self.assertIn('demo\towner/repo\ttesting;coding\t\t',
                       (self.root / 'skills/INDEX.tsv').read_text(encoding='utf-8'))
         (self.root / 'skills/INDEX.tsv').unlink()
-        adopt.publish(self.root, self.base, [], 'version = 1\n', '# Credits\n', runner=unexpected_runner)
+        adopt.publish(self.root, self.base, [], ('version = 1\n', '# Credits\n'), runner=unexpected_runner)
         self.assertIn('demo\towner/repo\t\t\t', (self.root / 'skills/INDEX.tsv').read_text(encoding='utf-8'))
         self.assertEqual([p.name for p in self.root.iterdir() if p.name.startswith('.adopt-publish')], [])
 
@@ -669,15 +1133,15 @@ class AdoptionTests(unittest.TestCase):
             adopt.default_download_runner(cmd, cwd=self.root)
 
     def test_silent_missing_licence_file_raises_and_leaves_root_unchanged(self):
-        """Fail before touching root when the download runner exits cleanly without writing LICENSES/<id>.txt."""
-        (self.root / 'LICENSES').mkdir()
-        (self.root / 'LICENSES/MIT.txt').write_text('Existing MIT\n', encoding='utf-8')
+        """Refuse a missing template and leave the root unchanged."""
+        (self.root / 'LICENSES').mkdir(exist_ok=True)
+        (self.root / 'LICENSES/MIT.txt').write_text(LICENCE, encoding='utf-8')
         self.fixture()
         self.invoke(apply=True)
         before = snapshot(self.root)
 
         self.candidates, self.census = [], []
-        pin = self.source({'pack/extra/SKILL.md': MD.format(name='extra'), 'pack/extra/LICENSE': 'MIT-0\n'},
+        pin = self.source({'pack/extra/SKILL.md': MD.format(name='extra'), 'pack/extra/LICENSE': MIT_ZERO_LICENCE},
                           source='other/repo')
         self.candidates.append({
             'source': 'other/repo', 'path': 'pack/extra/SKILL.md',
@@ -691,8 +1155,9 @@ class AdoptionTests(unittest.TestCase):
             self.assertTrue(cwd.is_dir())
             return b'ok'
 
-        with self.assertRaisesRegex(ValueError, r'licence download failed for MIT-0: MIT-0\.txt not written'):
-            self.invoke(apply=True, runner=silent_noop_runner)
+        rows, _ = self.invoke(apply=True, runner=silent_noop_runner)
+        self.assertEqual(rows[0]['verdict'], 'refused', rows)
+        self.assertRegex(rows[0]['reason'], r'licence download failed for MIT-0: MIT-0\.txt not written')
         self.assertEqual(snapshot(self.root), before)
 
         direct_root = self.base / 'direct-root'
@@ -706,11 +1171,14 @@ class AdoptionTests(unittest.TestCase):
             adopt.sync_licences(direct_root, reuse_doc, runner=silent_noop_runner)
         self.assertEqual(snapshot(direct_root), direct_before)
 
-    def _two_mit0_candidates(self):
+    def _two_mit0_candidates(self, *, with_notices=False):
         """Populate two MIT-0 candidates and return a deterministic download runner and call log."""
+        second_licence = MIT_ZERO_LICENCE
+        if with_notices:
+            second_licence += '\nCopyright 2026 Second Holder\n'
         pin = self.source({
-            'pack/first/SKILL.md': MD.format(name='first'), 'pack/first/LICENSE': 'MIT-0\n',
-            'pack/second/SKILL.md': MD.format(name='second'), 'pack/second/LICENSE': 'MIT-0\n',
+            'pack/first/SKILL.md': MD.format(name='first'), 'pack/first/LICENSE': MIT_ZERO_LICENCE,
+            'pack/second/SKILL.md': MD.format(name='second'), 'pack/second/LICENSE': second_licence,
         })
         for name, dom in (('first', 'science'), ('second', 'dev')):
             self.candidates.append({
@@ -725,7 +1193,7 @@ class AdoptionTests(unittest.TestCase):
             """Write a deterministic licence file into the staged output target."""
             self.assertIsNotNone(cwd)
             downloads.append(list(cmd))
-            Path(cmd[cmd.index('-o') + 1]).write_text('MIT-0 text\n', encoding='utf-8')
+            Path(cmd[cmd.index('-o') + 1]).write_text(MIT_ZERO_LICENCE, encoding='utf-8')
             return b'ok'
 
         return fake_runner, downloads
@@ -790,8 +1258,8 @@ class AdoptionTests(unittest.TestCase):
         before_populated = snapshot(self.root)
 
         pin_extra = self.source({
-            'pack/two/SKILL.md': MD.format(name='two'), 'pack/two/LICENSE': 'MIT-0\n',
-            'pack/three/SKILL.md': MD.format(name='three'), 'pack/three/LICENSE': 'MIT-0\n',
+            'pack/two/SKILL.md': MD.format(name='two'), 'pack/two/LICENSE': MIT_ZERO_LICENCE,
+            'pack/three/SKILL.md': MD.format(name='three'), 'pack/three/LICENSE': MIT_ZERO_LICENCE,
         }, source='other/repo')
         for name in ('two', 'three'):
             self.candidates.append({
@@ -849,7 +1317,7 @@ class AdoptionTests(unittest.TestCase):
                 self.assertEqual(snapshot(self.root), before)
             (self.root / 'LICENSES').unlink()
 
-        (self.root / 'LICENSES').mkdir()
+        (self.root / 'LICENSES').mkdir(exist_ok=True)
         (self.root / 'LICENSES/MIT.txt').write_text(LICENCE, encoding='utf-8')
         rows, _ = self.invoke(apply=True, runner=fake_runner)
         self.assertEqual(rows[0]['verdict'], 'adopted')
@@ -951,13 +1419,14 @@ class AdoptionTests(unittest.TestCase):
         """Reconcile a hard-killed publish on the next --apply so withdrawn skills leave no attribution."""
         self._seed_existing_skill()
         before_seed = snapshot(self.root)
-        fake_runner, _ = self._two_mit0_candidates()
+        fake_runner, _ = self._two_mit0_candidates(with_notices=True)
         self._fork_kill_on_second_skill(fake_runner)
 
         self.assertTrue((self.root / adopt.JOURNAL_NAME).is_file())
         self.assertTrue((self.root / 'LICENSES/MIT-0.txt').is_file())
         self.assertTrue((self.root / 'skills/first').is_dir())
         self.assertIn('skills/second/**', (self.root / 'REUSE.toml').read_text(encoding='utf-8'))
+        self.assertIn('Copyright 2026 Second Holder', check_skills.read_licence_notices(self.root))
 
         root_withdrawn = self.base / 'root-withdrawn'
         root_empty = self.base / 'root-empty'
@@ -978,6 +1447,7 @@ class AdoptionTests(unittest.TestCase):
         self.assertIn('`seed`', credits_text)
         self.assertIn('`first`', credits_text)
         self.assertNotIn('second', credits_text)
+        self.assertNotIn('Copyright 2026 Second Holder', check_skills.read_licence_notices(root_withdrawn))
         self.assertEqual([p.name for p in root_withdrawn.iterdir() if p.name.startswith('.adopt-publish')], [])
 
         tsv(self.base / 'cand-empty.tsv', CANDIDATE_FIELDS, [])
@@ -1019,7 +1489,8 @@ class AdoptionTests(unittest.TestCase):
         """Refuse previews, malformed journals, escaped paths and symlinks without modifying root."""
         self._seed_existing_skill()
         fake_runner, _ = self._two_mit0_candidates()
-        self.assertEqual([r['verdict'] for r in self.invoke(apply=False)[0]], ['adopted', 'adopted'])
+        preview, _ = self.invoke(apply=False, runner=fake_runner)
+        self.assertEqual([r['verdict'] for r in preview], ['adopted', 'adopted'])
         self._fork_kill_on_second_skill(fake_runner)
         journal_file = self.root / adopt.JOURNAL_NAME
         valid_payload = json.loads(journal_file.read_text(encoding='utf-8'))
@@ -1392,10 +1863,8 @@ class AdoptionTests(unittest.TestCase):
         if not node_bin:
             self.fail('node executable not found on PATH')
         for bad in (str(outside), '../outside.md', 'link.md'):
-            proc = subprocess.run([node_bin, str(script), bad], cwd=folder, capture_output=True,
-                                  check=False, timeout=60)
-            self.assertNotEqual(proc.returncode, 0, bad)
-            self.assertIn(b'refusing Markdown input', proc.stderr, (bad, proc.stderr[:300]))
+            with self.subTest(input=bad), self.assertRaisesRegex(adopt.Refused, 'refusing Markdown input'):
+                adopt.command([node_bin, str(script), bad], cwd=folder)
         self.assertEqual(outside.read_text(encoding='utf-8'), '# Outside\n')
 
     def test_whitespace_arbiter_omits_a_file_the_normalizer_changes_beyond_whitespace(self):
@@ -1466,13 +1935,12 @@ class AdoptionTests(unittest.TestCase):
         git_bin = shutil.which('git')
         if not git_bin:
             self.fail('git executable not found on PATH')
-        diff_proc = subprocess.run(
+        diff_output = adopt.command(
             [git_bin, 'diff', '--no-index', '-w', '--ignore-blank-lines',
              str(fenced_upstream), str(skill / 'reference/guide.md')],
-            capture_output=True, check=False, timeout=adopt.TIMEOUT,
+            timeout=adopt.TIMEOUT,
         )
-        self.assertEqual(diff_proc.returncode, 0, diff_proc.stdout.decode('utf-8', errors='replace'))
-        self.assertEqual(diff_proc.stdout, b'')
+        self.assertEqual(diff_output, b'')
         # Fail-closed when normalizer script is broken or absent
         shutil.rmtree(skill)
         (self.root / 'tools/markdownlint/normalize.mjs').unlink()
@@ -1828,7 +2296,7 @@ class AdoptionTests(unittest.TestCase):
 
     def _concurrent_apply_fixtures(self):
         """Prepare two independent single-skill apply inputs sharing self.root."""
-        (self.root / 'LICENSES').mkdir()
+        (self.root / 'LICENSES').mkdir(exist_ok=True)
         (self.root / 'LICENSES/MIT.txt').write_text(LICENCE, encoding='utf-8')
         pin1 = self.source({'pack/first/SKILL.md': MD.format(name='first'), 'pack/first/LICENSE': LICENCE},
                            source='owner/first')
@@ -1928,7 +2396,7 @@ class AdoptionTests(unittest.TestCase):
 
     def test_preview_completes_while_apply_lock_held(self):
         """Complete preview without waiting on a held apply lock when no publish journal exists."""
-        (self.root / 'LICENSES').mkdir()
+        (self.root / 'LICENSES').mkdir(exist_ok=True)
         (self.root / 'LICENSES/MIT.txt').write_text(LICENCE, encoding='utf-8')
         self.fixture()
         self.assertFalse((self.root / adopt.JOURNAL_NAME).exists())
@@ -1941,7 +2409,7 @@ class AdoptionTests(unittest.TestCase):
 
     def test_skill_directories_filters_dirs_before_max_skills_slice(self):
         """Keep all MAX_SKILLS directories in INDEX.tsv when skills/INDEX.tsv sits beside them."""
-        (self.root / 'LICENSES').mkdir()
+        (self.root / 'LICENSES').mkdir(exist_ok=True)
         (self.root / 'LICENSES/MIT.txt').write_text(LICENCE, encoding='utf-8')
         pin = self.source({
             'pack/mu/SKILL.md': MD.format(name='mu'), 'pack/mu/LICENSE': LICENCE,
@@ -2168,9 +2636,13 @@ class AdoptionTests(unittest.TestCase):
     def test_reconcile_preserves_operator_licence_when_rename_did_not_run(self):
         """Keep operator-created LICENSES/MIT-0.txt when hard-killed before its staged rename ran."""
         self._seed_existing_skill()
+        templates = {
+            'Apache-2.0': (REPO / 'LICENSES/Apache-2.0.txt').read_text(encoding='utf-8'),
+            'MIT-0': MIT_ZERO_LICENCE,
+        }
         pin = self.source({
-            'pack/first/SKILL.md': MD.format(name='first'), 'pack/first/LICENSE': 'Apache-2.0\n',
-            'pack/second/SKILL.md': MD.format(name='second'), 'pack/second/LICENSE': 'MIT-0\n',
+            'pack/first/SKILL.md': MD.format(name='first'), 'pack/first/LICENSE': templates['Apache-2.0'],
+            'pack/second/SKILL.md': MD.format(name='second'), 'pack/second/LICENSE': MIT_ZERO_LICENCE,
         })
         for name, lic in (('first', 'Apache-2.0'), ('second', 'MIT-0')):
             self.candidates.append({
@@ -2183,7 +2655,7 @@ class AdoptionTests(unittest.TestCase):
         def multi_runner(cmd, *, cwd=None):
             """Write deterministic staged licence files for Apache-2.0 and MIT-0."""
             self.assertIsNotNone(cwd)
-            Path(cmd[cmd.index('-o') + 1]).write_text(f'Downloaded {cmd[-1]}\n', encoding='utf-8')
+            Path(cmd[cmd.index('-o') + 1]).write_text(templates[cmd[-1]], encoding='utf-8')
             return b'ok'
 
         self._fork_kill_before_replace(multi_runner, self.root / 'LICENSES/MIT-0.txt', exit_code=96)

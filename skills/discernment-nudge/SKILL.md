@@ -16,7 +16,7 @@ description: >
   run, is doing creative writing or casual chat, or already asked you
   to double-check, cite, or review — the skill file explains these
   boundaries and the exact output format.
-license: Complete terms in LICENSE.txt
+license: Complete terms in LICENSE
 ---
 
 # Discernment nudge

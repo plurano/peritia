@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 import candidates
 import classify
+from licence_text import MAX_LICENCE_BYTES
 
 CENSUS_FIELDS = [
     "source", "pin", "path", "skill_name", "blob_id", "size", "folder_file_count",
@@ -101,6 +102,16 @@ class CandidatesTests(unittest.TestCase):
                     ):
                         read(path)
 
+    def test_only_supported_spdx_ids_have_licence_classes(self) -> None:
+        """Keep unsupported SPDX identifiers outside the candidate classes."""
+        for spdx in ("LGPL-NONSENSE", "GPL-NONSENSE", "MIT-only", "Apache-2.0-or-later"):
+            with self.subTest(spdx=spdx):
+                self.assertEqual(candidates.licence_class(spdx), "other")
+                self.assertEqual(candidates.normalise_licence(spdx), (spdx, spdx, False))
+                self.assertIsNone(candidates.licence_policy.candidate_licence_id(spdx))
+        self.assertEqual(candidates.normalise_licence("lgpl-2.0-OR-LATER"), ("LGPL-2.0-or-later", "LGPL-2.0", True))
+        self.assertEqual(candidates.licence_class("LGPL-2.0-or-later"), "weak")
+
     def test_licence_path_folder(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             folder = Path(tmp)
@@ -129,6 +140,135 @@ class CandidatesTests(unittest.TestCase):
             self.assertEqual((row.licence, row.licence_class, row.licence_evidence, row.verdict),
                              ("Apache-2.0", "permissive", "frontmatter", "candidate"))
 
+    def test_licence_front_matter_read_state(self) -> None:
+        """Retain an anchored licence, and refuse unreadable metadata before fallback."""
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            checkouts = folder / "checkouts"
+            source, path = "a/repo", "skills/s2/SKILL.md"
+            census_p = write_census(folder, [{
+                "source": source, "path": path, "skill_name": "s2", "blob_id": "b2", "repository_license": "MIT",
+            }])
+            class_p = write_classified(folder, [{
+                "blob_id": "b2", "source": source, "path": path, "skill_name": "s2", "functions": "coding",
+                "domains": "governance-devtooling", "status": "ok",
+            }])
+            out = folder / "out.tsv"
+            with self.subTest(front="anchor without alias"):
+                write_skill(checkouts, source, path, "---\nname: s2\nlicense: &terms GPL-3.0-only\n---\n")
+                row, = candidates.run(census_p, class_p, checkouts, out, [], FakeGitHubReader())
+                self.assertEqual((row.licence, row.licence_evidence, row.verdict), ("GPL-3.0-only", "frontmatter", "report"))
+                self.assertIn("strong copyleft", row.reason)
+            for front, detail in (
+                ("license: &terms GPL-3.0-only\ncopy: *terms\n---\n", "YAML aliases are not allowed"),
+                ("license: [\n---\n", "while parsing a flow node"),
+                ("license: MIT\n", "missing its closing delimiter"),
+                ("license: [MIT]\n---\n", "license must be a string"),
+                ("license: {id: MIT}\n---\n", "license must be a string"),
+                ("licence: [MIT]\n---\n", "licence must be a string"),
+            ):
+                write_skill(checkouts, source, path, f"---\nname: s2\n{front}")
+                for aggregators in ([], [source]):
+                    with self.subTest(front=front, aggregators=aggregators):
+                        row, = candidates.run(census_p, class_p, checkouts, out, aggregators, FakeGitHubReader())
+                        self.assertEqual((row.licence, row.licence_evidence, row.verdict),
+                                         ("unreadable", "frontmatter", "refused"))
+                        self.assertIn("front matter unreadable", row.reason)
+                        self.assertIn(detail, row.reason)
+
+    def test_licence_front_matter_line_endings_and_duplicate_keys(self) -> None:
+        """Use strict front matter evidence regardless of line endings."""
+        with tempfile.TemporaryDirectory() as tmp:
+            checkouts = Path(tmp)
+            source, path = "a/repo", "skills/demo/SKILL.md"
+            row = candidates.CensusRow(
+                source=source, path=path, skill_name="demo", blob_id="b1", pin="",
+                folder_license="", repository_license="Apache-2.0", ineligible="",
+                dup_of_blob="", failure_reason="",
+            )
+            tracer = candidates.UpstreamTracer(FakeGitHubReader())
+            skill = write_skill(checkouts, source, path)
+            for ending, licence, detail in (
+                ("\r", "license: [MIT]", "license must be a string"),
+                ("\r", "license: MIT", ""),
+                ("\n", "license: [MIT]\nlicense: MIT", "duplicate key 'license'"),
+                ("\n", "license: MIT\nlicense: MIT", "duplicate key 'license'"),
+                ("\n", "license: MIT", ""),
+                ("\r\n", "license: MIT", ""),
+            ):
+                with self.subTest(ending=ending, licence=licence):
+                    front = f"---\nname: demo\n{licence}\n---\n".replace("\n", ending)
+                    skill.write_bytes(front.encode())
+                    expected = candidates.LicenceResolution("MIT", "frontmatter")
+                    if detail:
+                        expected = candidates.LicenceResolution(
+                            "unreadable", "frontmatter", verdict="refused",
+                            reason=f"front matter unreadable: {detail}",
+                        )
+                    resolved = candidates.resolve_licence(row, checkouts, set(), tracer)
+                    self.assertEqual(resolved, expected)
+
+    def test_folder_licence_byte_limit(self) -> None:
+        """Read a licence at the byte cap and refuse an oversized file by name."""
+        with tempfile.TemporaryDirectory() as tmp:
+            checkouts = Path(tmp)
+            source, path = "a/repo", "skills/demo/SKILL.md"
+            row = candidates.CensusRow(
+                source=source, path=path, skill_name="demo", blob_id="b1", pin="",
+                folder_license="y", repository_license="MIT", ineligible="",
+                dup_of_blob="", failure_reason="",
+            )
+            tracer = candidates.UpstreamTracer(FakeGitHubReader())
+            prefix = "MIT License\n"
+            at_limit = prefix + "x" * (MAX_LICENCE_BYTES - len(prefix))
+            write_skill(checkouts, source, path, folder_license_text=at_limit)
+            self.assertEqual(
+                candidates.resolve_licence(row, checkouts, set(), tracer),
+                candidates.LicenceResolution("MIT", "folder"),
+            )
+            write_skill(checkouts, source, path, folder_license_text=at_limit + "x")
+            self.assertEqual(
+                candidates.resolve_licence(row, checkouts, set(), tracer),
+                candidates.LicenceResolution(
+                    "unreadable", "folder", verdict="refused",
+                    reason="LICENSE exceeds 256 KiB",
+                ),
+            )
+
+    def test_folder_licence_read_failures_refuse_candidates(self) -> None:
+        """Preserve folder evidence and the read error for each lookup path."""
+        source, path = "a/repo", "skills/demo/SKILL.md"
+        census = candidates.CensusRow(
+            source=source, path=path, skill_name="demo", blob_id="b1", pin="",
+            folder_license="", repository_license="MIT", ineligible="",
+            dup_of_blob="", failure_reason="",
+        )
+        classified = candidates.ClassifiedRow(
+            source=source, path=path, skill_name="demo", blob_id="b1",
+            functions="coding", domains="go-service-framework", model="", status="ok",
+        )
+        tracer = candidates.UpstreamTracer(FakeGitHubReader())
+        with tempfile.TemporaryDirectory() as tmp:
+            checkouts = Path(tmp)
+            skill = write_skill(checkouts, source, path, folder_license_text="MIT License\n")
+            licence = skill.with_name("LICENSE")
+            paths = (
+                ("folder", "", (licence,)),
+                ("named candidate", "license: Complete terms in LICENSE\n", (None,)),
+                ("any candidate", "license: Complete terms in LICENSE.txt\n", (None, licence)),
+            )
+            for lookup, field, matches in paths:
+                skill.write_text(f"---\nname: demo\n{field}---\n", encoding="utf-8")
+                for error_type in (TypeError, ValueError, FileNotFoundError):
+                    error = error_type(f"{lookup} read failed")
+                    with (self.subTest(lookup=lookup, error_type=error_type.__name__),
+                          patch.object(candidates, "find_folder_licence_file", side_effect=matches),
+                          patch.object(candidates.licence_text, "read_utf8", side_effect=error) as read):
+                        row = candidates.decide_row(census, classified, checkouts, set(), tracer)
+                        read.assert_called_once_with(licence, MAX_LICENCE_BYTES)
+                        self.assertEqual((row.licence, row.licence_evidence, row.verdict, row.reason),
+                                         ("unreadable", "folder", "refused", str(error)))
+
     def test_licence_path_upstream_aggregator(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             folder = Path(tmp)
@@ -146,17 +286,29 @@ class CandidatesTests(unittest.TestCase):
             self.assertEqual(reader.calls, ["orig/lib"])
 
     def test_licence_path_repository_non_aggregator(self) -> None:
+        """Use repository evidence to accept or refuse each licence family."""
         with tempfile.TemporaryDirectory() as tmp:
             folder = Path(tmp)
             checkouts = folder / "checkouts"
             write_skill(checkouts, "solo/repo", "skills/s4/SKILL.md", "---\nname: s4\n---\nbody\n")
-            census_p = write_census(folder, [{"source": "solo/repo", "path": "skills/s4/SKILL.md", "skill_name": "s4", "blob_id": "b4", "repository_license": "0BSD"}])
             class_p = write_classified(folder, [{"blob_id": "b4", "source": "solo/repo", "path": "skills/s4/SKILL.md", "skill_name": "s4", "functions": "testing", "domains": "reverse-engineering", "status": "ok"}])
             out = folder / "out.tsv"
-            res = candidates.run(census_p, class_p, checkouts, out, [], FakeGitHubReader())
-            row = res[0]
-            self.assertEqual((row.licence, row.licence_class, row.licence_evidence, row.verdict),
-                             ("0BSD", "permissive", "repository", "candidate"))
+            cases = (
+                ("0BSD", "permissive", "candidate", ""),
+                ("LGPL-3.0-only", "weak", "candidate", ""),
+                ("LGPL-3.0?", "other", "refused", "licence:LGPL-3.0? evidence:repository"),
+            )
+            for spdx, licence_class, verdict, reason in cases:
+                with self.subTest(spdx=spdx):
+                    census_p = write_census(folder, [{
+                        "source": "solo/repo", "path": "skills/s4/SKILL.md", "skill_name": "s4",
+                        "blob_id": "b4", "repository_license": spdx,
+                    }])
+                    row, = candidates.run(census_p, class_p, checkouts, out, [], FakeGitHubReader())
+                    self.assertEqual(
+                        (row.licence, row.licence_class, row.licence_evidence, row.verdict, row.reason),
+                        (spdx, licence_class, "repository", verdict, reason),
+                    )
 
     def test_licence_path_weak(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
 # SPDX-License-Identifier: EUPL-1.2
 """Tests for check_skills.py and skills/INDEX.tsv verification."""
+import re
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 
 import check_skills
@@ -11,6 +13,32 @@ import check_skills
 MD = "---\nname: {name}\ndescription: Use when testing.\n---\n\n# Example\n"
 ORIGIN = ("upstream: https://github.com/owner/repo\npath: skills/demo\ncommit: " + "a" * 40 +
           "\nlicence: MIT\nchanges: added provenance\n")
+
+
+class CheckSkillsLicenceTests(unittest.TestCase):
+    def test_readme_licence_exception_example_matches_schema(self):
+        """Load the documented example as a licence exception register."""
+        readme = Path(__file__).resolve().parent.parent / "README.md"
+        sample = re.search(r"^```yaml\n(exceptions:\n.*?)^```$", readme.read_text(encoding="utf-8"), re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(sample, "README needs a complete YAML exception example")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            register = root / check_skills.LICENCE_EXCEPTIONS_FILE
+            register.parent.mkdir()
+            register.write_text(sample.group(1), encoding="utf-8")
+            self.assertEqual(len(check_skills._read_licence_exceptions(root, today=date.max)), 1)
+
+    def test_strict_front_matter_projects_both_licence_keys_after_key_limit(self):
+        """Keep both trimmed licence declarations after 100 other keys."""
+        filler = "".join(f"field-{index}: value\n" for index in range(100))
+        text = f'---\n{filler}license: " GPL-3.0-only "\nlicence: " LGPL-3.0-only "\n---\n'
+        for option in ("exact_license", "require_string_licence"):
+            with self.subTest(option=option):
+                meta = check_skills.front_matter(text, **{option: True})
+                self.assertEqual(meta["license"], "GPL-3.0-only")
+                self.assertEqual(meta["licence"], "LGPL-3.0-only")
+        self.assertNotIn("license", check_skills.front_matter(text))
+        self.assertNotIn("licence", check_skills.front_matter(text))
 
 
 class CheckSkillsIndexTests(unittest.TestCase):

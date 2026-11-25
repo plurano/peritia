@@ -15,7 +15,7 @@ SPDX-FileCopyrightText = "2026 Lusoris <lusoris@pm.me>"
 SPDX-License-Identifier = "EUPL-1.2"
 
 [[annotations]]
-path = ["skills/INDEX.tsv"]
+path = ["skills/INDEX.tsv", "skills/licence-notices.yaml"]
 precedence = "closest"
 SPDX-FileCopyrightText = "2026 Lusoris <lusoris@pm.me>"
 SPDX-License-Identifier = "EUPL-1.2"

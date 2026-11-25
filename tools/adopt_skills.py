@@ -22,8 +22,9 @@ import sys
 import tempfile
 import urllib.parse
 from collections import Counter
-from contextlib import nullcontext, suppress
-from dataclasses import dataclass
+from collections.abc import Callable
+from contextlib import contextmanager, nullcontext, suppress
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
 # isort: split
@@ -55,6 +56,15 @@ from judge_groups import (
     is_existing_skill,
     load_sources,
 )
+from licence_policy import (
+    LICENSE_BASENAME_PATTERN,
+    candidate_licence_id,
+)
+from licence_text import (
+    LICENCE_NOTICES_FILE,
+    MAX_LICENCE_BYTES,
+    unreviewed_licence_notices,
+)
 
 MAX_FILES = 200
 MAX_BYTES = 2 * 1024 * 1024
@@ -63,6 +73,14 @@ TIMEOUT = 60
 REPORT_FIELDS = ['candidate', 'verdict', 'directory', 'reason']
 INDEX_FIELDS = ['skill', 'source', 'functions', 'domains', 'overlap_group']
 INDEX_HEADER = '\t'.join(INDEX_FIELDS)
+SKILLS_DIR = 'skills'
+LICENCES_DIR = 'LICENSES'
+REUSE_FILE = 'REUSE.toml'
+CREDITS_FILE = 'CREDITS.md'
+INDEX_FILE = f'{SKILLS_DIR}/INDEX.tsv'
+DEFAULT_REPORT_FILE = 'adopt-report.tsv'
+PUBLICATION_FILES = (REUSE_FILE, CREDITS_FILE, INDEX_FILE, LICENCE_NOTICES_FILE)
+PUBLICATION_TREES = (SKILLS_DIR, LICENCES_DIR)
 REPOSITORY = re.compile(r'[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9][A-Za-z0-9._-]*\Z')
 NAME = re.compile(r'[a-z0-9][a-z0-9-]*\Z')
 MARKDOWN_EXTENSIONS = ('.md', '.markdown', '.mdx')
@@ -82,7 +100,16 @@ class Refused(ValueError):
     """One candidate cannot be adopted; other candidates can continue."""
 
 
+class _LicenceDownloadError(ValueError):
+    """A required canonical SPDX template could not be downloaded."""
+
+
+class _LicenceOutputSymlinkError(ValueError):
+    """A licence template destination is a symlink."""
+
+
 def command(args, *, cwd=None, data=None, timeout=TIMEOUT, allow_fetch=False):
+    """Run a tool with a deadline and return its stdout or raise a contextual error."""
     result = subprocess.run(args, cwd=cwd, input=data, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, timeout=timeout,
                             env={**os.environ, 'GIT_OPTIONAL_LOCKS': '0',
@@ -168,8 +195,8 @@ def safe_path(raw):
 
 
 def is_licence_name(name: str) -> bool:
-    return (name in LICENSE_FILENAMES or
-            bool(re.fullmatch(r'(LICEN[SC]E|COPYING)(?:\.[A-Za-z0-9_-]+)?', name, re.IGNORECASE)))
+    """Identify upstream licence files by their shared filename policy."""
+    return name in LICENSE_FILENAMES or bool(LICENSE_BASENAME_PATTERN.fullmatch(name))
 
 
 def checkout_for(checkouts, row, pin):
@@ -304,10 +331,17 @@ def rewrite_fences(content: str) -> tuple[str, bool]:
     return ''.join(lines), changed
 
 
+def _is_skill_markdown(path: Path, skill: Path) -> bool:
+    """Select Markdown that can be rewritten without changing a shipped licence."""
+    return (path.suffix.lower() in MARKDOWN_EXTENSIONS and path.name != 'ORIGIN.md'
+            and not (path.parent == skill and is_licence_name(path.name)) and path.is_file())
+
+
 def rewrite_skill_fences(skill: Path) -> set[str]:
+    """Rewrite unlabelled code fences in eligible Markdown files."""
     changed_files: set[str] = set()
     for path in sorted(skill.rglob('*'))[:MAX_ROWS]:
-        if path.is_file() and path.name != 'ORIGIN.md' and path.suffix.lower() in MARKDOWN_EXTENSIONS:
+        if _is_skill_markdown(path, skill):
             text = path.read_text(encoding='utf-8')
             new_text, changed = rewrite_fences(text)
             if changed:
@@ -335,31 +369,41 @@ def upstream_licence(repository, reader):
     return data, f'licence text from <https://github.com/{repository}> at commit {pin}'
 
 
-def licence_text(row, checkout, pin, skill, apply, reader):
-    evidence = row['licence_evidence']
-    note = ''
+def _repository_licence_text(checkout, pin, apply) -> tuple[str, bytes]:
+    """Read the selected licence basename and bytes from the pinned repository."""
+    entries = tree_files(checkout, pin, PurePosixPath('.'), recursive=False)
+    entries = [entry for entry in entries[:MAX_ROWS] if is_licence_name(entry[0].name)]
+    with tempfile.TemporaryDirectory(prefix='adopt-licence-') as tmp:
+        if apply:
+            for entry in entries[:MAX_ROWS]:
+                expand_sparse(checkout, entry[0], file=True)
+            entries = [(path, mode, kind, oid, git(checkout, 'cat-file', '-s', oid).decode().strip())
+                       for path, mode, kind, oid, _ in entries[:MAX_ROWS]]
+        validate_files(entries, allow_missing=not apply)
+        copy_blobs(checkout, entries, Path(tmp), allow_fetch=not apply)
+        licence = find_folder_licence_file(Path(tmp))
+        return (licence.name, licence.read_bytes()) if licence else ('LICENSE', b'')
+
+
+def _selected_licence_text(evidence, checkout, pin, skill, inputs: StageInputs) -> tuple[str, bytes, str]:
+    """Get the selected basename, original bytes and optional evidence note."""
+    if evidence == 'folder':
+        licence = find_folder_licence_file(skill)
+        if licence is not None:
+            return licence.name, licence.read_bytes(), ''
+    elif evidence in ('repository', 'repository:self', 'frontmatter'):
+        name, data = _repository_licence_text(checkout, pin, inputs.apply)
+        return name, data, ''
+    elif evidence.startswith('upstream:'):
+        data, note = upstream_licence(evidence.removeprefix('upstream:'), inputs.reader)
+        return 'LICENSE', data, note
+    return 'LICENSE', b'', ''
+
+
+def licence_text(row, checkout, pin, skill, inputs: StageInputs):
+    """Copy the licence text from the pinned source to the staged skill."""
     try:
-        if evidence == 'folder':
-            licence = find_folder_licence_file(skill)
-            data = licence.read_bytes() if licence else b''
-        elif evidence in ('repository', 'repository:self', 'frontmatter'):
-            entries = tree_files(checkout, pin, PurePosixPath('.'), recursive=False)
-            entries = [entry for entry in entries if entry[0].name in LICENSE_FILENAMES or
-                       re.fullmatch(r'(LICEN[SC]E|COPYING)(?:\.[A-Za-z0-9_-]+)?', entry[0].name, re.I)]
-            with tempfile.TemporaryDirectory(prefix='adopt-licence-') as tmp:
-                if apply:
-                    for entry in entries:
-                        expand_sparse(checkout, entry[0], file=True)
-                    entries = [(path, mode, kind, oid, git(checkout, 'cat-file', '-s', oid).decode().strip())
-                                for path, mode, kind, oid, _ in entries]
-                validate_files(entries, allow_missing=not apply)
-                copy_blobs(checkout, entries, Path(tmp), allow_fetch=not apply)
-                licence = find_folder_licence_file(Path(tmp))
-                data = licence.read_bytes() if licence else b''
-        elif evidence.startswith('upstream:'):
-            data, note = upstream_licence(evidence.removeprefix('upstream:'), reader)
-        else:
-            data = b''
+        name, data, note = _selected_licence_text(row['licence_evidence'], checkout, pin, skill, inputs)
         if not data.strip() or len(data) > MAX_BYTES:
             raise Refused('licence-text-missing')
         data.decode('utf-8')
@@ -368,7 +412,16 @@ def licence_text(row, checkout, pin, skill, apply, reader):
         raise Refused(f'licence-text-missing: {detail}' if detail else 'licence-text-missing') from error
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
         raise Refused('licence-text-missing') from error
-    (skill / 'LICENSE').write_bytes(data)
+    destination = skill / name
+    try:
+        with destination.open('xb') as handle:
+            handle.write(data)
+    except FileExistsError as error:
+        if destination.is_symlink() or not destination.is_file() or destination.read_bytes() != data:
+            raise Refused(f'licence-text-conflict: {name}') from error
+    discovered = find_folder_licence_file(skill)
+    if discovered is not None and discovered != destination:
+        raise Refused(f'licence-text-shadowed: {name} by {discovered.name}')
     return note
 
 
@@ -592,6 +645,7 @@ def whitespace_arbiter(skill: Path, before: dict[str, str], patch_dir: Path | No
 
 
 def normalize_skill_markdown(root: Path, skill: Path) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+    """Normalise eligible staged Markdown and apply listed review patches."""
     tool_dir = root / 'tools/markdownlint' if root is not None else Path(__file__).resolve().parent / 'markdownlint'
     if not tool_dir.exists():
         tool_dir = Path(__file__).resolve().parent / 'markdownlint'
@@ -602,7 +656,7 @@ def normalize_skill_markdown(root: Path, skill: Path) -> tuple[dict[str, list[st
     files = [
         path.relative_to(skill).as_posix()
         for path in sorted(skill.rglob('*'))[:MAX_ROWS]
-        if path.is_file() and path.name != 'ORIGIN.md' and path.suffix.lower() in MARKDOWN_EXTENSIONS
+        if _is_skill_markdown(path, skill)
     ]
     if len(files) > MAX_FILES:
         raise Refused('file-limit: more than 200 files')
@@ -694,57 +748,81 @@ def run_gates(root, staging, skill, row, folder, pin, state, gates: GateOptions)
             git(staging, 'add', '-A', '--', 'skills')
 
 
-def stage_one(row, pin, checkouts, root, staging, occupied, apply, reader):
-    checkout, folder = checkout_for(checkouts, row, pin)
-    name = choose_name(row, occupied)
-    if apply:
+@dataclass(frozen=True)
+class StageInputs:
+    """Shared inputs for staging the candidates in a batch."""
+
+    checkouts: Path
+    root: Path
+    occupied: set[str]
+    apply: bool
+    reader: Callable
+    template_cache: Path
+    runner: Callable
+    licence_scan: check_skills.LicenceScan
+    download_failures: dict[str, str] = field(default_factory=dict, init=False)
+
+
+def _check_staged_skill(skill: Path, template_dir: Path, licence_scan: check_skills.LicenceScan) -> None:
+    """Apply the shared checker with a fresh copy of the reviewed licence entries."""
+    problems = check_skills.skill_problems(skill, template_dir=template_dir, licence_scan=licence_scan.copy())
+    if problems:
+        raise Refused('skill-check: ' + '; '.join(problems))
+
+
+def stage_one(row, pin, staging, inputs: StageInputs, spdx: str):
+    """Stage one skill and locate its canonical SPDX template."""
+    checkout, folder = checkout_for(inputs.checkouts, row, pin)
+    name = choose_name(row, inputs.occupied)
+    if inputs.apply:
         expand_sparse(checkout, folder)
     raw_entries = tree_files(checkout, pin, folder)
     entries, filter_notes = filter_entries(raw_entries, folder)
-    validate_files(entries, allow_missing=not apply)
+    validate_files(entries, allow_missing=not inputs.apply)
     skill = staging / 'skills' / name
     skill.mkdir(parents=True)
-    copy_blobs(checkout, entries, skill, allow_fetch=not apply)
+    copy_blobs(checkout, entries, skill, allow_fetch=not inputs.apply)
     fenced_files = rewrite_skill_fences(skill)
-    normalized, patched = normalize_skill_markdown(root, skill)
-    lic_note = licence_text(row, checkout, pin, skill, apply, reader)
+    normalized, patched = normalize_skill_markdown(inputs.root, skill)
+    lic_note = licence_text(row, checkout, pin, skill, inputs)
     note = build_notes(skill, filter_notes, normalized, {}, {}, lic_note, patched=patched)
     attribution(skill, row, folder, pin, note, fence_changed=bool(fenced_files))
-    problems = check_skills.skill_problems(skill)
-    if problems:
-        raise Refused('skill-check: ' + '; '.join(problems))
+    template_dir = _stage_licence_template(inputs, spdx)
     year = git(checkout, 'show', '-s', '--format=%cs', pin).decode().strip()[:4]
-    return skill, year, folder, (filter_notes, normalized, lic_note, fenced_files, patched)
+    return skill, year, folder, (filter_notes, normalized, lic_note, fenced_files, patched), template_dir
 
 
 def initial_metadata(root):
-    reuse = (root / 'REUSE.toml').read_text(encoding='utf-8')
+    """Read the REUSE and credits files and validate the REUSE TOML."""
+    reuse = (root / REUSE_FILE).read_text(encoding='utf-8')
     tomllib.loads(reuse)
-    credits = (root / 'CREDITS.md').read_text(encoding='utf-8')
-    return reuse, credits
+    credits_text = (root / CREDITS_FILE).read_text(encoding='utf-8')
+    return reuse, credits_text
 
 
-def add_metadata(reuse, credits, row, name, year):
+def add_metadata(reuse, credits_text, row, name, year):
+    """Add a skill's REUSE annotation and update its upstream credits row."""
+    spdx = candidate_licence_id(row['licence'])
     path_line = f'path = ["skills/{name}/**"]\n'
     annotation = ('\n[[annotations]]\n' + path_line +
                   'precedence = "override"\n' +
                   f'SPDX-FileCopyrightText = {json.dumps(year + " " + row["source"].split("/")[0] + " and contributors")}\n' +
-                  f'SPDX-License-Identifier = {json.dumps(row["licence"])}\n')
+                  f'SPDX-License-Identifier = {json.dumps(spdx)}\n')
     if path_line not in reuse:
         reuse = reuse + annotation
     url = f'https://github.com/{row["source"]}'
-    lines = credits.splitlines()
+    lines = credits_text.splitlines()
     found = False
     for index, line in enumerate(lines):
         cells = line.split('|')
-        if len(cells) == 5 and re.search(re.escape(url) + r'(?=[>\s)])', cells[1], re.I):
-            licences = sorted(set(cells[2].strip().split(', ')) | {row['licence']})
+        if len(cells) == 5 and re.search(re.escape(url) + r'(?=[>\s)])', cells[1], re.IGNORECASE):
+            licences = sorted(set(cells[2].strip().split(', ')) | {spdx})
             names = sorted(set(re.findall(r'`([^`]+)`', cells[3])) | {name})
             lines[index] = f'| <{url}> | {", ".join(licences)} | ' + ', '.join(f'`{n}`' for n in names) + ' |'
             found = True
             break
     if not found:
-        lines.append(f'| <{url}> | {row["licence"]} | `{name}` |')
+        lines.append(f'| <{url}> | {spdx} | `{name}` |')
     return reuse, '\n'.join(lines) + '\n'
 
 
@@ -855,11 +933,11 @@ def rebuild_index(root: Path, adopted_map: dict[str, dict] | None = None,
                   group_map: dict[str, str] | None = None, *,
                   staged_skills: Path | None = None) -> list[dict[str, str]]:
     """Build index rows for the skill folders under root and, when given, the staged ones."""
-    skills_dir = root / 'skills'
+    skills_dir = root / SKILLS_DIR
     dirs = _skill_directories(skills_dir, staged_skills)
     if not dirs:
         return []
-    index_file = skills_dir / 'INDEX.tsv'
+    index_file = root / INDEX_FILE
     existing = {}
     if index_file.is_file():
         try:
@@ -1089,51 +1167,88 @@ def resolve_copies(group_rows, checkouts, root, pins, all_candidates, sources, e
     return copies_map
 
 
-def evaluate(row, grouped, order, pins, checkouts, root, staging, occupied, apply, reader,
-             gate=markdown_gate, hiss_gate=hiss_gate, include_grouped=False, copies=None,
-             present=None):
+@dataclass(frozen=True)
+class EvaluationInputs:
+    """Census, grouping and gate settings used to evaluate each candidate."""
+
+    grouped: set[str]
+    order: dict[str, int]
+    pins: dict[str, str]
+    include_grouped: bool
+    copies: dict[str, str]
+    present: dict[tuple[str, str], dict[str, str]]
+    gates: GateOptions
+
+
+def _present_result(row, result, inputs: EvaluationInputs) -> bool:
+    """Record whether the source folder has already been adopted."""
+    if not inputs.present or (folder := candidate_folder(row)) is None:
+        return False
+    info = inputs.present.get((row['source'].lower(), folder))
+    if info is None:
+        return False
+    old_commit = info['commit']
+    new_commit = inputs.pins.get(row['source'], row.get('pin', ''))
+    reason = '' if old_commit == new_commit else f'present: pinned {old_commit[:12]}, census {new_commit[:12]}'
+    result.update(verdict='present', directory=info['directory'], reason=reason)
+    return True
+
+
+def _staged_notice_scan(
+    skill: Path, template_dir: Path, spdx: str, scan: check_skills.LicenceScan,
+) -> tuple[check_skills.LicenceScan, frozenset[str]]:
+    """Include proposed notices in a candidate-local scan until it passes the gates."""
+    staged_scan = scan.copy()
+    path = find_folder_licence_file(skill) or (skill / 'LICENSE')
+    new = unreviewed_licence_notices(path, template_dir, spdx, scan.notices)
+    if new:
+        try:
+            staged_scan.notices = check_skills.validate_licence_notices(sorted(scan.notices | new))
+        except (TypeError, ValueError) as error:
+            raise Refused(f'{LICENCE_NOTICES_FILE}: {error}') from error
+    return staged_scan, new
+
+
+def evaluate(row, staging, stage: StageInputs, inputs: EvaluationInputs):
+    """Stage and verify a candidate, returning its adoption report row."""
     result = dict(zip(REPORT_FIELDS, (candidate_id(row), 'refused', '', '')))
     cid = result['candidate']
-    if include_grouped:
-        if copies and cid in copies:
-            result.update(verdict='refused', reason=copies[cid])
-            return result, None, ''
-    else:
-        if cid in grouped:
-            result.update(verdict='skipped-grouped', reason='awaiting-group-judge')
-            return result, None, ''
+    if inputs.include_grouped and cid in inputs.copies:
+        result.update(verdict='refused', reason=inputs.copies[cid])
+        return result, None, ''
+    if not inputs.include_grouped and cid in inputs.grouped:
+        result.update(verdict='skipped-grouped', reason='awaiting-group-judge')
+        return result, None, ''
     try:
-        if cid not in order:
+        if cid not in inputs.order:
             raise Refused('candidate-not-in-census')
-        if present is None and root is not None:
-            present = read_present_skills(root / 'skills')
-        if present:
-            cand_folder = candidate_folder(row)
-            if cand_folder is not None:
-                key = (row['source'].lower(), cand_folder)
-                if key in present:
-                    info = present[key]
-                    old_commit = info['commit']
-                    new_commit = pins.get(row['source'], row.get('pin', ''))
-                    reason = ('' if old_commit == new_commit else
-                              f'present: pinned {old_commit[:12]}, census {new_commit[:12]}')
-                    result.update(verdict='present', directory=info['directory'], reason=reason)
-                    return result, None, ''
-        if len(occupied) >= check_skills.MAX_SKILLS:
+        if _present_result(row, result, inputs):
+            return result, None, ''
+        if len(stage.occupied) >= check_skills.MAX_SKILLS:
             raise Refused('skill-count-limit')
-        pin = pins[row['source']]
-        skill, year, folder, state = stage_one(
-            row, pin, checkouts, root, staging, occupied, apply, reader)
-        run_gates(root, staging, skill, row, folder, pin, state, GateOptions(gate=gate, hiss_gate=hiss_gate))
-        # A future gate fixer must preserve the checker contract too.
-        problems = check_skills.skill_problems(skill)
-        if problems:
-            raise Refused('skill-check: ' + '; '.join(problems))
-        result.update(verdict='adopted', directory=f'skills/{skill.name}')
+        pin = inputs.pins[row['source']]
+        spdx = candidate_licence_id(row['licence'])
+        if spdx is None:
+            raise Refused(f"licence {row['licence']} not recognised")
+        skill, year, folder, state, template_dir = stage_one(row, pin, staging, stage, spdx)
+        staged_scan, _ = _staged_notice_scan(skill, template_dir, spdx, stage.licence_scan)
+        _check_staged_skill(skill, template_dir, staged_scan)
+        run_gates(stage.root, staging, skill, row, folder, pin, state, inputs.gates)
+        staged_scan, notices = _staged_notice_scan(skill, template_dir, spdx, stage.licence_scan)
+        _check_staged_skill(skill, template_dir, staged_scan)
+        result.update(verdict='adopted', directory=f'{SKILLS_DIR}/{skill.name}')
+        if notices:
+            result['reason'] = 'licence notices added: ' + '; '.join(sorted(notices))
+            stage.licence_scan.notices = staged_scan.notices
         return result, skill, year
     except SourceReadError as error:
         detail = ' '.join(str(error).split())
         result['reason'] = f'licence-text-missing: {detail}' if detail else 'licence-text-missing'
+        return result, None, ''
+    except _LicenceOutputSymlinkError as error:
+        if stage.apply:
+            raise
+        result['reason'] = str(error)
         return result, None, ''
     except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
         result['reason'] = ' '.join(str(error).split())
@@ -1146,12 +1261,12 @@ def _called_process_detail(error: subprocess.CalledProcessError) -> str:
     return raw.strip()[:500] or ' '.join(str(error).split())[:500]
 
 
-def _download_error(args, error: Exception) -> ValueError:
+def _download_error(args, error: Exception) -> _LicenceDownloadError:
     """Format a licence download failure naming the SPDX identifier and cause."""
     spdx_id = args[-1] if args else 'unknown'
     prefix = f'licence download failed for {spdx_id}'
     if isinstance(error, ValueError) and str(error).startswith(f'{prefix}:'):
-        return error
+        return _LicenceDownloadError(str(error))
     if isinstance(error, subprocess.TimeoutExpired):
         limit = TIMEOUT if error.timeout is None else error.timeout
         detail = f'timed out after {limit:g} seconds'
@@ -1162,23 +1277,59 @@ def _download_error(args, error: Exception) -> ValueError:
         detail = _called_process_detail(error)
     else:
         detail = ' '.join(str(error).split())[:500] or type(error).__name__
-    return ValueError(f'{prefix}: {detail}')
+    return _LicenceDownloadError(f'{prefix}: {detail}')
 
 
 def default_download_runner(args, *, cwd=None):
-    """Run one licence download under the module deadline; failures raise ValueError."""
+    """Run REUSE with the module deadline and report the SPDX identifier on failure."""
+    if not args:
+        raise _LicenceDownloadError('licence download failed for unknown')
     try:
-        out = command(args, cwd=cwd, timeout=TIMEOUT)
+        return command(args, cwd=cwd, timeout=TIMEOUT)
     except (Refused, subprocess.SubprocessError, OSError) as error:
         raise _download_error(args, error) from error
-    return out
+
+
+def _download_licence(root: Path, spdx: str, runner) -> Path:
+    """Download one SPDX template to an explicit destination and require a regular file."""
+    target = root / LICENCES_DIR / f'{spdx}.txt'
+    args = ['reuse', 'download', '-o', str(target), spdx]
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        runner(args, cwd=root)
+        if target.is_symlink() or not target.is_file():
+            raise FileNotFoundError(f'{target.name} not written')
+    except Exception as error:
+        with suppress(OSError):
+            target.unlink(missing_ok=True)
+        if isinstance(error, _LicenceDownloadError):
+            raise
+        raise _download_error(args, error) from error
+    return target
+
+
+def _stage_licence_template(inputs: StageInputs, spdx: str) -> Path:
+    """Use a local template or memoize the download outcome for this run."""
+    if spdx in inputs.download_failures:
+        raise _LicenceDownloadError(inputs.download_failures[spdx])
+    filename = f'{spdx}.txt'
+    if _licence_target_present(inputs.root, filename):
+        return inputs.root / LICENCES_DIR
+    cache = inputs.template_cache
+    if not _licence_target_present(cache, filename):
+        try:
+            _download_licence(cache, spdx, inputs.runner)
+        except _LicenceDownloadError as error:
+            inputs.download_failures[spdx] = str(error)
+            raise
+    return cache / LICENCES_DIR
 
 
 def _licence_target_present(root: Path, filename: str) -> bool:
     """Return True when root/LICENSES/filename is a regular file; refuse any symlink."""
-    target = root / 'LICENSES' / filename
+    target = root / LICENCES_DIR / filename
     if target.is_symlink():
-        raise _output_symlink_error(f'LICENSES/{filename}')
+        raise _LicenceOutputSymlinkError(f'{LICENCES_DIR}/{filename}: output symlink refused')
     return target.is_file()
 
 
@@ -1196,28 +1347,27 @@ def _missing_spdx_ids(root: Path, reuse_text: str) -> list[str]:
 
 
 def sync_licences(root: Path, reuse_text: str, runner=default_download_runner, *,
-                  staging: Path | None = None) -> list[Path]:
-    """Download each licence text root/LICENSES lacks, into staging when given; return the files written."""
+                  staging: Path | None = None, template_cache: Path | None = None) -> list[Path]:
+    """Stage missing REUSE licence texts using verified cached bytes when available."""
     dest_root = root if staging is None else staging
     missing = _missing_spdx_ids(root, reuse_text)
     if not missing:
         return []
-    licenses_dir = dest_root / 'LICENSES'
+    licenses_dir = dest_root / LICENCES_DIR
     created_dir = not licenses_dir.exists()
-    licenses_dir.mkdir(parents=True, exist_ok=True)
     written = []
     try:
         for spdx_id in missing[:MAX_ROWS]:
-            lic_file = licenses_dir / f'{spdx_id}.txt'
-            cmd = ['reuse', 'download', '-o', str(lic_file), spdx_id]
-            try:
-                runner(cmd, cwd=dest_root)
-            except (ValueError, OSError, subprocess.SubprocessError) as error:
-                mapped = _download_error(cmd, error)
-                raise mapped from (error.__cause__ if mapped is error else error)
-            if not lic_file.is_file():
-                raise _download_error(cmd, FileNotFoundError(f'{lic_file.name} not written'))
-            written.append(lic_file)
+            filename = f'{spdx_id}.txt'
+            target = licenses_dir / filename
+            if template_cache is not None and _licence_target_present(template_cache, filename):
+                cached = template_cache / LICENCES_DIR / filename
+                if cached != target:
+                    licenses_dir.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(cached, target)
+            else:
+                _download_licence(dest_root, spdx_id, runner)
+            written.append(target)
     finally:
         if created_dir and licenses_dir.is_dir() and not any(licenses_dir.iterdir()):
             licenses_dir.rmdir()
@@ -1225,13 +1375,14 @@ def sync_licences(root: Path, reuse_text: str, runner=default_download_runner, *
 
 
 # Root metadata files publish stages and moves like every other output.
-METADATA_FILES = ('REUSE.toml', 'CREDITS.md')
+METADATA_FILES = (REUSE_FILE, CREDITS_FILE)
 APPLY_LOCK_PREFIX = '.adopt-skills'
 APPLY_LOCK_NAME = f'{APPLY_LOCK_PREFIX}.lock'
 JOURNAL_NAME = '.adopt-publish.journal.json'
-JOURNAL_BACKUP_TARGETS = ('REUSE.toml', 'CREDITS.md', 'skills/INDEX.tsv')
+JOURNAL_BACKUP_TARGETS = (*METADATA_FILES, INDEX_FILE)
+JOURNAL_TARGETS_WITH_NOTICES = (*JOURNAL_BACKUP_TARGETS, LICENCE_NOTICES_FILE)
 REFUSED_REPORT_TARGETS = (JOURNAL_NAME, APPLY_LOCK_NAME, *JOURNAL_BACKUP_TARGETS)
-OUTPUT_SYMLINK_TARGETS = ('skills', 'skills/INDEX.tsv', 'LICENSES', 'REUSE.toml', 'CREDITS.md')
+OUTPUT_SYMLINK_TARGETS = (*PUBLICATION_TREES, *PUBLICATION_FILES)
 
 
 class _PublishRollbackError(RuntimeError):
@@ -1257,7 +1408,7 @@ def _journal_error(journal_path: Path, detail: str) -> ValueError:
 
 def _stage_publish(root: Path, staging: Path, saved: Path, rows: list[dict],
                    metadata: dict[str, str], adopted_map, group_map,
-                   runner) -> tuple[list[Path], list[Path], bool]:
+                   runner, *, template_cache: Path | None = None) -> tuple[list[Path], list[Path], bool]:
     """Stage adopted skills, metadata, index and downloaded licences before touching root."""
     staged_skills = []
     for row in rows[:MAX_ROWS]:
@@ -1271,8 +1422,8 @@ def _stage_publish(root: Path, staging: Path, saved: Path, rows: list[dict],
         staged_skills.append(target)
     for name in METADATA_FILES:
         _staged_target_path(staging, root / name).write_text(metadata[name], encoding='utf-8')
-    staged_licences = sync_licences(root, metadata['REUSE.toml'], runner=runner,
-                                    staging=staging)
+    staged_licences = sync_licences(root, metadata[REUSE_FILE], runner=runner,
+                                    staging=staging, template_cache=template_cache)
     index_staged = write_index(
         root, adopted_map=adopted_map, group_map=group_map,
         target=_staged_target_path(staging, root / 'skills/INDEX.tsv'), staged_skills=staging / 'skills',
@@ -1295,7 +1446,12 @@ def _backup_publish_targets(root: Path, staging: Path) -> dict[Path, Path | None
     backup_dir = staging / 'backup'
     backup_dir.mkdir(parents=True, exist_ok=True)
     backups: dict[Path, Path | None] = {}
-    for idx, rel in enumerate(JOURNAL_BACKUP_TARGETS):
+    targets = (
+        JOURNAL_TARGETS_WITH_NOTICES
+        if _staged_target_path(staging, root / LICENCE_NOTICES_FILE).is_file()
+        else JOURNAL_BACKUP_TARGETS
+    )
+    for idx, rel in enumerate(targets):
         target = root / rel
         if target.is_file():
             saved = _backup_slot_path(staging, idx, target)
@@ -1388,7 +1544,7 @@ def _journal_backup_record(
     root: Path, staging: Path, rel: str, backup: Path | None, index_staged: bool,
 ) -> dict[str, str | None]:
     """Build one backup-and-source record for JOURNAL_BACKUP_TARGETS[rel]."""
-    staged = _staged_target_path(staging, root / rel) if (rel in METADATA_FILES or index_staged) else None
+    staged = _staged_target_path(staging, root / rel) if rel != INDEX_FILE or index_staged else None
     return {
         'backup': backup.relative_to(root).as_posix() if backup is not None else None,
         'source': staged.relative_to(root).as_posix() if staged is not None else None,
@@ -1406,7 +1562,7 @@ def _build_publish_journal(
     """Describe the staging directory, backups, planned moves and new directories relative to root."""
     backup_map = {
         rel: _journal_backup_record(root, staging, rel, backups[root / rel], index_staged)
-        for rel in JOURNAL_BACKUP_TARGETS
+        for rel in JOURNAL_TARGETS_WITH_NOTICES if root / rel in backups
     }
     moves = [
         {
@@ -1427,7 +1583,7 @@ def _build_publish_journal(
     created_dirs = []
     if licences and not (root / 'LICENSES').exists():
         created_dirs.append('LICENSES')
-    if (index_staged or skills) and not (root / 'skills').exists():
+    if (index_staged or skills or root / LICENCE_NOTICES_FILE in backups) and not (root / SKILLS_DIR).exists():
         created_dirs.append('skills')
     return {
         'version': 1,
@@ -1509,7 +1665,7 @@ def _parse_journal_backup_entry(
             raise _journal_error(journal_path, f'invalid backup path: {backup_rel!r}')
     source_rel = raw_entry['source']
     if source_rel is None:
-        if rel in METADATA_FILES:
+        if rel != INDEX_FILE:
             raise _journal_error(journal_path, f'invalid backup source: {source_rel!r}')
         return target_path, backup_path, None
     source_path = _journal_rel_path(root, source_rel, journal_path)
@@ -1521,12 +1677,15 @@ def _parse_journal_backup_entry(
 def _parse_journal_backups(
     root: Path, staging_path: Path, raw_backups: object, journal_path: Path,
 ) -> list[tuple[Path, Path | None, Path | None]]:
-    """Validate the three backup and staged-source entries recorded in the publish journal."""
-    if not isinstance(raw_backups, dict) or set(raw_backups) != set(JOURNAL_BACKUP_TARGETS):
+    """Validate the journal backup entries, including a notice register when staged."""
+    if not isinstance(raw_backups, dict):
+        raise _journal_error(journal_path, 'malformed backups mapping')
+    targets = JOURNAL_TARGETS_WITH_NOTICES if LICENCE_NOTICES_FILE in raw_backups else JOURNAL_BACKUP_TARGETS
+    if set(raw_backups) != set(targets):
         raise _journal_error(journal_path, 'malformed backups mapping')
     return [
         _parse_journal_backup_entry(root, staging_path, idx, rel, raw_backups[rel], journal_path)
-        for idx, rel in enumerate(JOURNAL_BACKUP_TARGETS)
+        for idx, rel in enumerate(targets)
     ]
 
 
@@ -1672,8 +1831,13 @@ def _apply_commit_moves(
         index_target = root / 'skills' / 'INDEX.tsv'
         undo.append(('restore', index_target, backups[index_target]))
         os.replace(_staged_target_path(staging, index_target), index_target)
+    register = root / LICENCE_NOTICES_FILE
+    if register in backups:
+        _ensure_publish_dir(root / SKILLS_DIR, undo)
+        undo.append(('restore', register, backups[register]))
+        os.replace(_staged_target_path(staging, register), register)
     for staged_skill in skills[:check_skills.MAX_SKILLS]:
-        _ensure_publish_dir(root / 'skills', undo)
+        _ensure_publish_dir(root / SKILLS_DIR, undo)
         dest = root / 'skills' / staged_skill.name
         if dest.exists() or dest.is_symlink():
             raise _skill_exists_error(dest)
@@ -1710,18 +1874,24 @@ def _commit_publish(root: Path, staging: Path, staged_licences: list[Path],
         raise
 
 
-def publish(root, saved, rows, reuse, credits, adopted_map=None, group_map=None, runner=default_download_runner):
-    """Stage every output, then move it under root; keep staging if a rollback step fails."""
-    # All gates and licence downloads complete in staging before modifying root. Never overwrite a skill.
-    _check_output_symlinks(root)
+def _render_notice_register(notices: frozenset[str]) -> bytes:
+    """Serialize a notice register within the checker's UTF-8 byte limit."""
+    data = check_skills.licence_notices_yaml(notices).encode('utf-8')
+    if len(data) > MAX_LICENCE_BYTES:
+        raise ValueError(
+            f'{LICENCE_NOTICES_FILE}: serialized size {len(data)} bytes '
+            f'exceeds {MAX_LICENCE_BYTES} bytes'
+        )
+    return data
+
+
+@contextmanager
+def _publication_staging(root: Path | None):
+    """Clean staging unless journal recovery needs to retain it."""
     staging = Path(tempfile.mkdtemp(dir=root, prefix='.adopt-publish-'))
     keep_staging = False
     try:
-        licences, skills, index_staged = _stage_publish(
-            root, staging, saved, rows, {'REUSE.toml': reuse, 'CREDITS.md': credits},
-            adopted_map, group_map, runner,
-        )
-        _commit_publish(root, staging, licences, skills, index_staged)
+        yield staging
     except _PublishRollbackError:
         keep_staging = True
         raise
@@ -1730,22 +1900,70 @@ def publish(root, saved, rows, reuse, credits, adopted_map=None, group_map=None,
             shutil.rmtree(staging, ignore_errors=True)
 
 
-def resolve_report_path(report: Path | None, root: Path) -> Path | None:
-    """Resolve the optional report TSV path and refuse the repository root or tool-owned outputs."""
+def publish(root, saved, rows, metadata, adopted_map=None, group_map=None,
+            runner=default_download_runner, *, staging=None):
+    """Stage and journal verified skills, licence templates and the (REUSE, credits) metadata pair."""
+    _check_output_symlinks(root)
+    reuse, credits_text = metadata
+    outputs = {REUSE_FILE: reuse, CREDITS_FILE: credits_text}
+    with _publication_staging(root) if staging is None else nullcontext(staging) as work:
+        licences, skills, index_staged = _stage_publish(
+            root, work, saved, rows, outputs, adopted_map, group_map, runner,
+            template_cache=staging,
+        )
+        _commit_publish(root, work, licences, skills, index_staged)
+
+
+def resolve_report_path(report: Path | str | None, root: Path) -> Path | None:
+    """Derive the final report file and refuse conflicts with publication."""
     if report is None:
         return None
-    dest = report.resolve()
-    if dest.is_dir() or str(report).endswith(('/', '\\')):
-        dest = dest / 'adopt-report.tsv'
-    root_resolved = root.resolve()
-    if dest == root_resolved or dest == (root_resolved / 'adopt-report.tsv'):
+    raw_report = Path(report)
+    dest = raw_report
+    if not dest.is_symlink():
+        dest = dest.resolve()
+        directory_hint = os.fspath(report).endswith(('/', '\\'))
+        if directory_hint and dest.is_file():
+            raise ValueError(f'report directory is a file: {dest}')
+        if directory_hint or dest.is_dir():
+            dest /= DEFAULT_REPORT_FILE
+    if dest.is_symlink():
+        raise ValueError('report output symlink refused')
+    dest, root = dest.resolve(), root.resolve()
+    if dest in {root, root / DEFAULT_REPORT_FILE}:
         raise ValueError('repository root refused as report location')
-    lexical_dest = report.parent.resolve() / report.name
-    for rel in REFUSED_REPORT_TARGETS:
-        reserved = root_resolved / rel
+    lexical_dest = raw_report.parent.resolve() / raw_report.name
+    for name in (*PUBLICATION_FILES, *PUBLICATION_TREES):
+        output = (root / name).resolve()
+        if dest.is_relative_to(output) or output.is_relative_to(dest) or lexical_dest == root / name:
+            overlap_error = f'report path overlaps publication output: {name}'
+            if name in REFUSED_REPORT_TARGETS:
+                raise ValueError(f'{name} refused as report location: {overlap_error}')
+            raise ValueError(overlap_error)
+    for name in (JOURNAL_NAME, APPLY_LOCK_NAME):
+        reserved = root / name
         if dest.is_relative_to(reserved) or lexical_dest == reserved:
-            raise ValueError(f'{rel} refused as report location')
+            raise ValueError(f'{name} refused as report location')
     return dest
+
+
+def _evaluate_candidates(selected, stage: StageInputs, evaluation: EvaluationInputs, saved, metadata):
+    """Keep accepted skills and prepare their metadata without publishing yet."""
+    reuse, credits_text = metadata
+    rows = []
+    adopted_map = {}
+    for row in selected[:MAX_ROWS]:
+        with tempfile.TemporaryDirectory(prefix='adopt-gate-') as work:
+            staging = Path(work)
+            prepare_staging(stage.root, staging)
+            result, skill, year = evaluate(row, staging, stage, evaluation)
+            rows.append(result)
+            if skill is not None:
+                reuse, credits_text = add_metadata(reuse, credits_text, row, skill.name, year)
+                stage.occupied.add(skill.name)
+                shutil.move(str(skill), saved / skill.name)
+                adopted_map[skill.name] = row
+    return rows, adopted_map, reuse, credits_text
 
 
 def run(candidates, groups, census, checkouts, root=Path('.'), *, apply=False,
@@ -1812,33 +2030,27 @@ def _evaluate_and_publish(root: Path, checkouts: Path, parsed: tuple, opts: _Run
     selected, grouped, order, pins, group_rows, group_map, all_candidates = parsed
     copies_map = (resolve_copies(group_rows, checkouts, root, pins, all_candidates, opts.sources, opts.embedding)
                   if opts.include_grouped else {})
-    reuse_text, credits_text = initial_metadata(root)
-    skills_dir = root / 'skills'
-    occupied = {path.name for path in skills_dir.iterdir() if path.is_dir()} if skills_dir.exists() else set()
+    metadata = initial_metadata(root)
+    skills_dir = root / SKILLS_DIR
+    occupied = {path.name for path in _skill_directories(skills_dir)}
     present = read_present_skills(skills_dir)
-    rows: list[dict] = []
-    adopted_map: dict[str, dict] = {}
-    with tempfile.TemporaryDirectory(prefix='adopt-skills-') as tmp:
-        saved = Path(tmp) / 'accepted'
-        saved.mkdir()
-        for row in selected:
-            with tempfile.TemporaryDirectory(prefix='adopt-gate-') as work:
-                staging = Path(work)
-                prepare_staging(root, staging)
-                result, skill, year = evaluate(
-                    row, grouped, order, pins, checkouts, root, staging, occupied, opts.apply, opts.reader,
-                    gate=opts.gates.gate, hiss_gate=opts.gates.hiss_gate,
-                    include_grouped=opts.include_grouped, copies=copies_map, present=present,
-                )
-                rows.append(result)
-                if skill is not None:
-                    reuse_text, credits_text = add_metadata(reuse_text, credits_text, row, skill.name, year)
-                    occupied.add(skill.name)
-                    shutil.move(str(skill), saved / skill.name)
-                    adopted_map[skill.name] = row
+    licence_scan = check_skills.read_licence_scan(root)
+    existing_notices = licence_scan.notices
+    with (_publication_staging(root if opts.apply else None) as template_cache,
+          tempfile.TemporaryDirectory(prefix='adopt-skills-') as tmp):
+        saved = Path(tmp)
+        stage = StageInputs(checkouts, root, occupied, opts.apply, opts.reader, template_cache,
+                            opts.runner, licence_scan)
+        evaluation = EvaluationInputs(grouped, order, pins, opts.include_grouped, copies_map, present, opts.gates)
+        rows, adopted_map, reuse, credits_text = _evaluate_candidates(selected, stage, evaluation, saved, metadata)
+        register = (
+            _render_notice_register(licence_scan.notices) if licence_scan.notices != existing_notices else None
+        )
         if opts.apply:
-            publish(root, saved, rows, reuse_text, credits_text, adopted_map=adopted_map,
-                    group_map=group_map, runner=opts.runner)
+            if register is not None:
+                _staged_target_path(template_cache, root / LICENCE_NOTICES_FILE).write_bytes(register)
+            publish(root, saved, rows, (reuse, credits_text), adopted_map, group_map, opts.runner,
+                    staging=template_cache)
     return rows
 
 
@@ -1849,7 +2061,7 @@ def main(argv=None):
         parser.add_argument('--' + name, required=True, type=Path)
     parser.add_argument('--root', type=Path, default=Path('.'))
     parser.add_argument('--apply', action='store_true', help='write accepted skills and attribution')
-    parser.add_argument('--report', type=Path, default=None, help='write adopt-report.tsv to this path')
+    parser.add_argument('--report', help=f'write {DEFAULT_REPORT_FILE} to this path')
     parser.add_argument('--include-grouped', action='store_true', help='adopt overlap-group members except collapsed copies')
     parser.add_argument('--cache', type=Path, default=None, help='embedding cache JSON path (required by --include-grouped)')
     parser.add_argument('--embed-model', default=os.environ.get('PERITIA_LLM_EMBED_MODEL'),

@@ -24,10 +24,43 @@ One directory per skill under `skills/`:
 | --- | --- |
 | `SKILL.md` | the skill, in the form agent clients read |
 | `ORIGIN.md` | upstream repository, path, pinned commit, licence, and what this library changed |
-| `LICENSE` | the upstream licence text, unchanged, when the skill derives from one |
+| Licence file | the upstream licence text under its selected filename, such as `LICENSE`, `LICENSE.md`, or `COPYING` |
 
 A skill adapted from upstream lists its changes against the pinned upstream text
 in `ORIGIN.md`. A skill written here says so there.
+For adapted skills, the checker compares the complete licence file body with the
+canonical SPDX text in `LICENSES/` for the ID declared in `ORIGIN.md`.
+A front matter `license` declaration must identify the same licence or point
+to the licence file.
+
+Keep vendored licence files unchanged. Copyright notice lines start with the
+word `Copyright` and a space, or with `©`, including `©2026` without a space.
+Lettered clauses and wrapped template terms such as `Copyright and Related
+Rights` stay in the body comparison.
+The checker accepts exact notices from the selected SPDX template or the
+reviewed [`skills/licence-notices.yaml`](skills/licence-notices.yaml) register.
+It collapses whitespace before matching the line, preserving case and
+punctuation. Adoption lists each proposed addition in its report and writes a
+sorted, deduplicated register with the adopted skills. Review each new line in
+the diff.
+
+Pin a reviewed licence body variant at `skills/<name>/LICENSE` in
+[`skills/licence-exceptions.yaml`](skills/licence-exceptions.yaml). Use the
+SHA-256 of the original bytes and review the pin again when it expires.
+Category D expires 120 days after entry. Other filenames still require a
+matching body.
+
+```yaml
+exceptions:
+  - rule: skill-licence-text
+    path: skills/example/LICENSE
+    spdx: MIT
+    sha256: b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5
+    reason: Reviewed variant with an upstream attribution note.
+    category: D
+    entered: '2026-11-25'
+    expires: '2027-03-25'
+```
 
 ## Using it
 
@@ -233,8 +266,10 @@ The list of upstreams is in [CREDITS.md](CREDITS.md).
 Text written or adapted in this repository is licensed under the European
 Union Public Licence 1.2 ([LICENSES/EUPL-1.2.txt](LICENSES/EUPL-1.2.txt)).
 Upstream text keeps its own licence, recorded per file in `REUSE.toml` and
-shipped beside the skill as `LICENSE`. The repository follows the
-[REUSE](https://reuse.software) specification.
+shipped beside the skill under the selected licence filename. The repository
+follows the [REUSE](https://reuse.software) specification.
+
+Peritia supplies the canonical Apache-2.0 text in [`skills/carrier-relationship-management/LICENSE`](skills/carrier-relationship-management/LICENSE). The pinned upstream skill folder contains only `SKILL.md`, which declares Apache-2.0, and the upstream repository root carries MIT. [CREDITS.md](CREDITS.md) records both licences for the source.
 
 <!-- praetor:readme-governance:start -->
 [![HISS Adopted][praetor-hiss-badge]][praetor-hiss-agents]
